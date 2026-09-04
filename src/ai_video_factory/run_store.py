@@ -25,11 +25,13 @@ class RunStore:
         self.root = root
 
     def start(self, stage: str, inputs: dict[str, Any]) -> RunManifest:
+        self._validate_stage(stage)
         fingerprint = fingerprint_inputs(inputs)
         completed = self._newest_completed(stage, fingerprint)
         if completed is not None:
             resumed = replace(completed, resumed=True, updated_at=_timestamp())
             self._write_manifest(resumed)
+            self._append_event(resumed, "run_resumed", {"status": resumed.status})
             return resumed
 
         now = _timestamp()
@@ -47,6 +49,7 @@ class RunStore:
             error=None,
         )
         self._write_manifest(manifest)
+        self._append_event(manifest, "run_started", {"status": manifest.status})
         return manifest
 
     def resume(self, run_id: str, inputs: dict[str, Any]) -> RunManifest:
@@ -56,10 +59,16 @@ class RunStore:
 
         resumed = replace(manifest, resumed=True, updated_at=_timestamp())
         self._write_manifest(resumed)
+        self._append_event(resumed, "run_resumed", {"status": resumed.status})
         return resumed
 
     def event(self, run_id: str, event: str, fields: dict[str, Any]) -> None:
         manifest = self._load_run(run_id)
+        self._append_event(manifest, event, fields)
+
+    def _append_event(
+        self, manifest: RunManifest, event: str, fields: dict[str, Any]
+    ) -> None:
         event_path = self._run_directory(manifest) / "events.jsonl"
         event_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
@@ -83,9 +92,11 @@ class RunStore:
             error=None,
         )
         self._write_manifest(completed)
+        self._append_event(completed, "run_completed", {"artifacts": artifacts})
         return completed
 
     def _newest_completed(self, stage: str, fingerprint: str) -> RunManifest | None:
+        self._validate_stage(stage)
         stage_directory = self.root / stage
         if not stage_directory.is_dir():
             return None
@@ -118,7 +129,19 @@ class RunStore:
         temporary_path.replace(manifest_path)
 
     def _run_directory(self, manifest: RunManifest) -> Path:
+        self._validate_stage(manifest.stage)
         return self.root / manifest.stage / manifest.run_id
+
+    @staticmethod
+    def _validate_stage(stage: str) -> None:
+        if (
+            not stage
+            or stage in {".", ".."}
+            or Path(stage).is_absolute()
+            or "/" in stage
+            or "\\" in stage
+        ):
+            raise ValueError("stage must be a single safe path component")
 
     @staticmethod
     def _read_manifest(path: Path) -> RunManifest:
