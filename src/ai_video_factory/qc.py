@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 from typing import Literal
 
@@ -28,15 +29,17 @@ def _check(name: str, passed: bool, detail: str) -> QcCheck:
 def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
     """Compare probed media to an edit specification and aggregate technical checks."""
     dimensions_match = media.width == edit.width and media.height == edit.height
+    expected_frame_rate = Fraction(edit.fps, 1)
     frame_rate_match = (
-        media.frame_rate is not None and abs(float(media.frame_rate) - edit.fps) <= 0.01
+        media.frame_rate is not None
+        and abs(media.frame_rate - expected_frame_rate) <= Fraction(1, 100)
     )
-    expected_duration = edit.duration_frames / edit.fps
+    expected_duration = Fraction(edit.duration_frames, edit.fps)
     duration_match = (
         media.duration_seconds is not None
-        and abs(media.duration_seconds - expected_duration) <= 0.10
+        and abs(Fraction(str(media.duration_seconds)) - expected_duration) <= Fraction(1, 10)
     )
-    decode_passed = media.decode_succeeded is not False
+    decode_passed = media.decode_succeeded is True
 
     checks = [
         _check("video-stream", media.video_codec is not None, "video stream detected"),
@@ -55,7 +58,7 @@ def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
         _check(
             "duration",
             duration_match,
-            f"expected {expected_duration:.3f}s; got "
+            f"expected {float(expected_duration):.3f}s; got "
             f"{media.duration_seconds:.3f}s"
             if media.duration_seconds is not None
             else "duration unavailable",
@@ -64,7 +67,7 @@ def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
             "full-decode",
             decode_passed,
             media.decode_detail
-            or ("full decode passed" if media.decode_succeeded is True else "not run for parsed metadata"),
+            or ("full decode passed" if decode_passed else "full decode was not successful"),
         ),
     ]
     status: Literal["pass", "fail"] = "pass" if all(check.passed for check in checks) else "fail"
