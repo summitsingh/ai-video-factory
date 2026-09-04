@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "duration_frames": 90,
+  "scenes": [
+    {
+      "id": "phase-1-title",
+      "from_frame": 0,
+      "duration_frames": 90,
+      "title": "AI Video Factory",
+      "caption": "Synthetic local pipeline test"
+    }
+  ]
+}
