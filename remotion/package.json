@@ -1,0 +1,21 @@
+{
+  "name": "ai-video-factory-remotion",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.json",
+    "render": "npm run build --silent && node dist/render.js"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.520",
+    "@remotion/renderer": "4.0.520",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "remotion": "4.0.520"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}
