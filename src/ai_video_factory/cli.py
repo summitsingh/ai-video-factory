@@ -1,11 +1,14 @@
 import typer
 
+from ai_video_factory.doctor import collect_doctor_report
+
 app = typer.Typer(no_args_is_help=True)
 
 
 @app.command()
 def doctor() -> None:
     """Report readiness without modifying the host."""
+    typer.echo(collect_doctor_report().model_dump_json(indent=2))
 
 
 @app.command()
