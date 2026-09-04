@@ -1,0 +1,24 @@
+[project]
+name = "ai-video-factory"
+version = "0.1.0"
+description = "Local AI video factory"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "typer>=0.27,<0.28",
+    "pydantic>=2.12,<3",
+]
+
+[project.scripts]
+ai-video-factory = "ai_video_factory.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_video_factory"]
