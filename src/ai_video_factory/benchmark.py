@@ -30,7 +30,14 @@ _PROBES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("vulkan-enumeration", ("vulkaninfo", "--summary")),
 )
 _SENSITIVE_LINE = re.compile(r"^([^:=]+)([:=])(.*)$")
-_SENSITIVE_KEY_PARTS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
+_SENSITIVE_KEY_PARTS = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "KEY",
+    "AUTHORIZATION",
+    "COOKIE",
+)
 
 
 def _detail_line(text: str) -> str:
