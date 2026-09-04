@@ -38,3 +38,21 @@ def test_pipeline_json_command_emits_only_pipeline_result(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == expected.to_dict()
+
+
+def test_pipeline_json_command_converts_unexpected_error_to_json_failure(monkeypatch) -> None:
+    """The public JSON command must not leak a traceback from an inner failure."""
+    def broken_pipeline(_project_root: Path, _data_root: Path) -> PipelineResult:
+        raise FileNotFoundError("synthetic fixture is missing")
+
+    monkeypatch.setattr(cli, "run_synthetic_pipeline", broken_pipeline)
+
+    result = CliRunner().invoke(cli.app, ["test-pipeline", "--json"])
+
+    payload = json.loads(result.stdout)
+    assert result.exit_code == 2
+    assert payload["status"] == "fail"
+    assert payload["run_id"] is None
+    assert payload["artifacts"] == {}
+    assert payload["error"] == "synthetic fixture is missing"
+    assert "Traceback" not in result.stdout

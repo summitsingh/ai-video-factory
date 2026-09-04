@@ -25,6 +25,13 @@ emits exactly one JSON object on stdout with these stable fields:
 Hermes must parse stdout as JSON, persist `run_id`, and use `retryable` when
 deciding whether to retry a command. A `status` of `fail` is a stopping
 condition for QC; Hermes must not continue to a later stage or publication.
+If `run_id` is `null`, setup failed before an active stage existed, so there is
+no run event to retain. The response still contains every stable result field.
+
+The synthetic render requires a verified local browser executable. It uses
+`REMOTION_CHROME_EXECUTABLE` when configured, otherwise a locally discoverable
+Chrome or Chromium executable. It never downloads a browser; absence is a
+retryable command failure before Remotion starts.
 
 Exit status is `0` on QC pass and `2` on a pipeline or QC failure. JSON mode
 never writes a traceback to stdout.

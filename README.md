@@ -16,7 +16,8 @@ The test pipeline renders the checked-in 1280x720, 30 fps fixture with
 Remotion, muxes a silent 48 kHz stereo AAC track, runs ffprobe plus a complete
 FFmpeg decode, and writes the resulting MP4 and QC reports beneath
 `data/projects/synthetic/runs/`. Generated run data is intentionally ignored
-by Git.
+by Git. Rendering requires an already-installed local Chrome or Chromium
+executable (or `REMOTION_CHROME_EXECUTABLE`); it never downloads a browser.
 
 Hermes uses only these CLI commands and parses the JSON response from
 `test-pipeline --json`; see [the Hermes command contract](docs/hermes-command-contract.md).
