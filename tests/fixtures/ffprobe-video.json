@@ -11,7 +11,10 @@
     {
       "index": 1,
       "codec_name": "aac",
-      "codec_type": "audio"
+      "codec_type": "audio",
+      "sample_rate": "48000",
+      "channels": 2,
+      "channel_layout": "stereo"
     }
   ],
   "format": {

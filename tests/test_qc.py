@@ -33,6 +33,46 @@ def test_missing_audio_fails_qc() -> None:
     assert next(check for check in report.checks if check.name == "audio-stream").passed is False
 
 
+def test_non_h264_video_fails_qc() -> None:
+    report = evaluate_qc(
+        replace(_decoded_media(), video_codec="vp9"),
+        load_edit(Path("fixtures/synthetic-edit.json")),
+    )
+
+    assert report.status == "fail"
+    assert next(check for check in report.checks if check.name == "video-codec").passed is False
+
+
+def test_non_aac_audio_fails_qc() -> None:
+    report = evaluate_qc(
+        replace(_decoded_media(), audio_codec="opus"),
+        load_edit(Path("fixtures/synthetic-edit.json")),
+    )
+
+    assert report.status == "fail"
+    assert next(check for check in report.checks if check.name == "audio-codec").passed is False
+
+
+def test_non_48_khz_audio_fails_qc() -> None:
+    report = evaluate_qc(
+        replace(_decoded_media(), audio_sample_rate=44_100),
+        load_edit(Path("fixtures/synthetic-edit.json")),
+    )
+
+    assert report.status == "fail"
+    assert next(check for check in report.checks if check.name == "audio-sample-rate").passed is False
+
+
+def test_non_stereo_audio_fails_qc() -> None:
+    report = evaluate_qc(
+        replace(_decoded_media(), audio_channels=1, audio_channel_layout="mono"),
+        load_edit(Path("fixtures/synthetic-edit.json")),
+    )
+
+    assert report.status == "fail"
+    assert next(check for check in report.checks if check.name == "audio-layout").passed is False
+
+
 def test_qc_reports_write_json_and_markdown(tmp_path: Path) -> None:
     """A report writer must leave both machine- and human-readable artifacts."""
     report = evaluate_qc(_decoded_media(), load_edit(Path("fixtures/synthetic-edit.json")))

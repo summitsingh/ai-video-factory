@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import re
 import subprocess
 import time
 from collections.abc import Callable, Sequence
 from typing import Literal
 
 from pydantic import BaseModel
+
+from ai_video_factory.sanitization import first_diagnostic_line
 
 CommandResult = tuple[int, str, str]
 CommandRunner = Callable[[Sequence[str]], CommandResult]
@@ -29,27 +30,8 @@ _PROBES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("ffmpeg-startup", ("ffmpeg", "-version")),
     ("vulkan-enumeration", ("vulkaninfo", "--summary")),
 )
-_SENSITIVE_LINE = re.compile(r"^([^:=]+)([:=])(.*)$")
-_SENSITIVE_KEY_PARTS = (
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "KEY",
-    "AUTHORIZATION",
-    "COOKIE",
-)
-
-
 def _detail_line(text: str) -> str:
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        match = _SENSITIVE_LINE.match(line)
-        if match and any(part in match.group(1).upper() for part in _SENSITIVE_KEY_PARTS):
-            line = f"{match.group(1)}{match.group(2)}[REDACTED]"
-        return line
-    return ""
+    return first_diagnostic_line(text) or ""
 
 
 def _subprocess_runner(argv: Sequence[str]) -> CommandResult:

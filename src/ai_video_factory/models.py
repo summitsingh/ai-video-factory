@@ -13,6 +13,15 @@ class StageStatus(StrEnum):
 
 
 @dataclass(frozen=True)
+class ArtifactIntegrity:
+    """A content digest for one artifact contained by the configured artifact root."""
+
+    path: str
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
 class RunManifest:
     schema_version: int
     run_id: str
@@ -24,6 +33,7 @@ class RunManifest:
     updated_at: str
     inputs: dict[str, Any]
     artifacts: dict[str, Any]
+    artifact_integrity: dict[str, ArtifactIntegrity]
     error: str | None
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,5 +52,9 @@ class RunManifest:
             updated_at=data["updated_at"],
             inputs=data["inputs"],
             artifacts=data["artifacts"],
+            artifact_integrity={
+                key: ArtifactIntegrity(**record)
+                for key, record in data.get("artifact_integrity", {}).items()
+            },
             error=data["error"],
         )

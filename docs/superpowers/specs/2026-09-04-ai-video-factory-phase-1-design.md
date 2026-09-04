@@ -10,7 +10,7 @@ Phase 1 creates a Git-managed project that can report its environment and safely
 
 ## Architecture
 
-The project is a Python command-line application with a small TypeScript/Remotion composition. Hermes invokes the same stable CLI that a human or Codex uses; it does not bypass validation or directly manipulate internal files. Every command creates a run directory containing an immutable manifest, structured JSONL event log, and stage output. Stages use content-addressed input fingerprints so a successful stage may be resumed only when its declared inputs are unchanged.
+The project is a Python command-line application with a small TypeScript/Remotion composition. Hermes invokes the same stable CLI that a human or Codex uses; it does not bypass validation or directly manipulate internal files. Every pipeline stage creates a run directory containing an atomically updated manifest state record, an append-only structured JSONL event log, and stage output. Stages use content-addressed input and provenance fingerprints, plus persisted artifact paths and digests, so a successful stage may be resumed only when its declared inputs and tools are unchanged and every expected artifact remains intact.
 
 The initial execution path is deliberately narrow:
 
@@ -24,7 +24,7 @@ No language, speech, image, vision, or video-generation model is required for th
 
 | Component | Responsibility | Inputs | Outputs |
 |---|---|---|---|
-| `doctor` | Collect safe system and tool status | host commands | JSON and Markdown diagnostic report |
+| `doctor` | Collect safe current system and tool status | host commands | JSON machine report; the repository separately retains the Markdown `system_report.md` bootstrap audit |
 | `run` core | Create/locate resumable runs and emit structured events | stage name, inputs | manifest and JSONL log |
 | schemas | Validate stage manifests and edit decisions | JSON | typed Python objects/errors |
 | Remotion fixture | Deterministic short video with captions and title card | fixture JSON | MP4 render |
@@ -49,7 +49,7 @@ No language, speech, image, vision, or video-generation model is required for th
 ## Exact initial stack
 
 - Python 3.12 project runtime via `uv` or an isolated virtual environment; do not rely on system Python 3.14 compatibility for future ML packages.
-- Python: `typer`, `pydantic`, `jsonschema`, `pytest`, and a JSONL logger.
+- Python: `typer`, `pydantic`, `pytest`, and standard-library JSON/JSONL persistence.
 - Node 22 with a pinned Remotion release and TypeScript.
 - Existing FFmpeg 8 for probing and software rendering validation. Hardware encoding is a later opt-in benchmark.
 - SQLite for future project/run indexes; no Docker in Phase 1.
@@ -61,15 +61,15 @@ Vulkan is the first candidate backend. Its viability must be verified in an inte
 
 ## Failure and safety behavior
 
-- A failed stage records an error event and leaves successful upstream outputs intact.
-- Resume is denied if input checksums or configuration fingerprints differ.
+- A failed active stage atomically records failed state plus a sanitized error event and leaves successful upstream outputs intact.
+- Resume is denied if input checksums, renderer/tool provenance, or configuration fingerprints differ, or if any expected artifact is missing or has the wrong digest.
 - Doctor marks unavailable tools as `not_ready`; it does not attempt installation or repair.
 - QC failures block any later publishing stage by contract. There is no publishing command in Phase 1.
 
 ## Verification
 
 - Unit tests cover run identity, resume eligibility, schema rejection, and FFmpeg-report parsing.
-- `doctor` runs without elevated privileges and produces a machine-readable report.
+- `doctor` runs without elevated privileges and produces a JSON machine report; `system_report.md` preserves the separate human-readable bootstrap audit.
 - The synthetic fixture renders a short MP4 deterministically using Remotion and validates it with FFmpeg.
 - `benchmark` reports only local tool/backend availability in Phase 1; it does not download models.
 - A Hermes-facing command contract returns structured status, run ID, artifact paths, and retryability without requiring Hermes to parse human-oriented terminal output.
@@ -79,3 +79,7 @@ Vulkan is the first candidate backend. Its viability must be verified in an inte
 - ROCm installation or driver changes.
 - Downloading models or large media assets.
 - ComfyUI, TTS, Whisper, local LLM inference, research, asset acquisition, browser automation, OAuth, upload, or public release.
+
+## Browser network boundary
+
+The render path requires a resolved local Chrome or Chromium executable, which prevents Remotion from automatically downloading a browser. The checked-in composition uses no remote fonts, images, audio, or other URL assets. Chrome is not placed in a process-level egress sandbox in Phase 1, so these controls prevent automatic browser/runtime and composition-asset downloads but do not constitute an operating-system network isolation guarantee.

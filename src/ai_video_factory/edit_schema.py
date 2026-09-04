@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class EditScene(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
     id: str = Field(min_length=1)
     from_frame: int = Field(ge=0)
     duration_frames: int = Field(gt=0)
@@ -16,6 +18,8 @@ class EditScene(BaseModel):
 
 
 class EditDocument(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
     schema_version: Literal[1]
     width: int = Field(gt=0)
     height: int = Field(gt=0)

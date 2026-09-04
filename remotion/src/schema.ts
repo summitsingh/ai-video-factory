@@ -43,10 +43,27 @@ const nonEmptyString = (value: unknown, field: string): string => {
   return value;
 };
 
+const assertExactKeys = (
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  label: string,
+): void => {
+  const allowed = new Set(expected);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown !== undefined) {
+    throw new Error(`${label} contains unknown field: ${unknown}`);
+  }
+};
+
 const parseScene = (value: unknown): EditScene => {
   if (!isRecord(value)) {
     throw new Error('scene must be an object');
   }
+  assertExactKeys(
+    value,
+    ['id', 'from_frame', 'duration_frames', 'title', 'caption'],
+    'scene',
+  );
 
   return {
     id: nonEmptyString(value.id, 'scene id'),
@@ -61,6 +78,11 @@ export const parseEditDocument = (value: unknown): EditDocument => {
   if (!isRecord(value)) {
     throw new Error('edit document must be an object');
   }
+  assertExactKeys(
+    value,
+    ['schema_version', 'width', 'height', 'fps', 'duration_frames', 'scenes'],
+    'edit document',
+  );
 
   if (value.schema_version !== 1) {
     throw new Error('schema_version must be 1');

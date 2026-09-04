@@ -1,0 +1,118 @@
+[
+  {
+    "name": "numeric string width",
+    "document": {
+      "schema_version": 1,
+      "width": "1280",
+      "height": 720,
+      "fps": 30,
+      "duration_frames": 90,
+      "scenes": [
+        {
+          "id": "title",
+          "from_frame": 0,
+          "duration_frames": 90,
+          "title": "Synthetic test",
+          "caption": "Local render"
+        }
+      ]
+    }
+  },
+  {
+    "name": "boolean frame rate",
+    "document": {
+      "schema_version": 1,
+      "width": 1280,
+      "height": 720,
+      "fps": true,
+      "duration_frames": 90,
+      "scenes": [
+        {
+          "id": "title",
+          "from_frame": 0,
+          "duration_frames": 90,
+          "title": "Synthetic test",
+          "caption": "Local render"
+        }
+      ]
+    }
+  },
+  {
+    "name": "fractional duration",
+    "document": {
+      "schema_version": 1,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "duration_frames": 90.5,
+      "scenes": [
+        {
+          "id": "title",
+          "from_frame": 0,
+          "duration_frames": 90,
+          "title": "Synthetic test",
+          "caption": "Local render"
+        }
+      ]
+    }
+  },
+  {
+    "name": "unknown document field",
+    "document": {
+      "schema_version": 1,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "duration_frames": 90,
+      "unexpected": true,
+      "scenes": [
+        {
+          "id": "title",
+          "from_frame": 0,
+          "duration_frames": 90,
+          "title": "Synthetic test",
+          "caption": "Local render"
+        }
+      ]
+    }
+  },
+  {
+    "name": "unknown scene field",
+    "document": {
+      "schema_version": 1,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "duration_frames": 90,
+      "scenes": [
+        {
+          "id": "title",
+          "from_frame": 0,
+          "duration_frames": 90,
+          "title": "Synthetic test",
+          "caption": "Local render",
+          "unexpected": true
+        }
+      ]
+    }
+  },
+  {
+    "name": "numeric string scene offset",
+    "document": {
+      "schema_version": 1,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "duration_frames": 90,
+      "scenes": [
+        {
+          "id": "title",
+          "from_frame": "0",
+          "duration_frames": 90,
+          "title": "Synthetic test",
+          "caption": "Local render"
+        }
+      ]
+    }
+  }
+]

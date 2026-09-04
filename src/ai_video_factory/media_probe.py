@@ -8,6 +8,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from ai_video_factory.sanitization import sanitize_diagnostic
+
 
 CommandResult = tuple[int, str, str]
 CommandRunner = Callable[[Sequence[str]], CommandResult]
@@ -24,6 +26,9 @@ class MediaInfo:
     source_path: Path | None
     video_codec: str | None
     audio_codec: str | None
+    audio_sample_rate: int | None
+    audio_channels: int | None
+    audio_channel_layout: str | None
     width: int | None
     height: int | None
     frame_rate: Fraction | None
@@ -64,7 +69,9 @@ def _frame_rate(value: object) -> Fraction | None:
     try:
         return Fraction(str(value))
     except (ValueError, ZeroDivisionError) as error:
-        raise MediaProbeError(f"invalid ffprobe frame rate: {value!r}") from error
+        raise MediaProbeError(sanitize_diagnostic(
+            f"invalid ffprobe frame rate: {sanitize_diagnostic(value)!r}"
+        )) from error
 
 
 def _duration(payload: Mapping[str, Any]) -> float | None:
@@ -77,7 +84,9 @@ def _duration(payload: Mapping[str, Any]) -> float | None:
     try:
         return float(str(value))
     except ValueError as error:
-        raise MediaProbeError(f"invalid ffprobe duration: {value!r}") from error
+        raise MediaProbeError(sanitize_diagnostic(
+            f"invalid ffprobe duration: {sanitize_diagnostic(value)!r}"
+        )) from error
 
 
 def parse_ffprobe(payload: Mapping[str, Any]) -> MediaInfo:
@@ -89,6 +98,21 @@ def parse_ffprobe(payload: Mapping[str, Any]) -> MediaInfo:
         source_path=None,
         video_codec=str(video["codec_name"]) if video and video.get("codec_name") is not None else None,
         audio_codec=str(audio["codec_name"]) if audio and audio.get("codec_name") is not None else None,
+        audio_sample_rate=(
+            int(audio["sample_rate"])
+            if audio and audio.get("sample_rate") is not None
+            else None
+        ),
+        audio_channels=(
+            int(audio["channels"])
+            if audio and audio.get("channels") is not None
+            else None
+        ),
+        audio_channel_layout=(
+            str(audio["channel_layout"])
+            if audio and audio.get("channel_layout") is not None
+            else None
+        ),
         width=int(video["width"]) if video and video.get("width") is not None else None,
         height=int(video["height"]) if video and video.get("height") is not None else None,
         frame_rate=_frame_rate(video.get("avg_frame_rate")) if video else None,
@@ -98,7 +122,20 @@ def parse_ffprobe(payload: Mapping[str, Any]) -> MediaInfo:
 
 def _command_error(command: str, returncode: int, stdout: str, stderr: str) -> MediaProbeError:
     detail = stderr.strip() or stdout.strip() or f"exit code {returncode}"
-    return MediaProbeError(f"{command} failed: {detail}")
+    return MediaProbeError(
+        sanitize_diagnostic(f"{command} failed: {detail}")
+    )
+
+
+def _run_command(
+    runner: CommandRunner, argv: Sequence[str], command: str
+) -> CommandResult:
+    try:
+        return runner(argv)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise MediaProbeError(sanitize_diagnostic(
+            f"{command} could not run: {sanitize_diagnostic(error)}"
+        )) from error
 
 
 def probe_media(path: Path, runner: CommandRunner = _subprocess_runner) -> MediaInfo:
@@ -114,7 +151,7 @@ def probe_media(path: Path, runner: CommandRunner = _subprocess_runner) -> Media
         "json",
         str(media_path),
     )
-    returncode, stdout, stderr = runner(ffprobe_argv)
+    returncode, stdout, stderr = _run_command(runner, ffprobe_argv, "ffprobe")
     if returncode != 0:
         raise _command_error("ffprobe", returncode, stdout, stderr)
 
@@ -127,10 +164,16 @@ def probe_media(path: Path, runner: CommandRunner = _subprocess_runner) -> Media
 
     media = replace(parse_ffprobe(payload), source_path=media_path)
     decode_argv = ("ffmpeg", "-v", "error", "-i", str(media_path), "-f", "null", "-")
-    decode_returncode, decode_stdout, decode_stderr = runner(decode_argv)
+    decode_returncode, decode_stdout, decode_stderr = _run_command(
+        runner, decode_argv, "ffmpeg decode"
+    )
     decode_detail = None
     if decode_returncode != 0:
-        decode_detail = decode_stderr.strip() or decode_stdout.strip() or f"exit code {decode_returncode}"
+        decode_detail = sanitize_diagnostic(
+            decode_stderr.strip()
+            or decode_stdout.strip()
+            or f"exit code {decode_returncode}"
+        )
     return replace(
         media,
         decode_succeeded=decode_returncode == 0,
