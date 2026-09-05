@@ -158,31 +158,28 @@ class _Report(BaseModel):
         return self
 
 
-def _common_request(prompt: str, *, max_tokens: int) -> dict[str, object]:
+def _common_request(prompt: str) -> dict[str, object]:
     return {
         "model": _MODEL_IDENTIFIER,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "seed": 7,
         "stream": False,
-        "max_tokens": max_tokens,
+        "max_tokens": 512,
     }
 
 
 def _requests() -> tuple[dict[str, object], ...]:
-    ordinary = _common_request("Reply exactly LOCAL_OK.", max_tokens=8)
+    ordinary = _common_request("Reply exactly LOCAL_OK.")
     structured = _common_request(
-        'Return a JSON object whose status is exactly "LOCAL_OK".', max_tokens=32
+        'Return a JSON object whose status is exactly "LOCAL_OK".'
     )
     structured["response_format"] = _RESPONSE_FORMAT
     tool = _common_request(
-        "Call record_scene for scene intro lasting 3 seconds.", max_tokens=64
+        "Call record_scene for scene intro lasting 3 seconds."
     )
     tool["tools"] = _TOOLS
-    tool["tool_choice"] = {
-        "type": "function",
-        "function": {"name": "record_scene"},
-    }
+    tool["tool_choice"] = "required"
     return ordinary, structured, tool
 
 

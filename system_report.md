@@ -1,11 +1,19 @@
 # AI Video Factory — System Audit
 
-**Audited:** 2026-09-04  
-**Scope:** read-only inspection; no packages, drivers, models, credentials, or external services were changed.
+**Audited:** 2026-09-04; LM Studio follow-up 2026-09-05
+**Scope:** host inspection plus a controlled, temporary local model lifecycle;
+no packages, drivers, runtimes, model files, credentials, or external services
+were installed, downloaded, selected, updated, or changed.
 
 ## Summary
 
-This workstation has the CPU, unified memory, storage, and installed editing prerequisites for a local AI-video workflow. The AMD display driver is active, and the user belongs to the `render` and `video` groups. The inference runtime is not yet ready: `rocminfo` and HIP tooling are absent, while AMD packages built for Ubuntu 24.04 are installed on an Ubuntu 26.04 host. Do not alter the GPU stack until a supported ROCm path for this exact host is confirmed.
+This workstation has the CPU, unified memory, storage, installed editing
+prerequisites, and an LM Studio-bundled AMD runtime family needed for controlled
+local-inference verification. The AMD display driver is active, and the user
+belongs to the `render` and `video` groups. This does not establish that the
+host's separate system ROCm stack works: `rocminfo` and HIP tooling remain
+absent and unchanged. Do not alter that GPU stack until a supported ROCm path
+for this exact host is confirmed.
 
 ## Hardware
 
@@ -16,7 +24,7 @@ This workstation has the CPU, unified memory, storage, and installed editing pre
 | Kernel driver | `amdgpu` loaded and in use |
 | Memory | 122 GiB total; 115 GiB available during audit |
 | Swap | 8 GiB total; 6.9 GiB free during audit |
-| System disk | 1.8 TB NVMe; 458 GiB free on `/` |
+| System disk | 1.8 TB NVMe; approximately 457 GiB free on `/` during the LM Studio audit |
 
 ## Operating system and development tools
 
@@ -42,6 +50,46 @@ This workstation has the CPU, unified memory, storage, and installed editing pre
 - Mesa Vulkan tools and the Radeon ICD are installed. The automated audit session has no `/dev/dri` device and no X server, so its Vulkan probe cannot establish desktop GPU compatibility. This is an environment limitation of the audit session, not evidence that the interactive desktop stack is broken.
 - FFmpeg advertises `vaapi`, `drm`, `opencl`, and `vulkan` acceleration plus H.264, HEVC, AV1 VAAPI/Vulkan encoders. Actual encode behavior remains unverified until a controlled local test can access `/dev/dri`.
 
+## LM Studio inference audit
+
+| Item | Audited state |
+|---|---|
+| CLI | `/home/summit/.lmstudio/bin/lms` |
+| Bundled runtime families | AMD ROCm AVX2 is installed through `2.31.2`; Vulkan AVX2 is installed through `2.33.0` and was selected during the passing capability run; no runtime selection or update was performed |
+| Server boundary | OpenAI-compatible API bound only to `127.0.0.1:1234` (`http://127.0.0.1:1234/v1`) |
+| Bundled survey | 85.67 GiB GPU-accessible memory and 122.69 GiB system RAM |
+| Primary existing model | `qwen3.6-35b-a3b-udt-mtp`; primary GGUF 17,741,611,328 bytes plus direct `mmproj` companion 899,283,584 bytes, exactly matching LM Studio's 18,640,894,912-byte resource total; stable API identifier `avf-qwen36-executor` |
+| Primary load estimate | 17.36 GiB total at 65,536 context, maximum GPU offload, parallelism 1; LM Studio confidence `LOW` |
+| Existing fallback | `gemma-4-26b-a4b-it`; estimated 17.49 GiB total; not selected or loaded by Phase 2A |
+| Existing LM Studio storage | Approximately 922 GiB of models; no model was downloaded, moved, converted, edited, or deleted |
+| Free filesystem capacity | Approximately 457 GiB during the LM Studio audit |
+
+LM Studio's runtime-family names describe bundled backends. They are not
+evidence that the separate host ROCm installation is valid. System ROCm remains
+unverified and was not repaired, installed, removed, or otherwise changed.
+
+### Controlled capability verification
+
+The v4 capability run `2ce5b25aa1894e5185295821186c9c4f` passed ordinary
+generation, strict structured output, and an exact `record_scene` tool call
+through `http://127.0.0.1:1234/v1`. Its integrity-checked report is stored at
+`data/projects/system/runs/2ce5b25aa1894e5185295821186c9c4f/inference_report.json`.
+The measured probe latencies were 2,205.578 ms, 5,035.866 ms, and 2,742.199 ms,
+respectively. The report records the primary-file digest and exact package-size
+relationship but persists no prompts, responses, reasoning, or raw HTTP bodies.
+
+The loaded-model identifier set was empty before the controlled start and empty
+again after the targeted unload. Only `avf-qwen36-executor` was loaded and
+unloaded; the shared loopback server remained running. The existing factory
+doctor and benchmark exited successfully, and the synthetic pipeline returned
+`status: pass`. The doctor continues to report the separate system ROCm probe as
+not ready, as expected and unchanged.
+
+This passing, provenance-verified report satisfies the local-inference
+capability prerequisite for Phase 2B on the audited host. Phase 2B must still
+revalidate report provenance before use. Hermes was not installed or configured
+as part of this work.
+
 ## Compatibility decision
 
 1. Treat Vulkan as the first backend to test because the host has Mesa/Radeon Vulkan packages and it does not require completing ROCm.
@@ -50,7 +98,7 @@ This workstation has the CPU, unified memory, storage, and installed editing pre
 
 ## Capacity budget
 
-Keep at least 120 GB free for the operating system and ordinary user work. With approximately 458 GB currently available, use the remaining space conservatively:
+Keep at least 120 GB free for the operating system and ordinary user work. With approximately 457 GiB available during the LM Studio audit, use the remaining space conservatively:
 
 | Use | Initial budget |
 |---|---:|
@@ -70,4 +118,3 @@ Do not store several large language models or video-generation checkpoints concu
 - Downloading a large model or media checkpoint (over 5 GB).
 - Installing Docker, exposing a service on the network, or adding persistent system services.
 - Entering OAuth/API credentials, downloading external assets, uploading, or publishing.
-

@@ -12,10 +12,35 @@ Hermes must use the repository root as its working directory and may set
 Chrome or Chromium executable.
 
 ```sh
+uv run ai-video-factory inference doctor
+uv run ai-video-factory inference estimate
+uv run ai-video-factory inference start
+uv run ai-video-factory inference status
+uv run ai-video-factory inference benchmark
+uv run ai-video-factory inference stop
 uv run ai-video-factory doctor
 uv run ai-video-factory benchmark
 uv run ai-video-factory test-pipeline --json
 ```
+
+The six `inference` commands each emit exactly one JSON document with these
+stable fields:
+
+- `schema_version`
+- `command`
+- `status`
+- `retryable`
+- `backend`
+- `model_identifier`
+- `checks`
+- `metrics`
+- `artifacts`
+- `error`
+
+They exit `0` only when `status` is `pass`; `fail` and `not_ready` exit `2`.
+Unexpected exceptions are converted to the same versioned contract with a
+sanitized error and no traceback. All paths resolve from the repository root,
+not Hermes's ambient working directory.
 
 `doctor` and `benchmark` emit JSON diagnostic documents. The checked-in
 `system_report.md` is a separate Markdown bootstrap audit and is not rewritten
@@ -46,3 +71,12 @@ sandboxed, so this contract does not claim operating-system network isolation.
 
 Exit status is `0` on QC pass and `2` on a pipeline or QC failure. JSON mode
 never writes a traceback to stdout.
+
+Phase 2B may use local inference only after `inference benchmark` has produced
+a passing, integrity-checked capability report whose current provenance still
+matches `config/inference.toml`. The report must identify
+`avf-qwen36-executor`, served only through `http://127.0.0.1:1234/v1`. A stale,
+missing, invalid, or non-passing report is a stopping condition. Hermes must not
+load a fallback model, select or update an LM Studio runtime, enable LAN/CORS,
+stop the shared server, or unload unrelated models. This contract prepares a
+future Hermes integration; it does not claim Hermes is installed or configured.

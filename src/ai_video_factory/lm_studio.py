@@ -334,7 +334,8 @@ class LmStudioBackend:
             "-y",
         )
         result = self._command(argv, timeout=_ESTIMATE_TIMEOUT_SECONDS)
-        return self._parse_estimate(result.stdout)
+        captured_output = "\n".join((result.stdout, result.stderr))
+        return self._parse_estimate(captured_output)
 
     def start_server(self) -> None:
         """Start only the configured loopback LM Studio server."""

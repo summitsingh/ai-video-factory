@@ -441,7 +441,7 @@ def test_capability_inputs_cache_configured_model_beneath_data_root(
     inputs = service.capability_inputs(tmp_path / "data")
 
     assert inputs["model"]["identifier"] == config.identifier
-    assert inputs["corpus_version"] == "lm-studio-capability-v1"
+    assert inputs["corpus_version"] == "lm-studio-capability-v4"
     assert list((tmp_path / "data" / "system" / "model-digests").glob("*.json"))
     assert fingerprint_inputs(inputs) == fingerprint_inputs(service.capability_inputs(tmp_path / "data"))
     assert not backend.mutating_calls

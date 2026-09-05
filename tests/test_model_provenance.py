@@ -69,6 +69,34 @@ def test_hashes_model_and_atomically_caches_identity(tmp_path: Path) -> None:
     }
 
 
+def test_primary_only_inventory_size_preserves_primary_identity(tmp_path: Path) -> None:
+    cache, model, hasher = cache_fixture(tmp_path)
+
+    identity = cache.identity(model_record(model, root=tmp_path / "models"))
+
+    assert identity.size_bytes == len(b"model-bytes")
+    assert hasher.calls == [model]
+
+
+def test_accepts_exact_primary_plus_direct_mmproj_package(tmp_path: Path) -> None:
+    cache, model, hasher = cache_fixture(tmp_path)
+    companion = model.parent / "mmproj-F16.gguf"
+    companion.write_bytes(b"vision-projector")
+    inventory_size = model.stat().st_size + companion.stat().st_size
+
+    identity = cache.identity(
+        model_record(
+            model,
+            root=tmp_path / "models",
+            size_bytes=inventory_size,
+        )
+    )
+
+    assert identity.size_bytes == model.stat().st_size
+    assert identity.sha256 == hashlib.sha256(b"model-bytes").hexdigest()
+    assert hasher.calls == [model]
+
+
 def test_reuses_digest_only_when_path_size_and_mtime_match(tmp_path: Path) -> None:
     cache, model, hasher = cache_fixture(tmp_path)
     record = model_record(model, root=tmp_path / "models")
@@ -106,6 +134,59 @@ def test_rejects_inventory_size_that_disagrees_with_file(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="size"):
         cache.identity(model_record(model, root=tmp_path / "models", size_bytes=1))
+
+    assert not hasher.calls
+
+
+def test_rejects_unexplained_package_size_mismatch(tmp_path: Path) -> None:
+    cache, model, hasher = cache_fixture(tmp_path)
+    companion = model.parent / "mmproj-F16.gguf"
+    companion.write_bytes(b"vision-projector")
+
+    with pytest.raises(ValueError, match="size"):
+        cache.identity(
+            model_record(
+                model,
+                root=tmp_path / "models",
+                size_bytes=model.stat().st_size + companion.stat().st_size + 1,
+            )
+        )
+
+    assert not hasher.calls
+
+
+def test_rejects_symlinked_mmproj_companion(tmp_path: Path) -> None:
+    cache, model, hasher = cache_fixture(tmp_path)
+    projector = model.parent / "projector.gguf"
+    projector.write_bytes(b"vision-projector")
+    companion = model.parent / "mmproj-F16.gguf"
+    companion.symlink_to(projector)
+
+    with pytest.raises(ValueError, match="non-symlink"):
+        cache.identity(
+            model_record(
+                model,
+                root=tmp_path / "models",
+                size_bytes=model.stat().st_size + projector.stat().st_size,
+            )
+        )
+
+    assert not hasher.calls
+
+
+def test_does_not_count_unrelated_sibling_as_package_companion(tmp_path: Path) -> None:
+    cache, model, hasher = cache_fixture(tmp_path)
+    unrelated = model.parent / "adapter.gguf"
+    unrelated.write_bytes(b"unrelated")
+
+    with pytest.raises(ValueError, match="size"):
+        cache.identity(
+            model_record(
+                model,
+                root=tmp_path / "models",
+                size_bytes=model.stat().st_size + unrelated.stat().st_size,
+            )
+        )
 
     assert not hasher.calls
 
@@ -204,12 +285,63 @@ def test_capability_inputs_have_a_deterministic_sanitized_fingerprint(tmp_path: 
     model_path.write_bytes(b"model-bytes")
     model = model_record(model_path, root=model_root)
     identity = ModelDigestCache(tmp_path / "cache", model_root=model_root).identity(model)
-    inputs = capability_inputs(config(tmp_path), snapshot(model), identity, "lm-studio-capability-v1")
+    inputs = capability_inputs(config(tmp_path), snapshot(model), identity, "lm-studio-capability-v4")
 
-    assert inputs["corpus_version"] == "lm-studio-capability-v1"
+    assert inputs["corpus_version"] == "lm-studio-capability-v4"
     assert inputs["runtime"] == "rocm-runtime 2.31.2 token=[REDACTED]"
     assert inputs["amd_survey"] == "AMD Radeon 8060S\nsecret=[REDACTED]"
     assert inputs["model"]["sha256"] == hashlib.sha256(b"model-bytes").hexdigest()
+    assert inputs["model"]["size_bytes"] == len(b"model-bytes")
+    assert inputs["model"]["inventory_size_bytes"] == len(b"model-bytes")
+    assert inputs["model"]["companion_size_bytes"] == 0
     assert fingerprint_inputs(inputs) == fingerprint_inputs(
-        capability_inputs(config(tmp_path), snapshot(model), identity, "lm-studio-capability-v1")
+        capability_inputs(config(tmp_path), snapshot(model), identity, "lm-studio-capability-v4")
     )
+
+
+def test_capability_fingerprint_changes_when_companion_size_changes(
+    tmp_path: Path,
+) -> None:
+    model_root = tmp_path / "models"
+    model_path = model_root / "publisher" / "model.gguf"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"model-bytes")
+    companion = model_path.parent / "mmproj-F16.gguf"
+    companion.write_bytes(b"vision")
+    cache = ModelDigestCache(tmp_path / "cache", model_root=model_root)
+
+    first_model = model_record(
+        model_path,
+        root=model_root,
+        size_bytes=model_path.stat().st_size + companion.stat().st_size,
+    )
+    first_identity = cache.identity(first_model)
+    first = capability_inputs(
+        config(tmp_path),
+        snapshot(first_model),
+        first_identity,
+        "lm-studio-capability-v4",
+    )
+
+    companion.write_bytes(b"vision-expanded")
+    second_model = model_record(
+        model_path,
+        root=model_root,
+        size_bytes=model_path.stat().st_size + companion.stat().st_size,
+    )
+    second_identity = cache.identity(second_model)
+    second = capability_inputs(
+        config(tmp_path),
+        snapshot(second_model),
+        second_identity,
+        "lm-studio-capability-v4",
+    )
+
+    assert first["model"]["inventory_size_bytes"] == len(b"model-bytesvision")
+    assert first["model"]["companion_size_bytes"] == len(b"vision")
+    assert second["model"]["inventory_size_bytes"] == len(
+        b"model-bytesvision-expanded"
+    )
+    assert second["model"]["companion_size_bytes"] == len(b"vision-expanded")
+    assert first_identity.sha256 == second_identity.sha256
+    assert fingerprint_inputs(first) != fingerprint_inputs(second)

@@ -23,7 +23,7 @@ MemoryReader = Callable[[], float]
 _LIFECYCLE_TIMEOUT_SECONDS = 600.0
 _POLL_INTERVAL_SECONDS = 1.0
 _MEM_AVAILABLE = re.compile(r"^MemAvailable:\s*(\d+)\s+kB\s*$")
-_CAPABILITY_CORPUS_VERSION = "lm-studio-capability-v1"
+_CAPABILITY_CORPUS_VERSION = "lm-studio-capability-v4"
 
 
 def available_memory_gib(path: Path = Path("/proc/meminfo")) -> float:

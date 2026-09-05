@@ -53,7 +53,11 @@ class ModelDigestCache:
         """Return a SHA-256 identity without modifying or relocating the model."""
         path, relative_path, file_stat = self._contained_file(model)
         if file_stat.st_size != model.size_bytes:
-            raise ValueError("LM Studio inventory size does not match the contained model file")
+            companion_size = self._direct_companion_size(path)
+            if file_stat.st_size + companion_size != model.size_bytes:
+                raise ValueError(
+                    "LM Studio inventory size does not match the contained model package"
+                )
 
         cache_path = self._cache_path(relative_path)
         cached_digest = self._cached_digest(
@@ -82,6 +86,42 @@ class ModelDigestCache:
         return model.identity(self.identifier or model.model_key).model_copy(
             update={"relative_path": relative_path, "size_bytes": file_stat.st_size, "sha256": digest}
         )
+
+    def _direct_companion_size(self, primary: Path) -> int:
+        root = self.model_root.resolve(strict=False)
+        try:
+            candidates = tuple(primary.parent.glob("mmproj*.gguf"))
+        except OSError as exc:
+            raise ValueError("LM Studio model companions could not be inspected") from exc
+
+        total = 0
+        for candidate in candidates:
+            if candidate == primary:
+                continue
+            try:
+                companion_stat = candidate.lstat()
+                if stat.S_ISLNK(companion_stat.st_mode):
+                    raise ValueError(
+                        "LM Studio model companion must be a regular non-symlink file"
+                    )
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+            except ValueError:
+                raise
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(
+                    "LM Studio model companion must be contained by models_directory"
+                ) from exc
+            if resolved.parent != primary.parent:
+                raise ValueError(
+                    "LM Studio model companion must be directly beside the primary model"
+                )
+            if not stat.S_ISREG(companion_stat.st_mode):
+                raise ValueError(
+                    "LM Studio model companion must be a regular non-symlink file"
+                )
+            total += companion_stat.st_size
+        return total
 
     def _contained_file(self, model: LmStudioModel) -> tuple[Path, str, os.stat_result]:
         root = self.model_root.resolve(strict=False)
@@ -184,11 +224,22 @@ def capability_inputs(
     corpus_version: str,
 ) -> dict[str, object]:
     """Return the sanitized, deterministic inputs for a capability run."""
+    inventory_size = snapshot.configured_model.size_bytes
+    companion_size = inventory_size - identity.size_bytes
+    if companion_size < 0:
+        raise ValueError("LM Studio inventory size is smaller than the primary model file")
+    model = identity.model_dump(mode="json")
+    model.update(
+        {
+            "inventory_size_bytes": inventory_size,
+            "companion_size_bytes": companion_size,
+        }
+    )
     return {
         "config": config.model_dump(mode="json"),
         "cli": sanitize_diagnostic(snapshot.cli_help),
         "runtime": sanitize_diagnostic(snapshot.runtimes),
         "amd_survey": sanitize_diagnostic(snapshot.runtime_survey),
-        "model": identity.model_dump(mode="json"),
+        "model": model,
         "corpus_version": corpus_version,
     }

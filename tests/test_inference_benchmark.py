@@ -284,17 +284,35 @@ def test_benchmark_sends_three_deterministic_requests_without_credentials(
     assert all(call.body["seed"] == 7 for call in transport.calls if call.body)
     assert all(call.body["stream"] is False for call in transport.calls if call.body)
     assert all(
-        0 < call.body["max_tokens"] <= 64
+        call.body["max_tokens"] == 512
         for call in transport.calls
         if call.body
     )
+    serialized_requests = json.dumps([call.body for call in transport.calls])
+    for thinking_control in ("/no_think", "<|think_off|>", "chat_template_kwargs"):
+        assert thinking_control not in serialized_requests
+    assert [call.body["messages"] for call in transport.calls] == [
+        [{"role": "user", "content": "Reply exactly LOCAL_OK."}],
+        [
+            {
+                "role": "user",
+                "content": 'Return a JSON object whose status is exactly "LOCAL_OK".',
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": "Call record_scene for scene intro lasting 3 seconds.",
+            }
+        ],
+    ]
     assert transport.calls[0].body == {
         "model": "avf-qwen36-executor",
         "messages": [{"role": "user", "content": "Reply exactly LOCAL_OK."}],
         "temperature": 0,
         "seed": 7,
         "stream": False,
-        "max_tokens": 8,
+        "max_tokens": 512,
     }
     assert transport.calls[1].body["response_format"] == {
         "type": "json_schema",
@@ -326,10 +344,8 @@ def test_benchmark_sends_three_deterministic_requests_without_credentials(
             },
         }
     ]
-    assert transport.calls[2].body["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "record_scene"},
-    }
+    assert len(transport.calls[2].body["tools"]) == 1
+    assert transport.calls[2].body["tool_choice"] == "required"
 
 
 def test_report_persists_metrics_but_not_prompts_or_response_text(
@@ -349,6 +365,7 @@ def test_report_persists_metrics_but_not_prompts_or_response_text(
         if path.is_file()
     )
     assert secret_response not in persisted
+    assert "chat_template_kwargs" not in persisted
     assert "Reply exactly LOCAL_OK" not in persisted
     assert "call-secret-id" not in persisted
     assert "chatcmpl-secret-id" not in persisted

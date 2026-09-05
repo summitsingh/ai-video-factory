@@ -1,8 +1,9 @@
 # AI Video Factory
 
-Phase 1 is a local-only, deterministic synthetic-video workflow. It does not
-download models or media, access credentials, publish content, install system
-software, or change device drivers.
+Phase 1 is a local-only, deterministic synthetic-video workflow. Phase 2A adds
+a controlled LM Studio boundary for one already-installed Qwen model. Neither
+workflow downloads models or media, accesses credentials, publishes content,
+installs system software, changes runtimes, or changes device drivers.
 
 ## Clean-checkout bootstrap
 
@@ -43,10 +44,54 @@ The `doctor` command emits the current JSON machine report. The checked-in
 `system_report.md` is the separate human-readable bootstrap audit; `doctor`
 does not rewrite it.
 
+## Local inference lifecycle
+
+Run the following commands separately and in order from the repository root.
+Record the loaded identifiers from both `lms ps --json` calls and require the
+unrelated before and after sets to match exactly.
+
+```sh
+uv run ai-video-factory inference doctor
+uv run ai-video-factory inference estimate
+lms ps --json
+uv run ai-video-factory inference start
+uv run ai-video-factory inference status
+uv run ai-video-factory inference benchmark
+uv run ai-video-factory doctor
+uv run ai-video-factory benchmark
+uv run ai-video-factory test-pipeline --json
+uv run ai-video-factory inference stop
+uv run ai-video-factory inference status
+lms ps --json
+```
+
+Every `inference` command emits exactly one versioned JSON document. A passing
+result exits `0`; `fail` and `not_ready` both exit `2`. The final inference
+status is therefore expected to exit `2` with a sanitized `not_ready` document
+after a successful stop confirms that the configured model is absent.
+
+`inference doctor`, `status`, and both `lms ps` calls are read-only.
+`inference estimate` uses LM Studio's estimate-only mode and applies the 40 GiB
+available-memory gate without loading a model. `inference start` may start only
+the `127.0.0.1:1234` server and loads only the existing Qwen model as
+`avf-qwen36-executor`. `inference benchmark` makes three loopback requests and
+may read/hash the existing model for provenance; it writes only ignored report
+and run-state data beneath `data/`. The generated primary-model digest cache is
+kept only beneath ignored `data/system/model-digests/`; model files and
+companions are never written. `inference stop` unloads only the stable
+identifier and never stops the shared server or unloads another model.
+
+If an inference step or probe fails, immediately run the targeted
+`uv run ai-video-factory inference stop`, verify with `lms ps --json` that
+`avf-qwen36-executor` is absent and unrelated identifiers are unchanged, and do
+not treat the host as ready for Phase 2B. Phase 2B may consume only a passing,
+provenance-verified capability report for the stable loopback identifier.
+
 At render time, an explicit local browser path prevents Remotion from
 automatically downloading a browser, and the checked-in composition contains
 no remote assets. Chrome is not process-level egress sandboxed, so this is not
 an operating-system offline guarantee.
 
-Hermes uses only these CLI commands and parses the JSON response from
-`test-pipeline --json`; see [the Hermes command contract](docs/hermes-command-contract.md).
+Future Hermes orchestration may use only the documented CLI commands and their
+JSON responses; Hermes is not installed or configured by Phase 2A. See
+[the Hermes command contract](docs/hermes-command-contract.md).

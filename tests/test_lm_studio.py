@@ -384,6 +384,51 @@ def test_estimate_uses_exact_nonloading_vector(config: InferenceConfig) -> None:
     assert runner.timeouts == [60.0]
 
 
+def test_estimate_accepts_valid_labels_on_stderr(config: InferenceConfig) -> None:
+    runner = RecordingRunner(
+        {
+            EXPECTED_ESTIMATE_COMMAND: ProcessResult(
+                0,
+                "Preparing estimate\n",
+                "Estimated GPU Memory: 17.36 GiB\n"
+                "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n",
+            )
+        }
+    )
+
+    estimate = lm_studio.LmStudioBackend(config, runner=runner).estimate()
+
+    assert estimate.gpu_gib == 17.36
+    assert estimate.total_gib == 17.36
+    assert estimate.confidence == "LOW"
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "Estimated GPU Memory: 17.36 GiB\n",
+        "Estimated GPU Memory: 17.49 GiB\n",
+    ],
+    ids=["duplicate", "conflicting"],
+)
+def test_estimate_rejects_duplicate_or_conflicting_labels_split_across_streams(
+    config: InferenceConfig, stderr: str,
+) -> None:
+    runner = RecordingRunner(
+        {
+            EXPECTED_ESTIMATE_COMMAND: ProcessResult(
+                0,
+                "Estimated GPU Memory: 17.36 GiB\n"
+                "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n",
+                stderr,
+            )
+        }
+    )
+
+    with pytest.raises(LmStudioError, match="estimate output"):
+        lm_studio.LmStudioBackend(config, runner=runner).estimate()
+
+
 @pytest.mark.parametrize(
     "output",
     [
