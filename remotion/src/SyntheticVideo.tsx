@@ -161,6 +161,19 @@ const SceneCard = ({
     extrapolateRight: 'clamp',
   });
 
+  // Intro / outro scenes render as dedicated branded sequences.
+  if (scene.kind === 'intro') {
+    return (
+      <IntroSequence
+        title={scene.title}
+        subtitle={scene.caption || ''}
+      />
+    );
+  }
+  if (scene.kind === 'outro') {
+    return <OutroSequence title={scene.title} sources={sources} />;
+  }
+
   return (
     <AbsoluteFill
       style={{
@@ -179,6 +192,8 @@ const SceneCard = ({
           pointerEvents: 'none',
         }}
       />
+      {/* Lower third: animated topic bar */}
+      {scene.caption && <LowerThird text={scene.caption} />}
       <AbsoluteFill
         style={{
           alignItems: 'center',
@@ -302,6 +317,216 @@ const ProgressBar = () => {
 };
 
 const TRANSITION_FRAMES = 24; // ~0.8s cross-dissolve at 30fps
+
+// Intro sequence: branded title card with animated reveal.
+const IntroSequence = ({title, subtitle}: {title: string; subtitle: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const titleIn = interpolate(frame, [0, 30], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  const subtitleIn = interpolate(frame, [24, 54], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  const lineExpand = interpolate(frame, [18, 48], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill>
+      <StarField count={120} />
+      <AbsoluteFill
+        style={{
+          background:
+            'radial-gradient(ellipse at center, #0a1a3d 0%, #000000 100%)',
+        }}
+      />
+      <AbsoluteFill
+        style={{
+          alignItems: 'center',
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'center',
+          fontFamily: 'Arial, sans-serif',
+          textAlign: 'center',
+        }}
+      >
+        <div
+          style={{
+            color: '#22d3ee',
+            fontSize: Math.round(height * 0.03),
+            fontWeight: 700,
+            letterSpacing: '0.4em',
+            opacity: titleIn,
+            transform: `translateY(${-10 * (1 - titleIn)}px)`,
+          }}
+        >
+          A DOCUMENTARY PRESENTATION
+        </div>
+        <div
+          style={{
+            color: '#f8fafc',
+            fontSize: Math.round(height * 0.075),
+            fontWeight: 800,
+            letterSpacing: '-0.03em',
+            lineHeight: 1.1,
+            marginTop: height * 0.04,
+            maxWidth: '90%',
+            textShadow: '0 4px 24px rgba(0,0,0,0.8)',
+            opacity: titleIn,
+            transform: `translateY(${-20 * (1 - titleIn)}px)`,
+          }}
+        >
+          {title}
+        </div>
+        <div
+          style={{
+            height: 4,
+            width: `${lineExpand * 200}px`,
+            backgroundColor: '#22d3ee',
+            marginTop: height * 0.04,
+            opacity: titleIn,
+            boxShadow: '0 0 16px rgba(34,211,238,0.6)',
+          }}
+        />
+        <div
+          style={{
+            color: '#cbd5e1',
+            fontSize: Math.round(height * 0.035),
+            fontWeight: 500,
+            letterSpacing: '0.05em',
+            marginTop: height * 0.04,
+            opacity: subtitleIn,
+            transform: `translateY(${-15 * (1 - subtitleIn)}px)`,
+          }}
+        >
+          {subtitle}
+        </div>
+      </AbsoluteFill>
+    </AbsoluteFill>
+  );
+};
+
+// Outro/credits sequence.
+const OutroSequence = ({title, sources}: {title: string; sources?: string[]}) => {
+  const frame = useCurrentFrame();
+  const {height} = useVideoConfig();
+  const contentIn = interpolate(frame, [0, 42], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill>
+      <StarField count={100} />
+      <AbsoluteFill
+        style={{
+          background:
+            'radial-gradient(ellipse at center, #1a0a2d 0%, #000000 100%)',
+        }}
+      />
+      <AbsoluteFill
+        style={{
+          alignItems: 'center',
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'center',
+          fontFamily: 'Arial, sans-serif',
+          textAlign: 'center',
+          opacity: contentIn,
+          transform: `translateY(${-15 * (1 - contentIn)}px)`,
+        }}
+      >
+        <div
+          style={{
+            color: '#f8fafc',
+            fontSize: Math.round(height * 0.06),
+            fontWeight: 800,
+            letterSpacing: '-0.02em',
+            lineHeight: 1.15,
+            maxWidth: '90%',
+            textShadow: '0 4px 24px rgba(0,0,0,0.8)',
+          }}
+        >
+          {title}
+        </div>
+        <div
+          style={{
+            height: 3,
+            width: 160,
+            backgroundColor: '#a855f7',
+            marginTop: height * 0.03,
+            marginBottom: height * 0.04,
+          }}
+        />
+        <div
+          style={{
+            color: '#94a3b8',
+            fontSize: Math.round(height * 0.028),
+            fontWeight: 500,
+            letterSpacing: '0.1em',
+          }}
+        >
+          PRODUCTION · AI VIDEO FACTORY
+        </div>
+        {sources && sources.length > 0 && (
+          <div
+            style={{
+              color: '#64748b',
+              fontSize: Math.round(height * 0.02),
+              marginTop: height * 0.03,
+              maxWidth: '85%',
+              fontStyle: 'italic',
+            }}
+          >
+            Sources: {sources.join(' · ').slice(0, 140)}
+          </div>
+        )}
+      </AbsoluteFill>
+    </AbsoluteFill>
+  );
+};
+
+// Lower third: animated topic bar that slides in at the bottom of frame.
+const LowerThird = ({text}: {text: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const enter = interpolate(frame, [0, 18], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill
+      style={{
+        bottom: height * 0.14,
+        left: width * 0.06,
+        opacity: enter,
+        transform: `translateX(${-20 * (1 - enter)}px)`,
+      }}
+    >
+      <div
+        style={{
+          backgroundColor: 'rgba(34, 211, 238, 0.9)',
+          padding: `${height * 0.01}px ${width * 0.03}px`,
+          borderRadius: 6,
+          boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+        }}
+      >
+        <div
+          style={{
+            color: '#0a0a0a',
+            fontSize: Math.round(height * 0.03),
+            fontWeight: 700,
+            letterSpacing: '0.02em',
+          }}
+        >
+          {text}
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
 
 export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
   return (

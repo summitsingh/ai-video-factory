@@ -17,6 +17,7 @@ class EditScene(BaseModel):
     duration_frames: int = Field(gt=0)
     title: str = Field(min_length=1)
     caption: str = Field(min_length=1)
+    kind: Literal["normal", "intro", "outro"] = Field(default="normal")
     
     # Extended fields for rich content
     visual: str | None = None

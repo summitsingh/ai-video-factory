@@ -4,6 +4,7 @@ export type EditScene = {
   duration_frames: number;
   title: string;
   caption: string;
+  kind?: 'normal' | 'intro' | 'outro';
   visual?: string;
   narration?: string;
   background?: string;
@@ -72,7 +73,7 @@ const parseScene = (value: unknown): EditScene => {
   }
   assertExactKeys(
     value,
-    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'visual', 'narration', 'background', 'text_color', 'accent_color', 'image', 'clip'],
+    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'kind', 'visual', 'narration', 'background', 'text_color', 'accent_color', 'image', 'clip'],
     'scene',
   );
 
@@ -82,6 +83,9 @@ const parseScene = (value: unknown): EditScene => {
     duration_frames: positiveInteger(value.duration_frames, 'scene duration_frames'),
     title: nonEmptyString(value.title, 'scene title'),
     caption: nonEmptyString(value.caption, 'scene caption'),
+    kind: value.kind === 'normal' || value.kind === 'intro' || value.kind === 'outro'
+      ? value.kind
+      : 'normal',
     visual: typeof value.visual === 'string' ? value.visual : undefined,
     narration: typeof value.narration === 'string' ? value.narration : undefined,
     background: typeof value.background === 'string' ? value.background : 'gradient',

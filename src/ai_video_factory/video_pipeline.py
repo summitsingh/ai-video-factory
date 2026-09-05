@@ -292,6 +292,9 @@ def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocu
     assets_dir. Prefers one clip then one image per scene; scenes without
     assets keep the title-card look. Paths are stored as filenames that
     will be copied to Remotion's public directory prior to rendering.
+
+    Scenes are matched by their numeric id suffix (``scene-0`` -> ``scene-00/``),
+    so intro/outro sequences and any reordering do not shift asset lookup.
     """
     if assets_dir is None:
         return edit
@@ -299,23 +302,29 @@ def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocu
     if not assets_dir.is_dir():
         return edit
     scenes: list[EditScene] = []
-    for i, scene in enumerate(edit.scenes):
-        scene_dir = assets_dir / f"scene-{i:02d}"
+    for scene in edit.scenes:
         update: dict[str, Any] = {}
-        if scene_dir.is_dir():
-            clips = sorted(scene_dir.glob("*clip*.mp4"))
-            images = sorted(
-                [p for p in scene_dir.iterdir()
-                 if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
-                 and p.is_file()]
-            )
-            # Use a scene-specific filename so each scene resolves to its own
-            # media file in Remotion's public/ directory instead of all scenes
-            # colliding on one shared name.
-            if clips:
-                update["clip"] = f"scene-{i:02d}-clip{clips[0].suffix}"
-            if images:
-                update["image"] = f"scene-{i:02d}-image{images[0].suffix}"
+        # Only normal content scenes have per-scene asset directories.
+        if scene.id.startswith("scene-"):
+            try:
+                idx = int(scene.id.split("-", 1)[1])
+            except ValueError:
+                idx = None
+            if idx is not None:
+                scene_dir = assets_dir / f"scene-{idx:02d}"
+                if scene_dir.is_dir():
+                    clips = sorted(scene_dir.glob("*clip*.mp4"))
+                    images = sorted(
+                        [p for p in scene_dir.iterdir()
+                         if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+                         and p.is_file()]
+                    )
+                    # Use a scene-specific filename so each scene resolves to
+                    # its own media file in Remotion's public/ directory.
+                    if clips:
+                        update["clip"] = f"scene-{idx:02d}-clip{clips[0].suffix}"
+                    if images:
+                        update["image"] = f"scene-{idx:02d}-image{images[0].suffix}"
         scenes.append(scene.model_copy(update=update) if update else scene)
     return edit.model_copy(update={"scenes": scenes})
 
@@ -727,12 +736,34 @@ def run_video_pipeline(
         duration_seconds = job.duration_seconds
         total_frames = duration_seconds * fps
 
-        # Distribute the full composition duration evenly across scenes so no
-        # blank tail remains when the script returns fewer/shorter scenes.
+        # Reserve fixed durations for branded intro/outro sequences. These are
+        # dedicated scenes so they render once (chunk-safe) and concatenate in
+        # order with the normal content.
+        INTRO_FRAMES = 150   # 5s branded title card
+        OUTRO_FRAMES = 180   # 6s credits sequence
+
+        # Distribute remaining frames across normal scenes so no blank tail
+        # remains when the script returns fewer/shorter scenes.
+        content_frames = total_frames - INTRO_FRAMES - OUTRO_FRAMES
         scene_count = max(len(script.scenes), 1)
-        base_frames, remainder = divmod(total_frames, scene_count)
-        scenes = []
+        base_frames, remainder = divmod(content_frames, scene_count)
+
+        scenes: list[EditScene] = []
         cursor = 0
+
+        # Intro sequence first.
+        intro_scene = EditScene(
+            id="intro",
+            from_frame=cursor,
+            duration_frames=INTRO_FRAMES,
+            title=job.title or f"Trending: {job.topic}",
+            caption=job.description or job.topic,
+            kind="intro",
+        )
+        scenes.append(intro_scene)
+        cursor += INTRO_FRAMES
+
+        # Normal content scenes.
         for i, scene_data in enumerate(script.scenes):
             span = base_frames + (1 if i < remainder else 0)
             scene = EditScene(
@@ -746,6 +777,17 @@ def run_video_pipeline(
             )
             scenes.append(scene)
             cursor += span
+
+        # Outro sequence last.
+        outro_scene = EditScene(
+            id="outro",
+            from_frame=cursor,
+            duration_frames=OUTRO_FRAMES,
+            title=job.title or f"Trending: {job.topic}",
+            caption="The Eyes That See Everything",
+            kind="outro",
+        )
+        scenes.append(outro_scene)
 
         edit_doc = EditDocument(
             schema_version=1,
