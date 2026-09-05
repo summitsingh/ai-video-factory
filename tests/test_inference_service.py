@@ -519,6 +519,22 @@ def test_capability_inputs_cache_configured_model_beneath_data_root(
     assert not backend.mutating_calls
 
 
+def test_current_capability_inputs_recomputes_unloaded_provenance_without_cache_writes(
+    config: InferenceConfig, tmp_path: Path,
+) -> None:
+    model = Path(config.models_directory) / "publisher" / "model.gguf"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"model-bytes")
+    service, backend, _clock = service_fixture(config, loaded=[])
+    data_root = tmp_path / "data"
+
+    inputs = service.current_capability_inputs(data_root)
+
+    assert inputs["model"]["identifier"] == config.identifier
+    assert not (data_root / "system" / "model-digests").exists()
+    assert not backend.mutating_calls
+
+
 def test_chat_completion_uses_injected_loopback_transport_without_credentials(
     config: InferenceConfig,
 ) -> None:

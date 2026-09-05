@@ -74,6 +74,18 @@ def test_unconfigured_delegation_is_not_ready_and_never_leaks_secrets() -> None:
     assert "api_key" not in result.model_dump_json().casefold()
 
 
+def test_merged_empty_route_defaults_are_unconfigured_not_ready() -> None:
+    result = HermesService(
+        config(),
+        backend=Backend(snapshot(
+            delegation_model=None, delegation_base_url=None, delegation_api_mode=None,
+        )),
+        text_capability=lambda: True,
+    ).doctor()
+
+    assert result.status == "not_ready"
+
+
 def test_partial_delegation_is_a_fail_closed_configuration_conflict() -> None:
     result = HermesService(
         config(), backend=Backend(snapshot(delegation_model=None)), text_capability=lambda: True,
@@ -86,6 +98,7 @@ def test_doctor_fails_closed_for_wrong_provider_paid_model_remote_or_recursion()
     for changes in (
         {"parent_provider": "other"},
         {"parent_model": "paid-model"},
+        {"delegation_model": "wrong-local-model"},
         {"delegation_base_url": "https://remote.example/v1"},
         {"delegation_api_mode": "responses"},
         {"delegation_max_iterations": 49},
@@ -96,6 +109,19 @@ def test_doctor_fails_closed_for_wrong_provider_paid_model_remote_or_recursion()
         {"delegation_inherit_mcp_toolsets": True},
     ):
         result = HermesService(config(), backend=Backend(snapshot(**changes)), text_capability=lambda: True).doctor()
+        assert result.status == "fail"
+
+
+def test_doctor_fails_closed_for_installation_identity_drift() -> None:
+    for changed in (
+        snapshot(version="0.21.1"),
+        snapshot(commit="deadbeef"),
+        snapshot(config_valid=False),
+        snapshot().model_copy(update={"profile": "other"}),
+        snapshot(delegation_model=None, delegation_base_url=None, delegation_api_mode=None,
+                 delegation_max_iterations=49),
+    ):
+        result = HermesService(config(), backend=Backend(changed), text_capability=lambda: True).doctor()
         assert result.status == "fail"
 
 

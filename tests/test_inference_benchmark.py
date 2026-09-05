@@ -12,6 +12,9 @@ import pytest
 from ai_video_factory.inference_benchmark import current_text_capability, run_capability_benchmark
 from ai_video_factory.inference_config import InferenceConfig
 from ai_video_factory.inference_service import InferenceService
+from ai_video_factory.hermes_config import HermesConfig
+from ai_video_factory.hermes_models import HermesSnapshot
+from ai_video_factory.hermes_service import HermesService
 from ai_video_factory.lm_studio import LmStudioError, LmStudioModel
 from ai_video_factory.run_store import RunStore
 
@@ -427,6 +430,56 @@ def test_current_text_capability_is_read_only_and_requires_current_intact_report
     before = manifest_path.read_text(encoding="utf-8")
     assert current_text_capability(service, store, data_root) is False
     assert manifest_path.read_text(encoding="utf-8") == before
+
+
+def test_current_text_capability_remains_valid_after_configured_model_unloads(
+    tmp_path: Path,
+) -> None:
+    service, store, data_root, _transport = benchmark_fixture(tmp_path)
+    result = run_capability_benchmark(service, store, data_root)
+    backend = service.backend
+    backend.loaded_identifier = None  # type: ignore[attr-defined]
+
+    assert result.status == "pass"
+    assert current_text_capability(service, store, data_root) is True
+
+
+def test_hermes_doctor_uses_real_unloaded_current_capability_report(tmp_path: Path) -> None:
+    service, store, data_root, _transport = benchmark_fixture(tmp_path)
+    report = run_capability_benchmark(service, store, data_root)
+    service.backend.loaded_identifier = None  # type: ignore[attr-defined]
+    hermes_config = HermesConfig(
+        schema_version=1, hermes_binary="hermes", required_version="0.21.0",
+        required_commit="b0ab2e16", profile="default", parent_provider="nous",
+        parent_model="stepfun/step-3.7-flash:free",
+        delegation_base_url="http://127.0.0.1:1234/v1", delegation_model="avf-qwen36-executor",
+        delegation_api_mode="chat_completions", local_api_key_placeholder="no-key-required",
+        max_concurrent_children=1, max_iterations=50, vision_fixture="assets/vision/capability-probe.png",
+        fallback_provider="nous", fallback_model="stepfun/step-3.7-flash:free",
+    )
+    hermes_snapshot = HermesSnapshot.model_validate({
+        "hermes_path": "/home/summit/.local/bin/hermes", "version": "0.21.0",
+        "commit": "b0ab2e16", "config_path": "/safe/config.yaml", "profile": "default",
+        "config_valid": True, "parent_provider": "nous",
+        "parent_model": "stepfun/step-3.7-flash:free", "parent_base_url": "https://nous.example/v1",
+        "delegation_model": "avf-qwen36-executor", "delegation_base_url": "http://127.0.0.1:1234/v1",
+        "delegation_api_mode": "chat_completions", "delegation_max_iterations": 50,
+        "delegation_max_concurrent_children": 1, "delegation_max_spawn_depth": 1,
+        "delegation_orchestrator_enabled": False, "delegation_subagent_auto_approve": False,
+        "delegation_inherit_mcp_toolsets": False,
+        "auxiliary_routes": {name: {"enabled": False, "base_url": None, "model": None}
+            for name in ("vision", "web_extract", "compression", "title_generation", "background_review")},
+    })
+    backend = type("HermesBackend", (), {"snapshot": lambda self: hermes_snapshot})()
+    doctor = HermesService(
+        hermes_config, backend=backend, inference_service=service, run_store=store, data_root=data_root,
+    )
+
+    assert report.status == "pass"
+    assert doctor.doctor().status == "pass"
+
+    Path(report.artifacts["report"]).write_text("{}\n", encoding="utf-8")
+    assert doctor.doctor().status == "not_ready"
 
 
 def test_tampered_report_is_invalidated_and_reexecuted(tmp_path: Path) -> None:

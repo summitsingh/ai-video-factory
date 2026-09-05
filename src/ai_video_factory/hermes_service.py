@@ -79,6 +79,18 @@ class HermesService:
             snapshot.delegation_subagent_auto_approve,
             snapshot.delegation_inherit_mcp_toolsets,
         )
+        route_values = values[:3]
+        safety_values = values[3:]
+        expected_safety = (
+            self.config.max_iterations,
+            self.config.max_concurrent_children,
+            1,
+            False,
+            False,
+            False,
+        )
+        if all(value is None for value in route_values) and safety_values == expected_safety:
+            return self._check(False, "delegation is not configured"), True
         if all(value is None for value in values):
             return self._check(False, "delegation is not configured"), True
         if any(value is None for value in values):

@@ -71,6 +71,16 @@ def snapshot_outputs() -> dict[tuple[str, ...], ProcessResult]:
     return {argv: result(value) for argv, value in values.items()}
 
 
+def merged_default_outputs() -> dict[tuple[str, ...], ProcessResult]:
+    outputs = snapshot_outputs()
+    outputs.update({
+        ("hermes", "config", "get", "delegation.model"): result("\n"),
+        ("hermes", "config", "get", "delegation.base_url"): result("\n"),
+        ("hermes", "config", "get", "delegation.api_mode"): result("\n"),
+    })
+    return outputs
+
+
 def test_allowlist_contains_only_the_fixed_read_only_vectors() -> None:
     assert ALLOWED_COMMANDS == frozenset(snapshot_outputs())
 
@@ -99,15 +109,18 @@ def test_default_runner_uses_resolved_executable_without_shell(
     observed = run_process(("hermes", "--version"), timeout=15.0)
 
     assert observed.executable_path == str(executable)
-    assert calls == [
-        ((str(executable), "--version"), {
-            "shell": False,
-            "capture_output": True,
-            "text": True,
-            "timeout": 15.0,
-            "check": False,
-        })
-    ]
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv[0].startswith("/proc/self/fd/")
+    assert argv[1:] == ("--version",)
+    assert kwargs == {
+        "shell": False,
+        "capture_output": True,
+        "text": True,
+        "timeout": 15.0,
+        "check": False,
+        "pass_fds": (int(argv[0].rsplit("/", 1)[1]),),
+    }
 
 
 def test_default_runner_maps_only_documented_missing_config_key(
@@ -171,7 +184,7 @@ def test_default_runner_rejects_combined_oversized_output(
         run_process(("hermes", "--version"), timeout=15.0)
 
 
-def test_resolver_rejects_symlink_and_detects_replacement_after_execution(
+def test_resolver_rejects_symlink_binds_swap_restore_to_opened_file_and_detects_mutation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     target = tmp_path / "target"
@@ -182,7 +195,7 @@ def test_resolver_rejects_symlink_and_detects_replacement_after_execution(
     monkeypatch.setattr("ai_video_factory.hermes_backend._HERMES_PATH", executable)
     monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: str(executable))
 
-    with pytest.raises(HermesError, match="canonical"):
+    with pytest.raises(HermesError, match="resolved|canonical"):
         run_process(("hermes", "--version"), timeout=15.0)
 
     executable.unlink()
@@ -194,14 +207,26 @@ def test_resolver_rejects_symlink_and_detects_replacement_after_execution(
         stdout = "Hermes Agent v0.21.0 (2026.8.31) · upstream b0ab2e16"
         stderr = ""
 
-    def swap(*_args: object, **_kwargs: object) -> Completed:
+    def swap_and_restore(argv: tuple[str, ...], **_kwargs: object) -> Completed:
+        assert argv[0].startswith("/proc/self/fd/")
+        original = tmp_path / "original"
+        os.replace(executable, original)
         replacement = tmp_path / "replacement"
         replacement.write_text("#!/bin/sh\n# replacement\n", encoding="utf-8")
         replacement.chmod(0o700)
         os.replace(replacement, executable)
+        os.replace(original, executable)
         return Completed()
 
-    monkeypatch.setattr("ai_video_factory.hermes_backend.subprocess.run", swap)
+    monkeypatch.setattr("ai_video_factory.hermes_backend.subprocess.run", swap_and_restore)
+    with pytest.raises(HermesError, match="changed"):
+        run_process(("hermes", "--version"), timeout=15.0)
+
+    def mutate_in_place(*_args: object, **_kwargs: object) -> Completed:
+        executable.write_text("#!/bin/sh\n# changed\n", encoding="utf-8")
+        return Completed()
+
+    monkeypatch.setattr("ai_video_factory.hermes_backend.subprocess.run", mutate_in_place)
     with pytest.raises(HermesError, match="changed"):
         run_process(("hermes", "--version"), timeout=15.0)
 
@@ -228,6 +253,19 @@ def test_default_runner_rejects_missing_executable(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: None)
 
     with pytest.raises(HermesError, match="not found"):
+        run_process(("hermes", "--version"), timeout=15.0)
+
+
+def test_resolver_rejects_a_path_result_other_than_the_audited_executable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    executable = tmp_path / "hermes"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+    monkeypatch.setattr("ai_video_factory.hermes_backend._HERMES_PATH", executable)
+    monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: str(tmp_path / "other"))
+
+    with pytest.raises(HermesError, match="audited"):
         run_process(("hermes", "--version"), timeout=15.0)
 
 
@@ -275,6 +313,15 @@ def test_snapshot_represents_missing_delegation_keys_as_unconfigured() -> None:
     assert snapshot.delegation_base_url is None
 
 
+def test_snapshot_maps_real_merged_empty_route_defaults_to_typed_unconfigured() -> None:
+    snapshot = HermesBackend(config(), runner=FakeRunner(merged_default_outputs())).snapshot()
+
+    assert snapshot.delegation_model is None
+    assert snapshot.delegation_base_url is None
+    assert snapshot.delegation_api_mode is None
+    assert snapshot.delegation_max_iterations == 50
+
+
 def test_snapshot_rejects_secret_or_multiline_values_without_exposure() -> None:
     outputs = snapshot_outputs()
     outputs[("hermes", "config", "get", "model.default")] = result("token=not-for-report\nsecond\n")
@@ -296,6 +343,27 @@ def test_snapshot_rejects_url_credentials_and_ambiguous_typed_values() -> None:
     with pytest.raises(HermesError, match="invalid"):
         HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()
 
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        "ghp_abcdefghijklmnopqrstuvwxyz1234567890\n",
+        "github_pat_abcdefghijklmnopqrstuvwxyz1234567890\n",
+        "AKIAABCDEFGHIJKLMNOP\n",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature\n",
+        "https://nous.example/v1?token=never\n",
+        "nous\u200b\n",
+        "nous\x1f\n",
+    ],
+)
+def test_snapshot_rejects_secret_like_or_unicode_format_values(unsafe_value: str) -> None:
+    outputs = snapshot_outputs()
+    outputs[("hermes", "config", "get", "model.base_url")] = result(unsafe_value)
+
+    with pytest.raises(HermesError, match="invalid") as exc_info:
+        HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()
+
+    assert "never" not in str(exc_info.value)
 
 @pytest.mark.parametrize(
     "version_text",

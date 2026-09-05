@@ -43,11 +43,15 @@ class ModelDigestCache:
         model_root: Path,
         identifier: str | None = None,
         hasher: Hasher = _sha256_file,
+        use_cache: bool = True,
+        write_cache: bool = True,
     ) -> None:
         self.cache_directory = Path(cache_directory)
         self.model_root = Path(model_root)
         self.identifier = identifier
         self.hasher = hasher
+        self.use_cache = use_cache
+        self.write_cache = write_cache
 
     def identity(self, model: LmStudioModel) -> ModelIdentity:
         """Return a SHA-256 identity without modifying or relocating the model."""
@@ -60,11 +64,15 @@ class ModelDigestCache:
                 )
 
         cache_path = self._cache_path(relative_path)
-        cached_digest = self._cached_digest(
-            cache_path,
-            relative_path=relative_path,
-            size_bytes=file_stat.st_size,
-            mtime_ns=file_stat.st_mtime_ns,
+        cached_digest = (
+            self._cached_digest(
+                cache_path,
+                relative_path=relative_path,
+                size_bytes=file_stat.st_size,
+                mtime_ns=file_stat.st_mtime_ns,
+            )
+            if self.use_cache
+            else None
         )
         digest = cached_digest or self.hasher(path)
         if cached_digest is None:
@@ -75,13 +83,14 @@ class ModelDigestCache:
                 or after_hash.st_mtime_ns != file_stat.st_mtime_ns
             ):
                 raise ValueError("LM Studio model changed while its digest was being computed")
-            self._write_cache(
-                cache_path,
-                relative_path=relative_path,
-                size_bytes=file_stat.st_size,
-                mtime_ns=file_stat.st_mtime_ns,
-                sha256=digest,
-            )
+            if self.write_cache:
+                self._write_cache(
+                    cache_path,
+                    relative_path=relative_path,
+                    size_bytes=file_stat.st_size,
+                    mtime_ns=file_stat.st_mtime_ns,
+                    sha256=digest,
+                )
 
         return model.identity(self.identifier or model.model_key).model_copy(
             update={"relative_path": relative_path, "size_bytes": file_stat.st_size, "sha256": digest}

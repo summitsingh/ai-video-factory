@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,13 @@ _STANDALONE_CREDENTIAL = re.compile(
 _SENSITIVE_QUERY_NAME = re.compile(
     r"(?i)(?:api[._-]?key|access[._-]?key|authorization|credential|password|secret|token)"
 )
+_TOKEN_VALUE = re.compile(
+    r"^(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$"
+)
+_ROUTE_DEFINING_KEYS = frozenset({
+    "delegation.model", "delegation.base_url", "delegation.api_mode",
+})
 
 
 class HermesError(RuntimeError):
@@ -94,6 +102,10 @@ class _ExecutableIdentity:
     path: str
     device: int
     inode: int
+    size_bytes: int
+    mtime_ns: int
+    ctime_ns: int
+    descriptor: int
 
 
 def _resolved_hermes() -> _ExecutableIdentity:
@@ -101,28 +113,42 @@ def _resolved_hermes() -> _ExecutableIdentity:
     resolved = shutil.which("hermes")
     if resolved is None:
         raise HermesError("Hermes executable not found")
+    descriptor: int | None = None
     try:
         configured = _HERMES_PATH
         if Path(resolved) != configured:
             raise ValueError("PATH did not resolve to the audited Hermes executable")
-        raw_stat = configured.lstat()
+        descriptor = os.open(
+            configured,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        raw_stat = os.fstat(descriptor)
         candidate = configured.resolve(strict=True)
+        path_stat = configured.lstat()
     except (OSError, RuntimeError) as exc:
+        if descriptor is not None:
+            os.close(descriptor)
         raise HermesError("Hermes executable could not be resolved") from exc
     except ValueError as exc:
         raise HermesError("Hermes executable is not the audited canonical path") from exc
     if (
         not candidate.is_absolute() or candidate != configured or stat.S_ISLNK(raw_stat.st_mode)
         or not stat.S_ISREG(raw_stat.st_mode)
+        or path_stat.st_dev != raw_stat.st_dev or path_stat.st_ino != raw_stat.st_ino
         or not os.access(candidate, os.X_OK)
     ):
+        os.close(descriptor)
         raise HermesError("Hermes executable is not a canonical executable regular file")
-    return _ExecutableIdentity(str(candidate), raw_stat.st_dev, raw_stat.st_ino)
+    return _ExecutableIdentity(
+        str(candidate), raw_stat.st_dev, raw_stat.st_ino, raw_stat.st_size,
+        raw_stat.st_mtime_ns, raw_stat.st_ctime_ns, descriptor,
+    )
 
 
 def _identity_is_current(identity: _ExecutableIdentity) -> bool:
     try:
         current = _HERMES_PATH.lstat()
+        opened = os.fstat(identity.descriptor)
     except OSError:
         return False
     return (
@@ -130,6 +156,11 @@ def _identity_is_current(identity: _ExecutableIdentity) -> bool:
         and stat.S_ISREG(current.st_mode)
         and current.st_dev == identity.device
         and current.st_ino == identity.inode
+        and opened.st_dev == identity.device
+        and opened.st_ino == identity.inode
+        and opened.st_size == identity.size_bytes
+        and opened.st_mtime_ns == identity.mtime_ns
+        and opened.st_ctime_ns == identity.ctime_ns
     )
 
 
@@ -175,25 +206,29 @@ def run_process(argv: tuple[str, ...], *, timeout: float) -> ProcessResult:
     _validate_timeout(timeout)
     identity = _resolved_hermes()
     try:
-        completed = subprocess.run(
-            (identity.path, *argv[1:]),
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise HermesError("Hermes executable not found") from exc
-    except PermissionError as exc:
-        raise HermesError("Hermes executable permission denied") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise HermesError("Hermes command timed out") from exc
-    except OSError as exc:
-        raise HermesError("Hermes command could not run") from exc
-    if not _identity_is_current(identity):
-        raise HermesError("Hermes executable changed while the command was running")
-    return _bounded_result(completed, identity, argv)
+        try:
+            completed = subprocess.run(
+                (f"/proc/self/fd/{identity.descriptor}", *argv[1:]),
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                pass_fds=(identity.descriptor,),
+            )
+        except FileNotFoundError as exc:
+            raise HermesError("Hermes executable not found") from exc
+        except PermissionError as exc:
+            raise HermesError("Hermes executable permission denied") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise HermesError("Hermes command timed out") from exc
+        except OSError as exc:
+            raise HermesError("Hermes command could not run") from exc
+        if not _identity_is_current(identity):
+            raise HermesError("Hermes executable changed while the command was running")
+        return _bounded_result(completed, identity, argv)
+    finally:
+        os.close(identity.descriptor)
 
 
 def _canonical_executable(path: str) -> str:
@@ -210,9 +245,21 @@ def _canonical_executable(path: str) -> str:
 def _single_safe_value(raw: str) -> str:
     if raw.endswith("\n"):
         raw = raw[:-1]
-    if not raw or "\n" in raw or "\r" in raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+    if (
+        not raw
+        or "\n" in raw
+        or "\r" in raw
+        or any(
+            ord(char) == 127 or unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+            for char in raw
+        )
+    ):
         raise HermesError("Hermes configuration value is invalid")
-    if _SECRET_VALUE.search(raw) or _STANDALONE_CREDENTIAL.fullmatch(raw):
+    if (
+        _SECRET_VALUE.search(raw)
+        or _STANDALONE_CREDENTIAL.fullmatch(raw)
+        or _TOKEN_VALUE.fullmatch(raw)
+    ):
         raise HermesError("Hermes configuration value is invalid")
     parsed = urlsplit(raw)
     if parsed.scheme:
@@ -287,7 +334,11 @@ class HermesBackend:
 
     def _value(self, key: str, *, optional: bool = False) -> str | None:
         result = self._command(("hermes", "config", "get", key), allow_missing=optional)
-        return None if result is None else _single_safe_value(result.stdout)
+        if result is None:
+            return None
+        if optional and key in _ROUTE_DEFINING_KEYS and result.stdout in {"", "\n"}:
+            return None
+        return _single_safe_value(result.stdout)
 
     @staticmethod
     def _unconfigured_auxiliaries() -> dict[str, HermesAuxiliaryRoute]:

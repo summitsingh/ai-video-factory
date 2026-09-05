@@ -130,17 +130,21 @@ class InferenceService:
                 )
             self.sleeper(_POLL_INTERVAL_SECONDS)
 
-    def capability_inputs(self, data_root: Path) -> dict[str, object]:
-        """Build read-only, cache-backed provenance for a capability benchmark."""
+    def _capability_inputs(
+        self, data_root: Path, *, require_resident: bool, use_cache: bool,
+    ) -> dict[str, object]:
         snapshot = self.backend.snapshot()
-        if not snapshot.server_running:
-            raise LmStudioError("LM Studio server is not running")
-        if not snapshot.configured_model_loaded:
-            raise LmStudioError("configured LM Studio model is not loaded")
+        if require_resident:
+            if not snapshot.server_running:
+                raise LmStudioError("LM Studio server is not running")
+            if not snapshot.configured_model_loaded:
+                raise LmStudioError("configured LM Studio model is not loaded")
         cache = ModelDigestCache(
             Path(data_root) / "system" / "model-digests",
             model_root=Path(self.config.models_directory),
             identifier=self.config.identifier,
+            use_cache=use_cache,
+            write_cache=use_cache,
         )
         identity = cache.identity(snapshot.configured_model)
         return build_capability_inputs(
@@ -148,6 +152,18 @@ class InferenceService:
             snapshot,
             identity,
             _CAPABILITY_CORPUS_VERSION,
+        )
+
+    def capability_inputs(self, data_root: Path) -> dict[str, object]:
+        """Build cache-backed benchmark provenance only while the model is resident."""
+        return self._capability_inputs(
+            data_root, require_resident=True, use_cache=True,
+        )
+
+    def current_capability_inputs(self, data_root: Path) -> dict[str, object]:
+        """Recompute provenance from inventory without requiring a loaded model."""
+        return self._capability_inputs(
+            data_root, require_resident=False, use_cache=False,
         )
 
     def chat_completion(

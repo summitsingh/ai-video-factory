@@ -342,7 +342,7 @@ def current_text_capability(
 ) -> bool:
     """Read the current, integrity-checked three-probe report without resuming it."""
     try:
-        inputs = service.capability_inputs(Path(data_root))
+        inputs = service.current_capability_inputs(Path(data_root))
         run = store.completed_read_only(_STAGE, inputs)
         if run is None:
             return False
