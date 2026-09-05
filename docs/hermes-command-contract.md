@@ -42,6 +42,15 @@ Unexpected exceptions are converted to the same versioned contract with a
 sanitized error and no traceback. All paths resolve from the repository root,
 not Hermes's ambient working directory.
 
+Before any lifecycle mutation, the adapter validates the canonical LM Studio
+executable and CLI commit, the single selected compatible GPU runtime and AMD
+survey, the running server's exact loopback/CORS safety fields, and the complete
+resident-model identity. It rechecks server configuration immediately after a
+server start. A matching already-resident model is idempotently accepted before
+the memory/estimate gates; an alias collision is never loaded over or unloaded.
+Loopback API calls disable inherited proxies, reject redirects, and discard HTTP
+error bodies at the adapter boundary.
+
 `doctor` and `benchmark` emit JSON diagnostic documents. The checked-in
 `system_report.md` is a separate Markdown bootstrap audit and is not rewritten
 by `doctor`. `test-pipeline --json`

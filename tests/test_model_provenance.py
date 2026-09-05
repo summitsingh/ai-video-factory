@@ -259,6 +259,7 @@ def config(tmp_path: Path) -> InferenceConfig:
             "ttl_seconds": 3_600,
             "minimum_available_memory_gib": 40,
             "models_directory": str(tmp_path / "models"),
+            "server_config_path": str(tmp_path / "http-server-config.json"),
         }
     )
 
@@ -266,11 +267,15 @@ def config(tmp_path: Path) -> InferenceConfig:
 def snapshot(model: LmStudioModel) -> LmStudioSnapshot:
     return LmStudioSnapshot(
         cli_help="lms 0.0.47",
+        cli_path="/safe/lms",
+        cli_commit="07b7252",
         runtimes="rocm-runtime 2.31.2 token=hidden",
+        selected_runtime="llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2",
         runtime_survey="AMD Radeon 8060S\nsecret=hidden",
         server_status="running",
         server_running=True,
         models=(model,),
+        loaded_models=(),
         loaded_identifiers=("local-model-identity",),
         configured_model=model,
         configured_model_loaded=True,
@@ -288,6 +293,8 @@ def test_capability_inputs_have_a_deterministic_sanitized_fingerprint(tmp_path: 
     inputs = capability_inputs(config(tmp_path), snapshot(model), identity, "lm-studio-capability-v4")
 
     assert inputs["corpus_version"] == "lm-studio-capability-v4"
+    assert inputs["cli_path"] == "/safe/lms"
+    assert inputs["cli_commit"] == "07b7252"
     assert inputs["runtime"] == "rocm-runtime 2.31.2 token=[REDACTED]"
     assert inputs["amd_survey"] == "AMD Radeon 8060S\nsecret=[REDACTED]"
     assert inputs["model"]["sha256"] == hashlib.sha256(b"model-bytes").hexdigest()
@@ -297,6 +304,37 @@ def test_capability_inputs_have_a_deterministic_sanitized_fingerprint(tmp_path: 
     assert fingerprint_inputs(inputs) == fingerprint_inputs(
         capability_inputs(config(tmp_path), snapshot(model), identity, "lm-studio-capability-v4")
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("cli_path", "/other/lms"), ("cli_commit", "89abcde")],
+)
+def test_capability_fingerprint_changes_with_cli_identity(
+    tmp_path: Path, field: str, value: str,
+) -> None:
+    model_root = tmp_path / "models"
+    model_path = model_root / "publisher" / "model.gguf"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"model-bytes")
+    model = model_record(model_path, root=model_root)
+    identity = ModelDigestCache(tmp_path / "cache", model_root=model_root).identity(model)
+    original_snapshot = snapshot(model)
+    changed_snapshot = LmStudioSnapshot(
+        **{
+            **original_snapshot.__dict__,
+            field: value,
+        }
+    )
+
+    original = capability_inputs(
+        config(tmp_path), original_snapshot, identity, "lm-studio-capability-v4"
+    )
+    changed = capability_inputs(
+        config(tmp_path), changed_snapshot, identity, "lm-studio-capability-v4"
+    )
+
+    assert fingerprint_inputs(original) != fingerprint_inputs(changed)
 
 
 def test_capability_fingerprint_changes_when_companion_size_changes(

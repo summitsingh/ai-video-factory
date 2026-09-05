@@ -53,6 +53,7 @@ def config(tmp_path: Path) -> InferenceConfig:
             "ttl_seconds": 3_600,
             "minimum_available_memory_gib": 40,
             "models_directory": str(tmp_path / "models"),
+            "server_config_path": str(tmp_path / "http-server-config.json"),
         }
     )
 
@@ -69,6 +70,8 @@ class FakeBackend:
         remove_unrelated_on_stop: bool = False,
         remove_unrelated_on_server_start: bool = False,
         estimate_error: BaseException | None = None,
+        snapshot_error: BaseException | None = None,
+        unsafe_after_server_start: bool = False,
     ) -> None:
         self.config = config
         self.loaded = list(loaded or [])
@@ -78,6 +81,9 @@ class FakeBackend:
         self.remove_unrelated_on_stop = remove_unrelated_on_stop
         self.remove_unrelated_on_server_start = remove_unrelated_on_server_start
         self.estimate_error = estimate_error
+        self.snapshot_error = snapshot_error
+        self.unsafe_after_server_start = unsafe_after_server_start
+        self.server_was_started = False
         self.calls: list[tuple[str, ...]] = []
         self.load_calls: list[tuple[str, ...]] = []
         self.unload_calls: list[tuple[str, ...]] = []
@@ -100,11 +106,21 @@ class FakeBackend:
 
     def snapshot(self) -> SimpleNamespace:
         self.snapshot_calls += 1
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        if self.unsafe_after_server_start and self.server_was_started:
+            raise LmStudioError("LM Studio server configuration is unsafe")
         model_path = Path(self.config.models_directory) / "publisher" / "model.gguf"
         return SimpleNamespace(
             cli_help="lms 0.0.47",
-            runtimes="rocm-runtime 2.31.2",
-            runtime_survey="AMD Radeon 8060S",
+            cli_path="/safe/lms",
+            cli_commit="07b7252",
+            runtimes="llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2 ✓ GGUF",
+            selected_runtime="llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2",
+            runtime_survey=(
+                "Survey by llama.cpp-linux-x86_64-amd-rocm-avx2 (2.31.2)\n"
+                "AMD Radeon Graphics 85.67 GiB"
+            ),
             server_running=self.server_running,
             loaded_identifiers=tuple(self.loaded),
             configured_model=LmStudioModel(
@@ -121,6 +137,7 @@ class FakeBackend:
         self.calls.append(SERVER_START_COMMAND)
         self.mutating_calls.append(SERVER_START_COMMAND)
         self.server_running = True
+        self.server_was_started = True
         if self.remove_unrelated_on_server_start:
             self.loaded = [
                 value for value in self.loaded if value == self.config.identifier
@@ -172,6 +189,8 @@ def service_fixture(
     remove_unrelated_on_stop: bool = False,
     remove_unrelated_on_server_start: bool = False,
     estimate_error: BaseException | None = None,
+    snapshot_error: BaseException | None = None,
+    unsafe_after_server_start: bool = False,
 ) -> tuple[InferenceService, FakeBackend, FakeClock]:
     backend = FakeBackend(
         config,
@@ -182,6 +201,8 @@ def service_fixture(
         remove_unrelated_on_stop=remove_unrelated_on_stop,
         remove_unrelated_on_server_start=remove_unrelated_on_server_start,
         estimate_error=estimate_error,
+        snapshot_error=snapshot_error,
+        unsafe_after_server_start=unsafe_after_server_start,
     )
     clock = FakeClock()
     service = InferenceService(
@@ -280,9 +301,60 @@ def test_start_is_idempotent_when_exact_identifier_is_already_visible(
 
     assert result.status == "pass"
     assert not backend.mutating_calls
+    assert backend.estimate_calls == 0
     assert backend.api_calls == 1
     assert backend.loaded == [config.identifier, "user-model"]
     assert_no_forbidden_commands(backend.calls)
+
+
+def test_start_exact_resident_model_bypasses_low_memory_gate(
+    config: InferenceConfig,
+) -> None:
+    service, backend, _clock = service_fixture(
+        config, loaded=[config.identifier], available_memory=0,
+    )
+
+    result = service.start()
+
+    assert result.status == "pass"
+    assert backend.estimate_calls == 0
+    assert not backend.mutating_calls
+
+
+def test_start_rechecks_server_safety_immediately_after_starting_server(
+    config: InferenceConfig,
+) -> None:
+    service, backend, _clock = service_fixture(
+        config,
+        server_running=False,
+        unsafe_after_server_start=True,
+    )
+
+    result = service.start()
+
+    assert result.status == "not_ready"
+    assert "server configuration" in (result.error or "")
+    assert backend.mutating_calls == [SERVER_START_COMMAND]
+    assert backend.load_calls == []
+
+
+@pytest.mark.parametrize("operation", ["start", "stop"])
+def test_lifecycle_never_mutates_when_snapshot_identity_is_unsafe(
+    config: InferenceConfig, operation: str,
+) -> None:
+    service, backend, _clock = service_fixture(
+        config,
+        snapshot_error=LmStudioError(
+            "configured LM Studio identifier is bound to a different model"
+        ),
+    )
+
+    result = getattr(service, operation)()
+
+    assert result.status == "not_ready"
+    assert "different model" in (result.error or "")
+    assert not backend.mutating_calls
+    assert backend.estimate_calls == 0
 
 
 def test_start_verifies_unrelated_models_after_starting_shared_server(

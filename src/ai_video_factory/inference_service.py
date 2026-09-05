@@ -120,7 +120,7 @@ class InferenceService:
         deadline = self.clock() + _LIFECYCLE_TIMEOUT_SECONDS
         while True:
             snapshot = self.backend.snapshot()
-            resident = self.config.identifier in snapshot.loaded_identifiers
+            resident = snapshot.configured_model_loaded
             if resident is present:
                 return snapshot
             if self.clock() >= deadline:
@@ -204,20 +204,6 @@ class InferenceService:
     def start(self) -> InferenceResult:
         """Memory-gate and load only the configured identifier when needed."""
         try:
-            estimate, available, allowed = self._estimate_and_gate()
-            metrics = self._estimate_metrics(estimate, available)
-            if not allowed:
-                return self._result(
-                    "start",
-                    status="not_ready",
-                    retryable=True,
-                    checks={
-                        "memory_gate": InferenceCheck(status="not_ready", detail=available)
-                    },
-                    metrics=metrics,
-                    error="available memory is below the configured 40 GiB gate",
-                )
-
             before = self.backend.snapshot()
             unrelated_before = {
                 identifier
@@ -225,15 +211,68 @@ class InferenceService:
                 if identifier != self.config.identifier
             }
             server_started = False
-            if not before.server_running:
-                self.backend.start_server()
-                server_started = True
-
-            if self.config.identifier in before.loaded_identifiers:
-                after = self._poll_for_identifier(present=True) if server_started else before
+            if before.configured_model_loaded:
+                if not before.server_running:
+                    self.backend.start_server()
+                    server_started = True
+                    after = self.backend.snapshot()
+                    if not after.server_running or not after.configured_model_loaded:
+                        raise LmStudioError(
+                            "configured LM Studio model is not ready after server start"
+                        )
+                else:
+                    after = before
+                metrics: dict[str, int | float | str | bool | None] = {
+                    "server_started": server_started,
+                    "configured_model_loaded": True,
+                    "api_visible": False,
+                    "memory_gate_skipped": True,
+                }
+                memory_gate_detail: int | float | str | bool | None = (
+                    "already resident"
+                )
             else:
-                self.backend.start()
-                after = self._poll_for_identifier(present=True)
+                estimate, available, allowed = self._estimate_and_gate()
+                metrics = self._estimate_metrics(estimate, available)
+                memory_gate_detail = available
+                if not allowed:
+                    return self._result(
+                        "start",
+                        status="not_ready",
+                        retryable=True,
+                        checks={
+                            "memory_gate": InferenceCheck(
+                                status="not_ready", detail=available
+                            )
+                        },
+                        metrics=metrics,
+                        error="available memory is below the configured 40 GiB gate",
+                    )
+                if not before.server_running:
+                    self.backend.start_server()
+                    server_started = True
+                    server_snapshot = self.backend.snapshot()
+                    if not server_snapshot.server_running:
+                        raise LmStudioError(
+                            "LM Studio server did not become safely ready after start"
+                        )
+                    unrelated_after_server = {
+                        identifier
+                        for identifier in server_snapshot.loaded_identifiers
+                        if identifier != self.config.identifier
+                    }
+                    if unrelated_after_server != unrelated_before:
+                        raise LmStudioError(
+                            "LM Studio start changed unrelated loaded identifiers"
+                        )
+                    if server_snapshot.configured_model_loaded:
+                        after = server_snapshot
+                    else:
+                        self.backend.start()
+                        after = self._poll_for_identifier(present=True)
+                else:
+                    self.backend.start()
+                    after = self._poll_for_identifier(present=True)
 
             unrelated_after = {
                 identifier
@@ -260,9 +299,15 @@ class InferenceService:
                 status="pass",
                 retryable=False,
                 checks={
-                    "memory_gate": InferenceCheck(status="ready", detail=available),
-                    "cli_residency": InferenceCheck(status="ready", detail=self.config.identifier),
-                    "api_visibility": InferenceCheck(status="ready", detail=self.config.identifier),
+                    "memory_gate": InferenceCheck(
+                        status="ready", detail=memory_gate_detail
+                    ),
+                    "cli_residency": InferenceCheck(
+                        status="ready", detail=self.config.identifier
+                    ),
+                    "api_visibility": InferenceCheck(
+                        status="ready", detail=self.config.identifier
+                    ),
                 },
                 metrics=metrics,
             )
@@ -307,7 +352,7 @@ class InferenceService:
                 for identifier in before.loaded_identifiers
                 if identifier != self.config.identifier
             }
-            if self.config.identifier not in before.loaded_identifiers:
+            if not before.configured_model_loaded:
                 return self._result(
                     "stop",
                     status="pass",

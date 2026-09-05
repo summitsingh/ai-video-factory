@@ -54,9 +54,9 @@ for this exact host is confirmed.
 
 | Item | Audited state |
 |---|---|
-| CLI | `/home/summit/.lmstudio/bin/lms` |
+| CLI | canonical `/home/summit/.lmstudio/bin/lms`; authoritative commit `07b7252` |
 | Bundled runtime families | AMD ROCm AVX2 is installed through `2.31.2`; Vulkan AVX2 is installed through `2.33.0` and was selected during the passing capability run; no runtime selection or update was performed |
-| Server boundary | OpenAI-compatible API bound only to `127.0.0.1:1234` (`http://127.0.0.1:1234/v1`) |
+| Server boundary | OpenAI-compatible API bound only to `127.0.0.1:1234` (`http://127.0.0.1:1234/v1`); persisted config safety fields are port `1234`, `networkInterface` `127.0.0.1`, and CORS disabled |
 | Bundled survey | 85.67 GiB GPU-accessible memory and 122.69 GiB system RAM |
 | Primary existing model | `qwen3.6-35b-a3b-udt-mtp`; primary GGUF 17,741,611,328 bytes plus direct `mmproj` companion 899,283,584 bytes, exactly matching LM Studio's 18,640,894,912-byte resource total; stable API identifier `avf-qwen36-executor` |
 | Primary load estimate | 17.36 GiB total at 65,536 context, maximum GPU offload, parallelism 1; LM Studio confidence `LOW` |
@@ -70,12 +70,13 @@ unverified and was not repaired, installed, removed, or otherwise changed.
 
 ### Controlled capability verification
 
-The v4 capability run `2ce5b25aa1894e5185295821186c9c4f` passed ordinary
+The hardened v4 capability run `ab73ed9f596e467cae6718161b59d1a4` passed ordinary
 generation, strict structured output, and an exact `record_scene` tool call
 through `http://127.0.0.1:1234/v1`. Its integrity-checked report is stored at
-`data/projects/system/runs/2ce5b25aa1894e5185295821186c9c4f/inference_report.json`.
-The measured probe latencies were 2,205.578 ms, 5,035.866 ms, and 2,742.199 ms,
-respectively. The report records the primary-file digest and exact package-size
+`data/projects/system/runs/ab73ed9f596e467cae6718161b59d1a4/inference_report.json`.
+The measured probe latencies were 2,219.804 ms, 5,043.842 ms, and 2,823.761 ms,
+respectively. Its fingerprint includes the canonical CLI path, commit, runtime,
+survey, strict server-config path, primary-file digest, and exact package-size
 relationship but persists no prompts, responses, reasoning, or raw HTTP bodies.
 
 The loaded-model identifier set was empty before the controlled start and empty

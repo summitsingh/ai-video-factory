@@ -61,12 +61,16 @@ class BenchmarkBackend:
         http: RecordingHttpTransport,
         *,
         loaded_identifier: str | None = "avf-qwen36-executor",
+        snapshot_error: BaseException | None = None,
     ) -> None:
         self.config = config
         self.http = http
         self.loaded_identifier = loaded_identifier
+        self.snapshot_error = snapshot_error
 
     def snapshot(self) -> object:
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
         model_path = Path(self.config.models_directory) / "publisher" / "model.gguf"
         loaded = () if self.loaded_identifier is None else (self.loaded_identifier,)
         return type(
@@ -74,8 +78,14 @@ class BenchmarkBackend:
             (),
             {
                 "cli_help": "lms 0.0.47",
-                "runtimes": "llama.cpp-linux-x86_64-amd-rocm-avx2 1.66.0",
-                "runtime_survey": "AMD Radeon 8060S",
+                "cli_path": "/safe/lms",
+                "cli_commit": "07b7252",
+                "runtimes": "llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2 ✓ GGUF",
+                "selected_runtime": "llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2",
+                "runtime_survey": (
+                    "Survey by llama.cpp-linux-x86_64-amd-rocm-avx2 (2.31.2)\n"
+                    "AMD Radeon Graphics 85.67 GiB"
+                ),
                 "server_running": True,
                 "loaded_identifiers": loaded,
                 "configured_model": LmStudioModel(
@@ -151,6 +161,7 @@ def benchmark_fixture(
     response_text: str = "LOCAL_OK",
     loaded_identifier: str | None = "avf-qwen36-executor",
     configured_identifier: str = "avf-qwen36-executor",
+    snapshot_error: BaseException | None = None,
 ) -> tuple[InferenceService, RunStore, Path, RecordingHttpTransport]:
     data_root = tmp_path / "data"
     model_path = tmp_path / "models" / "publisher" / "model.gguf"
@@ -170,13 +181,17 @@ def benchmark_fixture(
             "ttl_seconds": 3_600,
             "minimum_available_memory_gib": 40,
             "models_directory": str(tmp_path / "models"),
+            "server_config_path": str(tmp_path / "http-server-config.json"),
         }
     )
     transport = http or RecordingHttpTransport(
         passing_responses(response_text=response_text)
     )
     backend = BenchmarkBackend(
-        config, transport, loaded_identifier=loaded_identifier
+        config,
+        transport,
+        loaded_identifier=loaded_identifier,
+        snapshot_error=snapshot_error,
     )
     service = InferenceService(config, backend=backend)  # type: ignore[arg-type]
     artifact_root = data_root / "projects" / "system" / "runs"
@@ -502,6 +517,23 @@ def test_model_not_loaded_is_not_ready_without_http_requests(tmp_path: Path) -> 
     assert result.status == "not_ready"
     assert result.retryable is True
     assert transport.calls == []
+
+
+def test_alias_collision_blocks_benchmark_before_http_or_persistence(
+    tmp_path: Path,
+) -> None:
+    service, store, data_root, transport = benchmark_fixture(
+        tmp_path,
+        snapshot_error=LmStudioError(
+            "configured LM Studio identifier is bound to a different model"
+        ),
+    )
+
+    result = run_capability_benchmark(service, store, data_root)
+
+    assert result.status == "not_ready"
+    assert transport.calls == []
+    assert not (data_root / "projects" / "system" / "state").exists()
 
 
 def test_wrong_response_model_identifier_fails_all_checks(tmp_path: Path) -> None:

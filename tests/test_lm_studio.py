@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.request import ProxyHandler
 
 import pytest
 
@@ -17,6 +18,7 @@ from ai_video_factory.sanitization import MAX_DIAGNOSTIC_CHARS
 
 EXPECTED_READ_ONLY_COMMANDS = [
     ("lms", "--help"),
+    ("lms", "--version"),
     ("lms", "runtime", "ls"),
     ("lms", "runtime", "survey"),
     ("lms", "server", "status"),
@@ -42,6 +44,10 @@ EXPECTED_UNLOAD_COMMAND = ("lms", "unload", "avf-qwen36-executor")
 
 @pytest.fixture
 def config(tmp_path: Path) -> InferenceConfig:
+    server_config = tmp_path / "http-server-config.json"
+    server_config.write_text(
+        json.dumps({"port": 1234, "networkInterface": "127.0.0.1", "cors": False})
+    )
     return InferenceConfig.model_validate(
         {
             "schema_version": 1,
@@ -56,12 +62,13 @@ def config(tmp_path: Path) -> InferenceConfig:
             "ttl_seconds": 3_600,
             "minimum_available_memory_gib": 40,
             "models_directory": str(tmp_path / "models"),
+            "server_config_path": str(server_config),
         }
     )
 
 
 def ok(stdout: str) -> ProcessResult:
-    return ProcessResult(0, stdout, "")
+    return ProcessResult(0, stdout, "", "/safe/lms")
 
 
 def model_inventory_json(
@@ -69,6 +76,30 @@ def model_inventory_json(
 ) -> str:
     return json.dumps(
         [{"key": key or config.model_key, "path": path, "sizeBytes": 18_640_894_912}]
+    )
+
+
+def loaded_model_json(
+    config: InferenceConfig,
+    *,
+    identifier: str | None = None,
+    model_key: str | None = None,
+    path: str = "publisher/model.gguf",
+    size_bytes: int = 18_640_894_912,
+    context_length: int | None = None,
+    parallel: int | None = None,
+) -> str:
+    return json.dumps(
+        [
+            {
+                "identifier": identifier or config.identifier,
+                "modelKey": model_key or config.model_key,
+                "path": path,
+                "sizeBytes": size_bytes,
+                "contextLength": context_length or config.context_length,
+                "parallel": parallel or config.parallel,
+            }
+        ]
     )
 
 
@@ -125,10 +156,16 @@ class RecordingOpener:
 
 def patch_opener(
     monkeypatch: pytest.MonkeyPatch, response: FakeResponse | BaseException
-) -> RecordingOpener:
+) -> tuple[RecordingOpener, list[object]]:
     opener = RecordingOpener(response)
-    monkeypatch.setattr(lm_studio, "build_opener", lambda *_handlers: opener)
-    return opener
+    handlers: list[object] = []
+
+    def build(*provided: object) -> RecordingOpener:
+        handlers.extend(provided)
+        return opener
+
+    monkeypatch.setattr(lm_studio, "build_opener", build)
+    return opener, handlers
 
 
 def inventory_runner(
@@ -138,8 +175,15 @@ def inventory_runner(
     return RecordingRunner(
         {
             ("lms", "--help"): ok("lms is LM Studio's CLI utility (v0.0.47)"),
-            ("lms", "runtime", "ls"): ok("llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2"),
-            ("lms", "runtime", "survey"): ok("GPU: 85.67 GiB\nRAM: 122.69 GiB"),
+            ("lms", "--version"): ok("CLI commit: 07b7252"),
+            ("lms", "runtime", "ls"): ok(
+                "LLM ENGINE SELECTED MODEL FORMAT\n"
+                "llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2 ✓ GGUF"
+            ),
+            ("lms", "runtime", "survey"): ok(
+                "Survey by llama.cpp-linux-x86_64-amd-rocm-avx2 (2.31.2)\n"
+                "AMD Radeon Graphics 85.67 GiB\nRAM: 122.69 GiB"
+            ),
             ("lms", "server", "status"): ok(server_status),
             ("lms", "ls", "--json"): ok(inventory or model_inventory_json(config, path=path)),
             ("lms", "ps", "--json"): ok(loaded),
@@ -188,12 +232,153 @@ def test_snapshot_retains_loaded_unrelated_models_without_touching_them(
 ) -> None:
     from ai_video_factory.lm_studio import LmStudioBackend
 
-    runner = inventory_runner(config, loaded='[{"identifier": "user-model"}]')
+    runner = inventory_runner(
+        config,
+        loaded=loaded_model_json(config, identifier="user-model", model_key="user-key"),
+    )
     snapshot = LmStudioBackend(config, runner=runner).snapshot()
 
     assert snapshot.loaded_identifiers == ("user-model",)
     assert snapshot.configured_model_loaded is False
     assert runner.calls[-1] == ("lms", "ps", "--json")
+
+
+def test_snapshot_accepts_only_an_exact_loaded_model_identity(config: InferenceConfig) -> None:
+    snapshot = lm_studio.LmStudioBackend(
+        config, runner=inventory_runner(config, loaded=loaded_model_json(config))
+    ).snapshot()
+
+    assert snapshot.configured_model_loaded is True
+    assert snapshot.loaded_models[0].model_key == config.model_key
+    assert snapshot.loaded_models[0].context_length == config.context_length
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model_key": "wrong-model"},
+        {"path": "publisher/wrong.gguf"},
+        {"size_bytes": 1},
+        {"context_length": 4096},
+        {"parallel": 2},
+    ],
+)
+def test_snapshot_rejects_configured_alias_collision(
+    config: InferenceConfig, overrides: dict[str, object]
+) -> None:
+    with pytest.raises(LmStudioError, match="different model"):
+        lm_studio.LmStudioBackend(
+            config,
+            runner=inventory_runner(
+                config, loaded=loaded_model_json(config, **overrides)  # type: ignore[arg-type]
+            ),
+        ).snapshot()
+
+
+@pytest.mark.parametrize(
+    "server_config",
+    [
+        {"port": 1235, "networkInterface": "127.0.0.1", "cors": False},
+        {"port": 1234, "networkInterface": "0.0.0.0", "cors": False},
+        {"port": 1234, "networkInterface": "127.0.0.1", "cors": True},
+    ],
+)
+def test_snapshot_rejects_unsafe_running_server_configuration(
+    config: InferenceConfig, server_config: dict[str, object]
+) -> None:
+    Path(config.server_config_path).write_text(json.dumps(server_config))
+
+    with pytest.raises(LmStudioError, match="server configuration"):
+        lm_studio.LmStudioBackend(config, runner=inventory_runner(config)).snapshot()
+
+
+def test_snapshot_does_not_read_server_config_when_server_is_stopped(
+    config: InferenceConfig,
+) -> None:
+    reads: list[Path] = []
+
+    def reader(path: Path) -> str:
+        reads.append(path)
+        raise AssertionError("stopped server config must not be read")
+
+    snapshot = lm_studio.LmStudioBackend(
+        config,
+        runner=inventory_runner(config, server_status="The server is not running."),
+        file_reader=reader,
+    ).snapshot()
+
+    assert snapshot.server_running is False
+    assert reads == []
+
+
+@pytest.mark.parametrize(
+    "runtimes",
+    [
+        "llama.cpp-linux-x86_64-cpu-avx2@2.31.2 ✓ GGUF",
+        "llama.cpp-linux-x86_64-cuda-avx2@2.31.2 ✓ GGUF",
+        "llama.cpp-linux-x86_64-vulkan-avx@2.31.2 ✓ GGUF",
+        "llama.cpp-linux-x86_64-vulkan-avx2@2.31.2 GGUF",
+        (
+            "llama.cpp-linux-x86_64-vulkan-avx2@2.31.2 ✓ GGUF\n"
+            "llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2 ✓ GGUF"
+        ),
+    ],
+)
+def test_snapshot_rejects_missing_wrong_or_multiple_selected_runtimes(
+    config: InferenceConfig, runtimes: str
+) -> None:
+    runner = inventory_runner(config)
+    runner.outputs[("lms", "runtime", "ls")] = ok(runtimes)
+
+    with pytest.raises(LmStudioError, match="selected compatible runtime"):
+        lm_studio.LmStudioBackend(config, runner=runner).snapshot()
+
+
+@pytest.mark.parametrize(
+    "survey",
+    [
+        "Survey by llama.cpp-linux-x86_64-vulkan-avx2 (2.31.2)\nAMD GPU 85.67 GiB",
+        "Survey by llama.cpp-linux-x86_64-amd-rocm-avx2 (2.31.1)\nAMD GPU 85.67 GiB",
+        "Survey by llama.cpp-linux-x86_64-amd-rocm-avx2 (2.31.2)\nNVIDIA GPU 85.67 GiB",
+        "Survey by llama.cpp-linux-x86_64-amd-rocm-avx2 (2.31.2)\nAMD GPU 0 GiB",
+    ],
+)
+def test_snapshot_rejects_mismatched_or_invalid_runtime_survey(
+    config: InferenceConfig, survey: str
+) -> None:
+    runner = inventory_runner(config)
+    runner.outputs[("lms", "runtime", "survey")] = ok(survey)
+
+    with pytest.raises(LmStudioError, match="runtime survey"):
+        lm_studio.LmStudioBackend(config, runner=runner).snapshot()
+
+
+@pytest.mark.parametrize(
+    "help_text",
+    [
+        "lms is LM Studio's CLI utility (v0.0.47)",
+        "CLI commit: not-a-commit",
+        "CLI commit: 07b7252\nCLI commit: 07b7252",
+    ],
+)
+def test_snapshot_requires_one_authoritative_cli_commit(
+    config: InferenceConfig, help_text: str
+) -> None:
+    runner = inventory_runner(config)
+    runner.outputs[("lms", "--version")] = ok(help_text)
+
+    with pytest.raises(LmStudioError, match="CLI commit"):
+        lm_studio.LmStudioBackend(config, runner=runner).snapshot()
+
+
+def test_snapshot_rejects_conflicting_commit_lines_across_help_and_version(
+    config: InferenceConfig,
+) -> None:
+    runner = inventory_runner(config)
+    runner.outputs[("lms", "--help")] = ok("help\nCLI commit: 89abcde")
+
+    with pytest.raises(LmStudioError, match="exactly one CLI commit"):
+        lm_studio.LmStudioBackend(config, runner=runner).snapshot()
 
 
 @pytest.mark.parametrize(
@@ -248,7 +433,7 @@ def test_snapshot_sanitizes_and_caps_failed_command_stderr(config: InferenceConf
 
     runner = inventory_runner(config)
     runner.outputs[("lms", "runtime", "survey")] = ProcessResult(
-        1, "", "token=top-secret " + ("x" * (MAX_DIAGNOSTIC_CHARS * 2))
+        1, "", "token=top-secret " + ("x" * (MAX_DIAGNOSTIC_CHARS * 2)), "/safe/lms"
     )
 
     with pytest.raises(LmStudioError) as raised:
@@ -280,7 +465,7 @@ def test_run_process_rejects_a_mutating_command_before_subprocess(
 
 
 def test_request_json_rejects_non_loopback_urls(monkeypatch: pytest.MonkeyPatch) -> None:
-    opener = patch_opener(monkeypatch, FakeResponse(b"{}"))
+    opener, _handlers = patch_opener(monkeypatch, FakeResponse(b"{}"))
 
     with pytest.raises(LmStudioError, match="loopback"):
         lm_studio.request_json(
@@ -297,7 +482,7 @@ def test_request_json_rejects_non_loopback_urls(monkeypatch: pytest.MonkeyPatch)
 def test_request_json_rejects_nonexact_headers(
     monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]
 ) -> None:
-    opener = patch_opener(monkeypatch, FakeResponse(b"{}"))
+    opener, _handlers = patch_opener(monkeypatch, FakeResponse(b"{}"))
 
     with pytest.raises(LmStudioError, match="headers only"):
         lm_studio.request_json("GET", "http://127.0.0.1:1234/v1/models", None, headers, 1)
@@ -313,7 +498,7 @@ def test_request_json_rejects_nonexact_headers(
 def test_request_json_rejects_credentialed_or_decorated_loopback_urls(
     monkeypatch: pytest.MonkeyPatch, url: str
 ) -> None:
-    opener = patch_opener(monkeypatch, FakeResponse(b"{}"))
+    opener, _handlers = patch_opener(monkeypatch, FakeResponse(b"{}"))
 
     with pytest.raises(LmStudioError, match="loopback"):
         lm_studio.request_json(
@@ -343,7 +528,7 @@ def test_request_json_rejects_redirects_without_following_them(
     redirect = HTTPError(
         "http://127.0.0.1:1234/v1/models", 302, "Found", {}, BytesIO(b"redirect")
     )
-    opener = patch_opener(monkeypatch, redirect)
+    opener, _handlers = patch_opener(monkeypatch, redirect)
 
     with pytest.raises(LmStudioError, match="status 302"):
         lm_studio.request_json(
@@ -352,6 +537,45 @@ def test_request_json_rejects_redirects_without_following_them(
         )
 
     assert len(opener.calls) == 1
+
+
+def test_request_json_disables_ambient_proxies_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8443")
+    _opener, handlers = patch_opener(monkeypatch, FakeResponse(b"{}"))
+
+    lm_studio.request_json(
+        "GET", "http://127.0.0.1:1234/v1/models", None,
+        {"Content-Type": "application/json", "Accept": "application/json"}, 1,
+    )
+
+    proxy_handlers = [handler for handler in handlers if isinstance(handler, ProxyHandler)]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
+    assert sum(isinstance(handler, lm_studio._NoRedirect) for handler in handlers) == 1
+
+
+def test_request_json_never_exposes_http_error_response_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = b"token=SERVER-BODY-SECRET"
+    failure = HTTPError(
+        "http://127.0.0.1:1234/v1/models", 500, "failure", {}, BytesIO(secret)
+    )
+    patch_opener(monkeypatch, failure)
+
+    with pytest.raises(LmStudioError) as raised:
+        lm_studio.request_json(
+            "GET", "http://127.0.0.1:1234/v1/models", None,
+            {"Content-Type": "application/json", "Accept": "application/json"}, 1,
+        )
+
+    assert "SERVER-BODY-SECRET" not in str(raised.value)
+    assert str(raised.value) == "LM Studio HTTP request failed with status 500"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_request_json_rejects_responses_over_two_mib(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -392,6 +616,7 @@ def test_estimate_accepts_valid_labels_on_stderr(config: InferenceConfig) -> Non
                 "Preparing estimate\n",
                 "Estimated GPU Memory: 17.36 GiB\n"
                 "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n",
+                "/safe/lms",
             )
         }
     )
@@ -421,6 +646,7 @@ def test_estimate_rejects_duplicate_or_conflicting_labels_split_across_streams(
                 "Estimated GPU Memory: 17.36 GiB\n"
                 "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n",
                 stderr,
+                "/safe/lms",
             )
         }
     )
@@ -552,7 +778,21 @@ def test_default_runner_allows_only_exact_task_3_vectors(
     for command in approved:
         lm_studio.run_process(command, 15)
 
-    assert calls == approved
+    assert calls == [("/safe/lms", *command[1:]) for command in approved]
+
+
+def test_resolved_lms_is_canonical_absolute_executable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    executable = tmp_path / "real-lms"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o755)
+    alias = tmp_path / "lms"
+    alias.symlink_to(executable)
+    monkeypatch.setattr(lm_studio.shutil, "which", lambda _name: str(alias))
+    lm_studio._resolved_lms.cache_clear()
+
+    assert lm_studio._resolved_lms() == str(executable.resolve())
 
 
 @pytest.mark.parametrize(

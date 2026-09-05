@@ -20,6 +20,7 @@ def valid_config(**overrides: object) -> dict[str, object]:
         "ttl_seconds": 3_600,
         "minimum_available_memory_gib": 40,
         "models_directory": "/home/summit/.lmstudio/models",
+        "server_config_path": "/home/summit/.lmstudio/.internal/http-server-config.json",
     }
     config.update(overrides)
     return config
@@ -44,6 +45,16 @@ def test_loads_checked_in_lm_studio_configuration(project_root: Path) -> None:
     assert config.ttl_seconds == 3_600
     assert config.minimum_available_memory_gib == 40
     assert config.models_directory == "/home/summit/.lmstudio/models"
+    assert config.server_config_path == (
+        "/home/summit/.lmstudio/.internal/http-server-config.json"
+    )
+
+
+def test_example_configuration_matches_the_checked_in_contract(project_root: Path) -> None:
+    configured = load_inference_config(project_root / "config" / "inference.toml")
+    example = load_inference_config(project_root / "config.example.toml")
+
+    assert example == configured
 
 
 @pytest.mark.parametrize(
@@ -66,6 +77,7 @@ def test_rejects_noncanonical_or_credentialed_endpoint(base_url: str) -> None:
     [
         ("identifier", "AB"),
         ("models_directory", "relative/models"),
+        ("server_config_path", "relative/http-server-config.json"),
         ("context_length", 0),
         ("parallel", 2),
         ("ttl_seconds", 0),

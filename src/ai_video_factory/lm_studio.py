@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
@@ -29,6 +29,7 @@ _MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 _LOOPBACK_ORIGIN = ("http", "127.0.0.1", 1234)
 _READ_ONLY_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("lms", "--help"),
+    ("lms", "--version"),
     ("lms", "runtime", "ls"),
     ("lms", "runtime", "survey"),
     ("lms", "server", "status"),
@@ -62,6 +63,11 @@ _ESTIMATE_PATTERNS = {
     "total_gib": re.compile(r"^Estimated Total Memory:\s*(\S+)\s+GiB\s*$"),
     "confidence": re.compile(r"^Confidence:\s*(LOW|MEDIUM|HIGH|UNKNOWN)\s*$"),
 }
+_CLI_COMMIT = re.compile(r"^CLI commit:\s*([0-9a-f]{7,40})$")
+_SELECTED_RUNTIME = re.compile(
+    r"^(llama\.cpp-linux-x86_64-(?:vulkan|amd-rocm)-avx2)@(\d+(?:\.\d+)+)$"
+)
+_GPU_GIB = re.compile(r"^(?=.*\bAMD\b).+\s([0-9]+(?:\.[0-9]+)?)\s+GiB\s*$")
 
 
 class LmStudioError(RuntimeError):
@@ -76,12 +82,14 @@ class ProcessResult:
     returncode: int
     stdout: str
     stderr: str
+    executable_path: str
 
 
 CommandRunner = Callable[[Sequence[str], float], ProcessResult]
 HttpTransport = Callable[
     [str, str, dict[str, object] | None, Mapping[str, str], float], dict[str, object]
 ]
+FileReader = Callable[[Path], str]
 
 
 @dataclass(frozen=True)
@@ -104,15 +112,31 @@ class LmStudioModel:
 
 
 @dataclass(frozen=True)
+class LmStudioLoadedModel:
+    """A fully identified model record reported by ``lms ps``."""
+
+    identifier: str
+    model_key: str
+    relative_path: str
+    size_bytes: int
+    context_length: int
+    parallel: int
+
+
+@dataclass(frozen=True)
 class LmStudioSnapshot:
     """A read-only view of CLI availability, model inventory, and residency."""
 
     cli_help: str
+    cli_path: str
+    cli_commit: str
     runtimes: str
+    selected_runtime: str
     runtime_survey: str
     server_status: str
     server_running: bool
     models: tuple[LmStudioModel, ...]
+    loaded_models: tuple[LmStudioLoadedModel, ...]
     loaded_identifiers: tuple[str, ...]
     configured_model: LmStudioModel
     configured_model_loaded: bool
@@ -131,6 +155,21 @@ class _LoadedModel(BaseModel):
     model_config = ConfigDict(strict=True, extra="ignore")
 
     identifier: str
+    model_key: str = Field(validation_alias=AliasChoices("modelKey", "model_key"))
+    path: str
+    size_bytes: int = Field(validation_alias=AliasChoices("sizeBytes", "size_bytes"), ge=0)
+    context_length: int = Field(
+        validation_alias=AliasChoices("contextLength", "context_length"), gt=0
+    )
+    parallel: int = Field(gt=0)
+
+
+class _ServerConfig(BaseModel):
+    model_config = ConfigDict(strict=True, extra="ignore")
+
+    port: int
+    network_interface: str = Field(validation_alias="networkInterface")
+    cors: bool
 
 
 class _ApiModel(BaseModel):
@@ -150,8 +189,15 @@ def _resolved_lms() -> str:
     resolved = shutil.which("lms")
     if resolved is None:
         raise LmStudioError("LM Studio executable not found")
-    candidate = Path(resolved)
-    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+    try:
+        candidate = Path(resolved).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise LmStudioError("LM Studio executable could not be resolved") from exc
+    if (
+        not candidate.is_absolute()
+        or not candidate.is_file()
+        or not os.access(candidate, os.X_OK)
+    ):
         raise LmStudioError("LM Studio executable is not an executable regular file")
     return str(candidate)
 
@@ -162,10 +208,11 @@ def run_process(argv: Sequence[str], timeout: float) -> ProcessResult:
         raise LmStudioError(
             "LM Studio command is not an approved read-only or configured lifecycle command"
         )
-    _resolved_lms()
+    executable = _resolved_lms()
+    command = (executable, *argv[1:])
     try:
         completed = subprocess.run(
-            argv,
+            command,
             shell=False,
             capture_output=True,
             text=True,
@@ -180,7 +227,7 @@ def run_process(argv: Sequence[str], timeout: float) -> ProcessResult:
         raise LmStudioError(f"LM Studio command timed out after {timeout:g} seconds") from exc
     except OSError as exc:
         raise LmStudioError(f"LM Studio command could not run: {exc}") from exc
-    return ProcessResult(completed.returncode, completed.stdout, completed.stderr)
+    return ProcessResult(completed.returncode, completed.stdout, completed.stderr, executable)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -222,18 +269,34 @@ def request_json(
         raise LmStudioError("LM Studio requests require JSON Content-Type and Accept headers only")
     payload = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
     request = Request(url, data=payload, headers=dict(headers), method=method)
+    http_error_status: int | None = None
     try:
-        with build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+        with build_opener(ProxyHandler({}), _NoRedirect()).open(
+            request, timeout=timeout
+        ) as response:
             status = response.getcode()
             raw = response.read(_MAX_HTTP_RESPONSE_BYTES + 1)
     except HTTPError as exc:
-        raise LmStudioError(f"LM Studio HTTP request failed with status {exc.code}: {exc.read(_MAX_HTTP_RESPONSE_BYTES)}") from exc
+        http_error_status = exc.code
+        try:
+            exc.read(_MAX_HTTP_RESPONSE_BYTES + 1)
+        except OSError:
+            pass
+        finally:
+            try:
+                exc.close()
+            except OSError:
+                pass
     except URLError as exc:
         raise LmStudioError(f"LM Studio HTTP request failed: {exc.reason}") from exc
     except TimeoutError as exc:
         raise LmStudioError(f"LM Studio HTTP request timed out after {timeout:g} seconds") from exc
     except OSError as exc:
         raise LmStudioError(f"LM Studio HTTP request could not run: {exc}") from exc
+    if http_error_status is not None:
+        raise LmStudioError(
+            f"LM Studio HTTP request failed with status {http_error_status}"
+        )
     if not 200 <= status < 300:
         raise LmStudioError(f"LM Studio HTTP request failed with status {status}")
     if len(raw) > _MAX_HTTP_RESPONSE_BYTES:
@@ -247,6 +310,10 @@ def request_json(
     return parsed
 
 
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
 class LmStudioBackend:
     """Typed boundary around fixed LM Studio CLI and loopback HTTP calls."""
 
@@ -256,10 +323,12 @@ class LmStudioBackend:
         *,
         runner: CommandRunner = run_process,
         http: HttpTransport = request_json,
+        file_reader: FileReader = _read_text,
     ) -> None:
         self.config = config
         self.runner = runner
         self.http = http
+        self.file_reader = file_reader
 
     def _command(
         self,
@@ -285,6 +354,12 @@ class LmStudioBackend:
             if detail is None:
                 detail = f"exit code {result.returncode}"
             raise LmStudioError(f"LM Studio command {' '.join(argv)} failed: {detail}")
+        executable = Path(result.executable_path)
+        if (
+            not executable.is_absolute()
+            or executable.resolve(strict=False) != executable
+        ):
+            raise LmStudioError("LM Studio executable path is not canonical and absolute")
         return result
 
     @staticmethod
@@ -417,31 +492,141 @@ class LmStudioBackend:
             )
         return tuple(models)
 
-    @staticmethod
-    def _loaded(raw_loaded: str) -> tuple[str, ...]:
+    def _loaded(self, raw_loaded: str) -> tuple[LmStudioLoadedModel, ...]:
         try:
             parsed = json.loads(raw_loaded)
             records = _LOADED_ADAPTER.validate_python(parsed, strict=True)
         except (json.JSONDecodeError, ValidationError) as exc:
             raise LmStudioError("LM Studio loaded-model JSON is invalid") from exc
-        return tuple(record.identifier for record in records)
+        root = Path(self.config.models_directory).resolve(strict=False)
+        loaded: list[LmStudioLoadedModel] = []
+        for record in records:
+            raw_path = Path(record.path)
+            candidate = raw_path if raw_path.is_absolute() else root / raw_path
+            resolved = candidate.resolve(strict=False)
+            try:
+                relative_path = resolved.relative_to(root).as_posix()
+            except ValueError as exc:
+                raise LmStudioError(
+                    "LM Studio loaded-model path must be contained by models_directory"
+                ) from exc
+            loaded.append(
+                LmStudioLoadedModel(
+                    identifier=record.identifier,
+                    model_key=record.model_key,
+                    relative_path=relative_path,
+                    size_bytes=record.size_bytes,
+                    context_length=record.context_length,
+                    parallel=record.parallel,
+                )
+            )
+        return tuple(loaded)
+
+    @staticmethod
+    def _cli_commit(raw_help: str) -> str:
+        matches = [
+            match.group(1)
+            for line in raw_help.splitlines()
+            if (match := _CLI_COMMIT.fullmatch(line.strip())) is not None
+        ]
+        if len(matches) != 1:
+            raise LmStudioError("LM Studio help must contain exactly one CLI commit")
+        return matches[0]
+
+    @staticmethod
+    def _selected_runtime(raw_runtimes: str) -> tuple[str, str, str]:
+        selected = []
+        for line in raw_runtimes.splitlines():
+            if "✓" not in line:
+                continue
+            fields = line.split()
+            if fields:
+                selected.append(fields[0])
+        if len(selected) != 1:
+            raise LmStudioError("LM Studio must have exactly one selected compatible runtime")
+        match = _SELECTED_RUNTIME.fullmatch(selected[0])
+        if match is None:
+            raise LmStudioError("LM Studio must have exactly one selected compatible runtime")
+        return selected[0], match.group(1), match.group(2)
+
+    @staticmethod
+    def _validate_survey(raw_survey: str, family: str, version: str) -> None:
+        lines = raw_survey.splitlines()
+        expected_header = f"Survey by {family} ({version})"
+        if not lines or lines[0].strip() != expected_header:
+            raise LmStudioError("LM Studio runtime survey does not match the selected runtime")
+        gpu_sizes = []
+        for line in lines[1:]:
+            match = _GPU_GIB.fullmatch(line.strip())
+            if match is not None:
+                gpu_sizes.append(float(match.group(1)))
+        if not any(math.isfinite(size) and size > 0 for size in gpu_sizes):
+            raise LmStudioError("LM Studio runtime survey lacks a positive AMD accelerator")
+
+    def _validate_server_config(self) -> None:
+        try:
+            raw = self.file_reader(Path(self.config.server_config_path))
+            parsed = json.loads(raw)
+            config = _ServerConfig.model_validate(parsed, strict=True)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
+            raise LmStudioError("LM Studio server configuration is invalid") from exc
+        if (
+            config.port != 1234
+            or config.network_interface != "127.0.0.1"
+            or config.cors is not False
+        ):
+            raise LmStudioError("LM Studio server configuration is unsafe")
 
     def snapshot(self) -> LmStudioSnapshot:
         """Inspect fixed CLI state without loading models or changing LM Studio."""
         help_result = self._command(_READ_ONLY_COMMANDS[0])
-        runtimes_result = self._command(_READ_ONLY_COMMANDS[1])
-        survey_result = self._command(_READ_ONLY_COMMANDS[2])
-        server_result = self._command(_READ_ONLY_COMMANDS[3], allow_failure=True)
-        inventory_result = self._command(_READ_ONLY_COMMANDS[4])
-        loaded_result = self._command(_READ_ONLY_COMMANDS[5])
+        version_result = self._command(_READ_ONLY_COMMANDS[1])
+        runtimes_result = self._command(_READ_ONLY_COMMANDS[2])
+        survey_result = self._command(_READ_ONLY_COMMANDS[3])
+        server_result = self._command(_READ_ONLY_COMMANDS[4], allow_failure=True)
+        inventory_result = self._command(_READ_ONLY_COMMANDS[5])
+        loaded_result = self._command(_READ_ONLY_COMMANDS[6])
+
+        executable_paths = {
+            result.executable_path
+            for result in (
+                help_result,
+                version_result,
+                runtimes_result,
+                survey_result,
+                server_result,
+                inventory_result,
+                loaded_result,
+            )
+        }
+        if len(executable_paths) != 1:
+            raise LmStudioError("LM Studio commands resolved to inconsistent executables")
+        cli_path = executable_paths.pop()
+        help_text = "\n".join((help_result.stdout, help_result.stderr)).strip()
+        identity_text = "\n".join(
+            (
+                help_result.stdout,
+                help_result.stderr,
+                version_result.stdout,
+                version_result.stderr,
+            )
+        )
+        cli_commit = self._cli_commit(identity_text)
+        selected_runtime, runtime_family, runtime_version = self._selected_runtime(
+            runtimes_result.stdout
+        )
+        self._validate_survey(survey_result.stdout, runtime_family, runtime_version)
 
         models = self._inventory(inventory_result.stdout)
-        configured_models = [model for model in models if model.model_key == self.config.model_key]
+        configured_models = [
+            model for model in models if model.model_key == self.config.model_key
+        ]
         if not configured_models:
             raise LmStudioError("configured model is missing from LM Studio inventory")
         if len(configured_models) != 1:
             raise LmStudioError("duplicate configured model keys in LM Studio inventory")
-        loaded_identifiers = self._loaded(loaded_result.stdout)
+        loaded_models = self._loaded(loaded_result.stdout)
+        loaded_identifiers = tuple(model.identifier for model in loaded_models)
         server_detail = (
             first_diagnostic_line(server_result.stdout)
             or first_diagnostic_line(server_result.stderr)
@@ -451,24 +636,53 @@ class LmStudioBackend:
         server_running = server_result.returncode == 0 and "running" in status_text and all(
             marker not in status_text for marker in ("not running", "stopped")
         )
+        if server_running:
+            self._validate_server_config()
         checks: dict[str, InferenceCheck] = {
-            "cli": InferenceCheck(status="ready", detail=first_diagnostic_line(help_result.stdout)),
-            "runtime": InferenceCheck(status="ready", detail=first_diagnostic_line(runtimes_result.stdout)),
-            "survey": InferenceCheck(status="ready", detail=first_diagnostic_line(survey_result.stdout)),
+            "cli": InferenceCheck(status="ready", detail=f"{cli_path} commit {cli_commit}"),
+            "runtime": InferenceCheck(status="ready", detail=selected_runtime),
+            "survey": InferenceCheck(
+                status="ready", detail=first_diagnostic_line(survey_result.stdout)
+            ),
             "server": InferenceCheck(
                 status="ready" if server_running else "not_ready",
                 detail=None if server_running else server_detail,
             ),
-            "configured_model": InferenceCheck(status="ready", detail=self.config.model_key),
+            "configured_model": InferenceCheck(
+                status="ready", detail=self.config.model_key
+            ),
         }
-        configured_model_loaded = self.config.identifier in loaded_identifiers
+        aliases = [
+            loaded for loaded in loaded_models if loaded.identifier == self.config.identifier
+        ]
+        if len(aliases) > 1:
+            raise LmStudioError("configured LM Studio identifier has duplicate loaded records")
+        configured_model_loaded = False
+        if aliases:
+            loaded = aliases[0]
+            configured = configured_models[0]
+            configured_model_loaded = (
+                loaded.model_key == configured.model_key
+                and loaded.relative_path == configured.relative_path
+                and loaded.size_bytes == configured.size_bytes
+                and loaded.context_length == self.config.context_length
+                and loaded.parallel == self.config.parallel
+            )
+            if not configured_model_loaded:
+                raise LmStudioError(
+                    "configured LM Studio identifier is bound to a different model"
+                )
         return LmStudioSnapshot(
-            cli_help=help_result.stdout,
+            cli_help=help_text,
+            cli_path=cli_path,
+            cli_commit=cli_commit,
             runtimes=runtimes_result.stdout,
+            selected_runtime=selected_runtime,
             runtime_survey=survey_result.stdout,
             server_status=server_detail,
             server_running=server_running,
             models=models,
+            loaded_models=loaded_models,
             loaded_identifiers=loaded_identifiers,
             configured_model=configured_models[0],
             configured_model_loaded=configured_model_loaded,

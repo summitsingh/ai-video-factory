@@ -81,6 +81,16 @@ kept only beneath ignored `data/system/model-digests/`; model files and
 companions are never written. `inference stop` unloads only the stable
 identifier and never stops the shared server or unloads another model.
 
+Every discovery snapshot resolves the canonical executable and records its
+authoritative CLI commit, requires exactly one selected Vulkan-or-AMD-ROCm AVX2
+runtime plus a matching positive AMD accelerator survey, and—whenever the
+server is running—checks `server_config_path` for port `1234`, interface
+`127.0.0.1`, and disabled CORS. Residency is accepted only when the alias,
+inventory model key and contained path, package size, context length, and
+parallelism all match. An alias collision fails closed, including for stop, so
+the factory cannot unload a different model. Loopback HTTP ignores ambient
+proxy settings and never follows redirects or exposes HTTP error bodies.
+
 If an inference step or probe fails, immediately run the targeted
 `uv run ai-video-factory inference stop`, verify with `lms ps --json` that
 `avf-qwen36-executor` is absent and unrelated identifiers are unchanged, and do

@@ -25,6 +25,7 @@ class InferenceConfig(BaseModel):
     ttl_seconds: int = Field(gt=0)
     minimum_available_memory_gib: int = Field(gt=0)
     models_directory: str = Field(min_length=1)
+    server_config_path: str = Field(min_length=1)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -63,6 +64,8 @@ class InferenceConfig(BaseModel):
             raise ValueError("base_url must be http://127.0.0.1:1234/v1 without credentials")
         if not Path(self.models_directory).is_absolute():
             raise ValueError("models_directory must be absolute")
+        if not Path(self.server_config_path).is_absolute():
+            raise ValueError("server_config_path must be absolute")
         return self
 
 

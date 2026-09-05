@@ -238,6 +238,8 @@ def capability_inputs(
     return {
         "config": config.model_dump(mode="json"),
         "cli": sanitize_diagnostic(snapshot.cli_help),
+        "cli_path": snapshot.cli_path,
+        "cli_commit": snapshot.cli_commit,
         "runtime": sanitize_diagnostic(snapshot.runtimes),
         "amd_survey": sanitize_diagnostic(snapshot.runtime_survey),
         "model": model,
