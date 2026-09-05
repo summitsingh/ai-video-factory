@@ -21,6 +21,7 @@ from typing import Any, Literal
 from ai_video_factory.edit_schema import EditDocument, EditScene, load_edit, save_edit
 from ai_video_factory.lm_studio import LmStudioError
 from ai_video_factory.media_probe import MediaProbeError, probe_media
+from ai_video_factory.narration import NarrationError, mix_scenes_to_track, synthesize_to_wav
 from ai_video_factory.qc import evaluate_qc, write_qc_reports
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
 from ai_video_factory.run_store import RunStore
@@ -115,7 +116,7 @@ def _pipeline_inputs(
                         "chromium-browser",
                     ],
                 },
-                "audio_filter": "anullsrc=r=48000:cl=stereo",
+                "audio_filter": "espeak-ng scene narration mixed with adelay/amix, apad to video length (silent anullsrc fallback)",
                 "audio_codec": "aac",
                 "audio_bitrate": "192k",
                 "shortest": True,
@@ -298,6 +299,66 @@ def _find_local_browser() -> Path:
                 return browser
     raise LocalBrowserError(
         "no verified local browser executable; install or configure REMOTION_CHROME_EXECUTABLE"
+    )
+
+
+def _mux_narration_audio(
+    source: Path,
+    narration_track: Path | None,
+    destination: Path,
+    *,
+    ffmpeg: Path | None = None,
+) -> None:
+    """Mux the video with the TTS narration track (or silence as fallback).
+
+    The narration track is padded with silence so the video length governs
+    the output duration via -shortest.
+    """
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg is not None else "ffmpeg"
+    if narration_track is not None:
+        _run_command(
+            (
+                ffmpeg_bin, "-y",
+                "-i", str(source),
+                "-i", str(Path(narration_track).resolve()),
+                "-filter_complex", "[1:a]apad[aud]",
+                "-map", "0:v", "-map", "[aud]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-ar", "48000", "-ac", "2",
+                "-shortest", str(destination),
+            ),
+            cwd=destination.parent,
+            name="FFmpeg narration mux",
+        )
+    else:
+        _mux_silent_audio(source, destination, ffmpeg=ffmpeg)
+
+
+def _synthesize_narration_track(
+    edit: EditDocument, workdir: Path, *, ffmpeg: Path | None = None
+) -> Path | None:
+    """Synthesize per-scene narration and mix into one padded track.
+
+    Returns None when no scene carries speakable narration (caller falls
+    back to a silent track).
+    """
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    segments: list[tuple[Path, float]] = []
+    for i, scene in enumerate(edit.scenes):
+        if not scene.narration or not scene.narration.strip():
+            continue
+        wav = workdir / f"scene-{i}.wav"
+        synthesize_to_wav(scene.narration, wav)
+        segments.append((wav, scene.from_frame / edit.fps))
+    if not segments:
+        return None
+    return mix_scenes_to_track(
+        segments, workdir / "narration.wav",
+        ffmpeg=str(ffmpeg) if ffmpeg is not None else "ffmpeg",
     )
 
 
@@ -545,10 +606,15 @@ def run_video_pipeline(
                 job.master_path = root / job.master_path
             job.master_path.parent.mkdir(parents=True, exist_ok=True)
 
-        render_run = state_store.start("video-render", {
-            "topic": job.topic,
-            "edit_path": str(job.edit_path),
-        })
+        render_run = state_store.start(
+            "video-render",
+            _pipeline_inputs(
+                root,
+                job.edit_path,
+                root / "remotion" / "package-lock.json",
+                tools,
+            ),
+        )
         run_id = render_run.run_id
         run_directory = artifact_root / render_run.run_id
         temporary_path = run_directory / "render.tmp.mp4"
@@ -569,8 +635,22 @@ def run_video_pipeline(
                     browser=_required_tool(tools, "browser"),
                     npm=_required_tool(tools, "npm"),
                 )
-                _mux_silent_audio(
+                edit_doc_render = load_edit(job.edit_path)
+                narration_track = _synthesize_narration_track(
+                    edit_doc_render,
+                    run_directory / "narration",
+                    ffmpeg=_required_tool(tools, "ffmpeg"),
+                )
+                if narration_track is not None:
+                    metadata["narration_status"] = "complete"
+                    metadata["narration_segments"] = len([
+                        s for s in edit_doc_render.scenes if (s.narration or "").strip()
+                    ])
+                else:
+                    metadata["narration_status"] = "silent_fallback"
+                _mux_narration_audio(
                     temporary_path,
+                    narration_track,
                     run_master,
                     ffmpeg=_required_tool(tools, "ffmpeg"),
                 )
@@ -659,7 +739,7 @@ def run_video_pipeline(
             status="fail",
             run_id=run_id,
             resumed=False,
-            retryable=isinstance(error, (PipelineCommandError, LmStudioError, MediaProbeError)),
+            retryable=isinstance(error, (PipelineCommandError, LmStudioError, MediaProbeError, NarrationError)),
             artifacts=artifacts,
             error=job.error,
             metadata=metadata,
