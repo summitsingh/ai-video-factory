@@ -23,6 +23,49 @@ const toLocalSrc = (path: string): string => {
   return staticFile(path);
 };
 
+// Deterministic pseudo-random per star index so the field is stable across
+// frames within a scene but varied between scenes.
+const starHash = (i: number): number => {
+  const x = Math.sin(i * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+};
+
+// Animated starfield: twinkling stars with slow parallax drift. Pure CSS, no
+// external assets. Adds depth behind title cards and subtle motion over media.
+const StarField = ({count = 90}: {count?: number}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none', overflow: 'hidden'}}>
+      {Array.from({length: count}, (_, i) => {
+        const baseX = starHash(i) * width;
+        const baseY = starHash(i + 1000) * height;
+        const depth = 0.3 + starHash(i + 2000) * 0.7; // parallax factor
+        const drift = frame * (4 + depth * 8);
+        const twinkle =
+          0.35 + 0.65 * Math.abs(Math.sin(frame * 0.04 + i));
+        const size = 1 + depth * 2;
+        return (
+          <div
+            key={i}
+            style={{
+              position: 'absolute',
+              left: baseX - drift,
+              top: baseY,
+              width: `${size}px`,
+              height: `${size}px`,
+              borderRadius: '50%',
+              backgroundColor: '#ffffff',
+              opacity: twinkle * depth,
+              transform: 'translateZ(0)',
+            }}
+          />
+        );
+      })}
+    </AbsoluteFill>
+  );
+};
+
 const SceneMedia = ({scene}: {scene: EditScene}) => {
   const frame = useCurrentFrame();
   if (scene.clip) {
@@ -39,7 +82,16 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
     );
   }
   if (scene.image) {
-    const zoom = interpolate(frame, [0, scene.duration_frames], [1, 1.15], {
+    const zoom = interpolate(frame, [0, scene.duration_frames], [1, 1.12], {
+      extrapolateLeft: 'clamp',
+      extrapolateRight: 'clamp',
+    });
+    // Slow deliberate pan so stills feel alive (Ken Burns).
+    const panX = interpolate(frame, [0, scene.duration_frames], [-3, 3], {
+      extrapolateLeft: 'clamp',
+      extrapolateRight: 'clamp',
+    });
+    const panY = interpolate(frame, [0, scene.duration_frames], [-2, 2], {
       extrapolateLeft: 'clamp',
       extrapolateRight: 'clamp',
     });
@@ -50,7 +102,7 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
           style={{
             height: '100%',
             objectFit: 'cover',
-            transform: `scale(${zoom})`,
+            transform: `translate(${panX}px, ${panY}px) scale(${zoom})`,
             width: '100%',
           }}
         />
@@ -67,12 +119,14 @@ const SceneCard = ({
   total,
   isLast,
   sources,
+  overlay,
 }: {
   scene: EditScene;
   index: number;
   total: number;
   isLast: boolean;
   sources?: string[];
+  overlay?: boolean;
 }) => {
   const frame = useCurrentFrame();
   const {height} = useVideoConfig();
@@ -89,6 +143,15 @@ const SceneCard = ({
     [1, 0],
     {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'},
   );
+  // During a transition overlay, ramp opacity in from zero so the next scene
+  // dissolves over the previous one instead of popping in.
+  const overlayIn = overlay
+    ? interpolate(frame, [0, fadeIn + 6], [0, 1], {
+        extrapolateLeft: 'clamp',
+        extrapolateRight: 'clamp',
+      })
+    : 1;
+
   const rise = interpolate(frame, [0, fadeIn], [36, 0], {
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
@@ -102,10 +165,20 @@ const SceneCard = ({
     <AbsoluteFill
       style={{
         background: BACKGROUNDS[index % BACKGROUNDS.length],
-        opacity: Math.min(enter, exit),
+        opacity: overlay ? overlayIn : Math.min(enter, exit),
       }}
     >
       <SceneMedia scene={scene} />
+      {/* Animated starfield for depth behind title cards */}
+      <StarField count={80} />
+      {/* Cinematic vignette to focus the eye and add a filmic look */}
+      <AbsoluteFill
+        style={{
+          background:
+            'radial-gradient(ellipse at center, transparent 45%, rgba(0,0,0,0.6) 100%)',
+          pointerEvents: 'none',
+        }}
+      />
       <AbsoluteFill
         style={{
           alignItems: 'center',
@@ -138,6 +211,7 @@ const SceneCard = ({
             letterSpacing: '-0.03em',
             lineHeight: 1.08,
             maxWidth: '85%',
+            textShadow: '0 2px 12px rgba(0,0,0,0.7)',
           }}
         >
           {scene.title}
@@ -227,6 +301,8 @@ const ProgressBar = () => {
   );
 };
 
+const TRANSITION_FRAMES = 24; // ~0.8s cross-dissolve at 30fps
+
 export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
   return (
     <AbsoluteFill>
@@ -243,6 +319,25 @@ export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
             scene={scene}
             sources={sources}
             total={scenes.length}
+          />
+        </Sequence>
+      ))}
+      {/* Cross-dissolve transitions: fade the next scene in over the tail of
+          the current one. Only valid within a chunk (boundaries hard-cut). */}
+      {scenes.slice(0, -1).map((scene, index) => (
+        <Sequence
+          durationInFrames={TRANSITION_FRAMES}
+          from={scene.from_frame + scene.duration_frames - TRANSITION_FRAMES}
+          key={`transition-${scene.id}`}
+          layout="none"
+        >
+          <SceneCard
+            index={index + 1}
+            isLast={index === scenes.length - 2}
+            scene={scenes[index + 1]}
+            sources={sources}
+            total={scenes.length}
+            overlay
           />
         </Sequence>
       ))}

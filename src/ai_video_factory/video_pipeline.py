@@ -266,20 +266,23 @@ def cache_assets_for_remotion(
     are available during rendering.
     """
     remotion_public.mkdir(parents=True, exist_ok=True)
-    for scene_dir in sorted(assets_dir.glob("scene-*")):
+    for idx, scene_dir in enumerate(sorted(assets_dir.glob("scene-*"))):
         if not scene_dir.is_dir():
             continue
-        # Copy clips
-        for clip in scene_dir.glob("*clip*.mp4"):
-            dst = remotion_public / clip.name
+        # Copy clips using a scene-specific name so each scene resolves to its
+        # own media file (see attach_scene_assets).
+        for clip in sorted(scene_dir.glob("*clip*.mp4")):
+            dst = remotion_public / f"scene-{idx:02d}-clip{clip.suffix}"
             if not dst.exists():
                 shutil.copy2(clip, dst)
-        # Copy images
-        for img in scene_dir.glob("*"):
-            if img.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") and img.is_file():
-                dst = remotion_public / img.name
-                if not dst.exists():
-                    shutil.copy2(img, dst)
+        # Copy images using a scene-specific name. Prefer the first image so it
+        # matches what attach_scene_assets stored; copy any extras too.
+        for img in sorted(scene_dir.glob("*")):
+            if img.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+                continue
+            dst = remotion_public / f"scene-{idx:02d}-image{img.suffix}"
+            if not dst.exists():
+                shutil.copy2(img, dst)
 
 
 def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocument:
@@ -306,11 +309,13 @@ def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocu
                  if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
                  and p.is_file()]
             )
-            # Use simple filenames that staticFile() can resolve from public/
+            # Use a scene-specific filename so each scene resolves to its own
+            # media file in Remotion's public/ directory instead of all scenes
+            # colliding on one shared name.
             if clips:
-                update["clip"] = clips[0].name
+                update["clip"] = f"scene-{i:02d}-clip{clips[0].suffix}"
             if images:
-                update["image"] = images[0].name
+                update["image"] = f"scene-{i:02d}-image{images[0].suffix}"
         scenes.append(scene.model_copy(update=update) if update else scene)
     return edit.model_copy(update={"scenes": scenes})
 
