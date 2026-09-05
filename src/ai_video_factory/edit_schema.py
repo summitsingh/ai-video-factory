@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EditScene(BaseModel):
@@ -26,6 +26,13 @@ class EditDocument(BaseModel):
     fps: int = Field(gt=0)
     duration_frames: int = Field(gt=0)
     scenes: list[EditScene]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def reject_boolean_schema_version(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("schema_version must be the number 1, not a boolean")
+        return value
 
     @model_validator(mode="after")
     def validate_scenes(self) -> Self:

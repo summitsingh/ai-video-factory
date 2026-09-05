@@ -114,5 +114,24 @@
         }
       ]
     }
+  },
+  {
+    "name": "boolean schema version",
+    "document": {
+      "schema_version": true,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "duration_frames": 90,
+      "scenes": [
+        {
+          "id": "title",
+          "from_frame": 0,
+          "duration_frames": 90,
+          "title": "Synthetic test",
+          "caption": "Local render"
+        }
+      ]
+    }
   }
 ]
