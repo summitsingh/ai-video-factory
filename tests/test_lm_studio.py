@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
+import ai_video_factory.lm_studio as lm_studio
 from ai_video_factory.inference_config import InferenceConfig
-from ai_video_factory.lm_studio import ProcessResult
+from ai_video_factory.lm_studio import LmStudioError, ProcessResult
 from ai_video_factory.sanitization import MAX_DIAGNOSTIC_CHARS
 
 
@@ -71,6 +74,46 @@ class RecordingRunner:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+class FakeResponse:
+    def __init__(self, body: bytes, *, status: int = 200) -> None:
+        self.body = body
+        self.status = status
+        self.read_limits: list[int] = []
+
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        return None
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self, limit: int) -> bytes:
+        self.read_limits.append(limit)
+        return self.body[:limit]
+
+
+class RecordingOpener:
+    def __init__(self, response: FakeResponse | BaseException) -> None:
+        self.response = response
+        self.calls: list[tuple[object, float]] = []
+
+    def open(self, request: object, *, timeout: float) -> FakeResponse:
+        self.calls.append((request, timeout))
+        if isinstance(self.response, BaseException):
+            raise self.response
+        return self.response
+
+
+def patch_opener(
+    monkeypatch: pytest.MonkeyPatch, response: FakeResponse | BaseException
+) -> RecordingOpener:
+    opener = RecordingOpener(response)
+    monkeypatch.setattr(lm_studio, "build_opener", lambda *_handlers: opener)
+    return opener
 
 
 def inventory_runner(
@@ -193,11 +236,110 @@ def test_snapshot_sanitizes_and_caps_failed_command_stderr(config: InferenceConf
     assert len(str(raised.value)) <= MAX_DIAGNOSTIC_CHARS
 
 
-def test_request_json_rejects_non_loopback_urls() -> None:
-    from ai_video_factory.lm_studio import LmStudioError, request_json
+def test_snapshot_rejects_malformed_loaded_model_json(config: InferenceConfig) -> None:
+    with pytest.raises(LmStudioError, match="loaded-model JSON"):
+        lm_studio.LmStudioBackend(
+            config, runner=inventory_runner(config, loaded="not json")
+        ).snapshot()
+
+
+def test_run_process_rejects_a_mutating_command_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lm_studio, "_resolved_lms", lambda: "/safe/lms")
+    monkeypatch.setattr(
+        lm_studio.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("subprocess must not be invoked"),
+    )
+
+    with pytest.raises(LmStudioError, match="read-only"):
+        lm_studio.run_process(("lms", "server", "stop"), 15)
+
+
+def test_request_json_rejects_non_loopback_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    opener = patch_opener(monkeypatch, FakeResponse(b"{}"))
 
     with pytest.raises(LmStudioError, match="loopback"):
-        request_json(
+        lm_studio.request_json(
             "GET", "http://example.com/v1/models", None,
             {"Content-Type": "application/json", "Accept": "application/json"}, 1,
         )
+
+    assert opener.calls == []
+
+
+@pytest.mark.parametrize("headers", [{"Accept": "application/json"}, {
+    "Content-Type": "application/json", "Accept": "application/json", "Authorization": "secret"
+}])
+def test_request_json_rejects_nonexact_headers(
+    monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]
+) -> None:
+    opener = patch_opener(monkeypatch, FakeResponse(b"{}"))
+
+    with pytest.raises(LmStudioError, match="headers only"):
+        lm_studio.request_json("GET", "http://127.0.0.1:1234/v1/models", None, headers, 1)
+
+    assert opener.calls == []
+
+
+@pytest.mark.parametrize("url", [
+    "http://user:password@127.0.0.1:1234/v1/models",
+    "http://127.0.0.1:1234/v1/models?token=secret",
+    "http://127.0.0.1:1234/v1/models#fragment",
+])
+def test_request_json_rejects_credentialed_or_decorated_loopback_urls(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    opener = patch_opener(monkeypatch, FakeResponse(b"{}"))
+
+    with pytest.raises(LmStudioError, match="loopback"):
+        lm_studio.request_json(
+            "GET", url, None,
+            {"Content-Type": "application/json", "Accept": "application/json"}, 1,
+        )
+
+    assert opener.calls == []
+
+
+@pytest.mark.parametrize(("body", "message"), [(b"not json", "valid JSON"), (b"[]", "object")])
+def test_request_json_rejects_invalid_or_nonobject_json(
+    monkeypatch: pytest.MonkeyPatch, body: bytes, message: str
+) -> None:
+    patch_opener(monkeypatch, FakeResponse(body))
+
+    with pytest.raises(LmStudioError, match=message):
+        lm_studio.request_json(
+            "GET", "http://127.0.0.1:1234/v1/models", None,
+            {"Content-Type": "application/json", "Accept": "application/json"}, 1,
+        )
+
+
+def test_request_json_rejects_redirects_without_following_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redirect = HTTPError(
+        "http://127.0.0.1:1234/v1/models", 302, "Found", {}, BytesIO(b"redirect")
+    )
+    opener = patch_opener(monkeypatch, redirect)
+
+    with pytest.raises(LmStudioError, match="status 302"):
+        lm_studio.request_json(
+            "GET", "http://127.0.0.1:1234/v1/models", None,
+            {"Content-Type": "application/json", "Accept": "application/json"}, 1,
+        )
+
+    assert len(opener.calls) == 1
+
+
+def test_request_json_rejects_responses_over_two_mib(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = FakeResponse(b"x" * (2 * 1024 * 1024 + 1))
+    patch_opener(monkeypatch, response)
+
+    with pytest.raises(LmStudioError, match="2 MiB"):
+        lm_studio.request_json(
+            "GET", "http://127.0.0.1:1234/v1/models", None,
+            {"Content-Type": "application/json", "Accept": "application/json"}, 1,
+        )
+
+    assert response.read_limits == [2 * 1024 * 1024 + 1]

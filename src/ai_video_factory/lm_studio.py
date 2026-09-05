@@ -122,8 +122,8 @@ def _resolved_lms() -> str:
 
 def run_process(argv: Sequence[str], timeout: float) -> ProcessResult:
     """Run a fixed LM Studio command without a shell or inherited stdin."""
-    if not argv or argv[0] != "lms":
-        raise LmStudioError("LM Studio command must begin with lms")
+    if tuple(argv) not in _READ_ONLY_COMMANDS:
+        raise LmStudioError("LM Studio command is not an approved read-only command")
     _resolved_lms()
     try:
         completed = subprocess.run(
