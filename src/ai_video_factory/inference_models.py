@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class InferenceCheck(BaseModel):
@@ -44,3 +44,10 @@ class InferenceResult(BaseModel):
     metrics: dict[str, int | float | str | bool | None]
     artifacts: dict[str, str]
     error: str | None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def reject_boolean_schema_version(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("schema_version must be the number 1, not a boolean")
+        return value

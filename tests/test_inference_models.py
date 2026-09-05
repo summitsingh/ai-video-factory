@@ -92,3 +92,18 @@ def test_result_forbids_unknown_fields_and_coercion() -> None:
     payload["retryable"] = "false"
     with pytest.raises(ValidationError):
         InferenceResult.model_validate(payload)
+
+
+def test_result_rejects_boolean_schema_version() -> None:
+    with pytest.raises(ValidationError):
+        InferenceResult.model_validate({
+            "schema_version": True,
+            "command": "doctor",
+            "status": "pass",
+            "retryable": False,
+            "model_identifier": "avf-qwen36-executor",
+            "checks": {},
+            "metrics": {},
+            "artifacts": {},
+            "error": None,
+        })

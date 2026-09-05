@@ -33,6 +33,13 @@ class InferenceConfig(BaseModel):
             raise ValueError("schema_version must be the number 1, not a boolean")
         return value
 
+    @field_validator("parallel", mode="before")
+    @classmethod
+    def reject_boolean_parallel(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("parallel must be the number 1, not a boolean")
+        return value
+
     @model_validator(mode="after")
     def validate_loopback_endpoint_and_model_directory(self) -> Self:
         endpoint = urlsplit(self.base_url)

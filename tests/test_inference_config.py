@@ -32,14 +32,18 @@ def project_root() -> Path:
 
 def test_loads_checked_in_lm_studio_configuration(project_root: Path) -> None:
     config = load_inference_config(project_root / "config" / "inference.toml")
+    assert config.schema_version == 1
+    assert config.backend == "lm_studio"
+    assert config.base_url == "http://127.0.0.1:1234/v1"
+    assert config.lms_binary == "lms"
     assert config.model_key == "qwen3.6-35b-a3b-udt-mtp"
     assert config.identifier == "avf-qwen36-executor"
-    assert config.base_url == "http://127.0.0.1:1234/v1"
     assert config.context_length == 65_536
     assert config.gpu == "max"
     assert config.parallel == 1
     assert config.ttl_seconds == 3_600
     assert config.minimum_available_memory_gib == 40
+    assert config.models_directory == "/home/summit/.lmstudio/models"
 
 
 @pytest.mark.parametrize(
@@ -71,3 +75,9 @@ def test_rejects_noncanonical_or_credentialed_endpoint(base_url: str) -> None:
 def test_rejects_invalid_strict_configuration_values(field: str, value: object) -> None:
     with pytest.raises(ValidationError):
         InferenceConfig.model_validate(valid_config(**{field: value}))
+
+
+@pytest.mark.parametrize("field", ["schema_version", "parallel"])
+def test_rejects_boolean_numeric_literals(field: str) -> None:
+    with pytest.raises(ValidationError):
+        InferenceConfig.model_validate(valid_config(**{field: True}))
