@@ -12,6 +12,7 @@ from typing import Literal
 from ai_video_factory.inference_config import InferenceConfig
 from ai_video_factory.inference_models import InferenceCheck, InferenceResult, MemoryEstimate
 from ai_video_factory.lm_studio import LmStudioBackend, LmStudioError, LmStudioSnapshot
+from ai_video_factory.model_provenance import ModelDigestCache, capability_inputs as build_capability_inputs
 from ai_video_factory.sanitization import sanitize_diagnostic
 
 
@@ -22,6 +23,7 @@ MemoryReader = Callable[[], float]
 _LIFECYCLE_TIMEOUT_SECONDS = 600.0
 _POLL_INTERVAL_SECONDS = 1.0
 _MEM_AVAILABLE = re.compile(r"^MemAvailable:\s*(\d+)\s+kB\s*$")
+_CAPABILITY_CORPUS_VERSION = "lm-studio-capability-v1"
 
 
 def available_memory_gib(path: Path = Path("/proc/meminfo")) -> float:
@@ -127,6 +129,22 @@ class InferenceService:
                     f"LM Studio model lifecycle timed out waiting for identifier to {state}"
                 )
             self.sleeper(_POLL_INTERVAL_SECONDS)
+
+    def capability_inputs(self, data_root: Path) -> dict[str, object]:
+        """Build read-only, cache-backed provenance for a capability benchmark."""
+        snapshot = self.backend.snapshot()
+        cache = ModelDigestCache(
+            Path(data_root) / "system" / "model-digests",
+            model_root=Path(self.config.models_directory),
+            identifier=self.config.identifier,
+        )
+        identity = cache.identity(snapshot.configured_model)
+        return build_capability_inputs(
+            self.config,
+            snapshot,
+            identity,
+            _CAPABILITY_CORPUS_VERSION,
+        )
 
     def doctor(self) -> InferenceResult:
         """Inspect the configured backend without changing runtime state."""

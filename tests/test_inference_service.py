@@ -9,7 +9,8 @@ import pytest
 from ai_video_factory.inference_config import InferenceConfig
 from ai_video_factory.inference_models import MemoryEstimate
 from ai_video_factory.inference_service import InferenceService, available_memory_gib
-from ai_video_factory.lm_studio import LmStudioError
+from ai_video_factory.lm_studio import LmStudioError, LmStudioModel
+from ai_video_factory.run_store import fingerprint_inputs
 from ai_video_factory.sanitization import MAX_DIAGNOSTIC_CHARS
 
 
@@ -99,9 +100,19 @@ class FakeBackend:
 
     def snapshot(self) -> SimpleNamespace:
         self.snapshot_calls += 1
+        model_path = Path(self.config.models_directory) / "publisher" / "model.gguf"
         return SimpleNamespace(
+            cli_help="lms 0.0.47",
+            runtimes="rocm-runtime 2.31.2",
+            runtime_survey="AMD Radeon 8060S",
             server_running=self.server_running,
             loaded_identifiers=tuple(self.loaded),
+            configured_model=LmStudioModel(
+                model_key=self.config.model_key,
+                path=model_path,
+                relative_path="publisher/model.gguf",
+                size_bytes=model_path.stat().st_size if model_path.exists() else 0,
+            ),
             configured_model_loaded=self.config.identifier in self.loaded,
             checks={},
         )
@@ -415,6 +426,25 @@ def test_doctor_and_status_are_read_only(config: InferenceConfig) -> None:
     assert status.status == "pass"
     assert not backend.mutating_calls
     assert backend.loaded == [config.identifier, "user-model"]
+
+
+def test_capability_inputs_cache_configured_model_beneath_data_root(
+    config: InferenceConfig, tmp_path: Path,
+) -> None:
+    model = Path(config.models_directory) / "publisher" / "model.gguf"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"model-bytes")
+    service, backend, _clock = service_fixture(
+        config, loaded=[config.identifier, "user-model"],
+    )
+
+    inputs = service.capability_inputs(tmp_path / "data")
+
+    assert inputs["model"]["identifier"] == config.identifier
+    assert inputs["corpus_version"] == "lm-studio-capability-v1"
+    assert list((tmp_path / "data" / "system" / "model-digests").glob("*.json"))
+    assert fingerprint_inputs(inputs) == fingerprint_inputs(service.capability_inputs(tmp_path / "data"))
+    assert not backend.mutating_calls
 
 
 class ExplodingBackend:
