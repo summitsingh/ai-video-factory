@@ -28,6 +28,11 @@ _CHECK_NAMES = (
     "tool_calling",
 )
 
+
+class _BenchmarkClockError(ValueError):
+    """Raised when the injected monotonic clock violates its contract."""
+
+
 _RESPONSE_FORMAT: dict[str, object] = {
     "type": "json_schema",
     "json_schema": {
@@ -226,7 +231,7 @@ def _tool_passes(completion: _Completion) -> bool:
 
 def _duration_ms(start: float, end: float) -> float:
     if not all(math.isfinite(value) for value in (start, end)) or end < start:
-        raise LmStudioError("capability benchmark clock returned invalid values")
+        raise _BenchmarkClockError("capability benchmark clock returned invalid values")
     return round((end - start) * 1000, 3)
 
 
@@ -270,6 +275,10 @@ def _result_from_report(
 
 def _safe_error(error: BaseException) -> tuple[str, bool]:
     detail = str(error).casefold()
+    if isinstance(error, _BenchmarkClockError):
+        return "capability benchmark clock returned invalid values", False
+    if "identifier does not match benchmark" in detail:
+        return "configured model identifier does not match benchmark", True
     if isinstance(error, TimeoutError) or "timed out" in detail or "timeout" in detail:
         return "LM Studio capability request timed out", True
     if "status" in detail:
@@ -343,18 +352,29 @@ def run_capability_benchmark(
         if service.config.identifier != _MODEL_IDENTIFIER:
             raise LmStudioError("configured model identifier does not match benchmark")
         inputs = service.capability_inputs(Path(data_root))
-        run = store.start(_STAGE, inputs)
-        report_path = (
-            Path(data_root)
-            / "projects"
-            / "system"
-            / "runs"
-            / run.run_id
-            / "inference_report.json"
-        )
-        if run.resumed:
+        while True:
+            run = store.start(_STAGE, inputs)
+            report_path = (
+                Path(data_root)
+                / "projects"
+                / "system"
+                / "runs"
+                / run.run_id
+                / "inference_report.json"
+            )
+            if not run.resumed:
+                break
             recorded_path = Path(str(run.artifacts.get("report", report_path)))
-            report = _load_verified_report(recorded_path, run_id=run.run_id, inputs=inputs)
+            try:
+                report = _load_verified_report(
+                    recorded_path, run_id=run.run_id, inputs=inputs
+                )
+            except LmStudioError:
+                store.invalidate_completed(
+                    run.run_id, inputs, "capability report validation failed"
+                )
+                run = None
+                continue
             return _result_from_report(report, recorded_path, resumed=True)
 
         checks: dict[str, Literal["pass", "fail"]] = {}

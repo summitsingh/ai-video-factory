@@ -137,6 +137,17 @@ class RunStore:
         self._append_event(failed, "run_failed", {"error": safe_error})
         return failed
 
+    def invalidate_completed(
+        self, run_id: str, inputs: dict[str, Any], error: object
+    ) -> RunManifest:
+        """Invalidate one exact completed run after stage-specific verification fails."""
+        manifest = self._load_run(run_id)
+        if manifest.input_fingerprint != fingerprint_inputs(inputs):
+            raise FingerprintMismatch(f"inputs do not match run {run_id}")
+        if manifest.status is not StageStatus.completed:
+            raise ValueError("only completed runs can be invalidated")
+        return self._invalidate(manifest, sanitize_diagnostic(error))
+
     def _newest_completed(self, stage: str, fingerprint: str) -> RunManifest | None:
         self._validate_stage(stage)
         stage_directory = self.root / stage

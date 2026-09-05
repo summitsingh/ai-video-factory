@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +150,7 @@ def benchmark_fixture(
     http: RecordingHttpTransport | None = None,
     response_text: str = "LOCAL_OK",
     loaded_identifier: str | None = "avf-qwen36-executor",
+    configured_identifier: str = "avf-qwen36-executor",
 ) -> tuple[InferenceService, RunStore, Path, RecordingHttpTransport]:
     data_root = tmp_path / "data"
     model_path = tmp_path / "models" / "publisher" / "model.gguf"
@@ -161,7 +163,7 @@ def benchmark_fixture(
             "base_url": "http://127.0.0.1:1234/v1",
             "lms_binary": "lms",
             "model_key": "qwen3.6-35b-a3b-udt-mtp",
-            "identifier": "avf-qwen36-executor",
+            "identifier": configured_identifier,
             "context_length": 65_536,
             "gpu": "max",
             "parallel": 1,
@@ -182,6 +184,69 @@ def benchmark_fixture(
         data_root / "projects" / "system" / "state", artifact_root=artifact_root
     )
     return service, store, data_root, transport
+
+
+def _seed_completed_report(
+    service: InferenceService,
+    store: RunStore,
+    data_root: Path,
+    *,
+    invalid_field: str,
+) -> str:
+    inputs = service.capability_inputs(data_root)
+    run = store.start("lm-studio-capability", inputs)
+    report_path = (
+        data_root
+        / "projects"
+        / "system"
+        / "runs"
+        / run.run_id
+        / "inference_report.json"
+    )
+    report = {
+        "schema_version": 1,
+        "run_id": run.run_id,
+        "resumed": False,
+        "checks": {
+            "ordinary_generation": "pass",
+            "structured_output": "pass",
+            "tool_calling": "pass",
+        },
+        "latency_ms": {
+            "ordinary_generation": 1.0,
+            "structured_output": 1.0,
+            "tool_calling": 1.0,
+        },
+        "usage": {
+            name: {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            }
+            for name in (
+                "ordinary_generation",
+                "structured_output",
+                "tool_calling",
+            )
+        },
+        "provenance": inputs,
+    }
+    if invalid_field == "schema":
+        report["checks"] = {"ordinary_generation": "pass"}
+    elif invalid_field == "run_id":
+        report["run_id"] = "0" * 32
+    elif invalid_field == "provenance":
+        report["provenance"] = {"stale": True}
+    else:
+        raise AssertionError(f"unknown invalid field: {invalid_field}")
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    store.complete(
+        run.run_id,
+        {"report": str(report_path)},
+        expected_artifacts={"report": report_path},
+    )
+    return run.run_id
 
 
 def _read_report(result: Any) -> tuple[Path, dict[str, object]]:
@@ -277,7 +342,7 @@ def test_report_persists_metrics_but_not_prompts_or_response_text(
 
     result = run_capability_benchmark(service, store, data_root)
 
-    report_path, report = _read_report(result)
+    _report_path, report = _read_report(result)
     persisted = "\n".join(
         path.read_text(encoding="utf-8")
         for path in data_root.rglob("*")
@@ -326,6 +391,40 @@ def test_tampered_report_is_invalidated_and_reexecuted(tmp_path: Path) -> None:
     assert len(transport.calls) == 6
 
 
+@pytest.mark.parametrize("invalid_field", ["schema", "run_id", "provenance"])
+def test_invalid_resumed_report_is_invalidated_then_reexecuted_once(
+    tmp_path: Path, invalid_field: str
+) -> None:
+    service, store, data_root, transport = benchmark_fixture(tmp_path)
+    stale_run_id = _seed_completed_report(
+        service, store, data_root, invalid_field=invalid_field
+    )
+
+    replacement = run_capability_benchmark(service, store, data_root)
+    resumed = run_capability_benchmark(service, store, data_root)
+
+    assert replacement.status == "pass"
+    assert replacement.metrics["resumed"] is False
+    assert replacement.metrics["run_id"] != stale_run_id
+    assert resumed.status == "pass"
+    assert resumed.metrics["resumed"] is True
+    assert resumed.metrics["run_id"] == replacement.metrics["run_id"]
+    assert len(transport.calls) == 3
+    stale_manifest = json.loads(
+        (
+            data_root
+            / "projects"
+            / "system"
+            / "state"
+            / "lm-studio-capability"
+            / stale_run_id
+            / "manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert stale_manifest["status"] == "failed"
+    assert stale_manifest["error"] == "capability report validation failed"
+
+
 def test_duration_and_usage_metrics_are_recorded_per_probe(tmp_path: Path) -> None:
     service, store, data_root, _transport = benchmark_fixture(tmp_path)
     clock = FakeClock([1.0, 1.012, 2.0, 2.025, 3.0, 3.125])
@@ -342,6 +441,38 @@ def test_duration_and_usage_metrics_are_recorded_per_probe(tmp_path: Path) -> No
         probe: {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13}
         for probe in ("ordinary_generation", "structured_output", "tool_calling")
     }
+
+
+@pytest.mark.parametrize(
+    "clock_values",
+    [
+        [math.nan, 1.0],
+        [1.0, math.inf],
+        [2.0, 1.0],
+    ],
+    ids=["non-finite-start", "non-finite-end", "regressing"],
+)
+def test_invalid_clock_values_fail_safely_without_report(
+    tmp_path: Path, clock_values: list[float]
+) -> None:
+    service, store, data_root, transport = benchmark_fixture(tmp_path)
+
+    result = run_capability_benchmark(
+        service, store, data_root, clock=FakeClock(clock_values)
+    )
+
+    assert result.status == "fail"
+    assert result.retryable is False
+    assert result.error == "capability benchmark clock returned invalid values"
+    assert len(transport.calls) == 1
+    assert result.artifacts == {}
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in data_root.rglob("*")
+        if path.is_file()
+    )
+    assert "nan" not in persisted.casefold()
+    assert "inf" not in persisted.casefold()
 
 
 def test_model_not_loaded_is_not_ready_without_http_requests(tmp_path: Path) -> None:
@@ -383,6 +514,25 @@ def test_wrong_response_model_identifier_fails_all_checks(tmp_path: Path) -> Non
     assert result.status == "fail"
     _path, report = _read_report(result)
     assert set(report["checks"].values()) == {"fail"}
+
+
+def test_configured_identifier_mismatch_fails_before_http_or_persistence(
+    tmp_path: Path,
+) -> None:
+    service, store, data_root, transport = benchmark_fixture(
+        tmp_path,
+        configured_identifier="other-stable-model",
+        loaded_identifier="other-stable-model",
+    )
+
+    result = run_capability_benchmark(service, store, data_root)
+
+    assert result.status == "not_ready"
+    assert result.retryable is True
+    assert result.error == "configured model identifier does not match benchmark"
+    assert result.model_identifier == "other-stable-model"
+    assert transport.calls == []
+    assert not (data_root / "projects" / "system" / "state").exists()
 
 
 @pytest.mark.parametrize(
@@ -457,6 +607,92 @@ def test_invalid_probe_outputs_fail_only_the_affected_check(
     _path, report = _read_report(result)
     assert report["checks"][failed_check] == "fail"
     assert len(transport.calls) == 3
+
+
+def _assert_invalid_tool_calls_do_not_persist(
+    tmp_path: Path,
+    tool_calls: list[dict[str, object]],
+    forbidden_value: str,
+) -> None:
+    responses = passing_responses()
+    responses[2] = _response(None, tool_calls=tool_calls)
+    service, store, data_root, transport = benchmark_fixture(
+        tmp_path, http=RecordingHttpTransport(responses)
+    )
+
+    result = run_capability_benchmark(service, store, data_root)
+
+    assert result.status == "fail"
+    _report_path, report = _read_report(result)
+    assert report["checks"]["tool_calling"] == "fail"
+    assert len(transport.calls) == 3
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in data_root.rglob("*")
+        if path.is_file()
+    )
+    assert forbidden_value not in persisted
+
+
+def test_multiple_tool_calls_fail_without_persisting_arguments(tmp_path: Path) -> None:
+    _assert_invalid_tool_calls_do_not_persist(
+        tmp_path,
+        [
+            {
+                "id": "first-secret-id",
+                "type": "function",
+                "function": {
+                    "name": "record_scene",
+                    "arguments": '{"scene_id":"first-secret","duration_seconds":3}',
+                },
+            },
+            {
+                "id": "second-secret-id",
+                "type": "function",
+                "function": {
+                    "name": "record_scene",
+                    "arguments": '{"scene_id":"second-secret","duration_seconds":3}',
+                },
+            },
+        ],
+        "first-secret",
+    )
+
+
+def test_wrong_scene_id_fails_without_persisting_arguments(tmp_path: Path) -> None:
+    _assert_invalid_tool_calls_do_not_persist(
+        tmp_path,
+        [
+            {
+                "id": "scene-secret-id",
+                "type": "function",
+                "function": {
+                    "name": "record_scene",
+                    "arguments": '{"scene_id":"wrong-secret-scene","duration_seconds":3}',
+                },
+            }
+        ],
+        "wrong-secret-scene",
+    )
+
+
+def test_wrong_duration_fails_without_persisting_arguments(tmp_path: Path) -> None:
+    _assert_invalid_tool_calls_do_not_persist(
+        tmp_path,
+        [
+            {
+                "id": "duration-secret-id",
+                "type": "function",
+                "function": {
+                    "name": "record_scene",
+                    "arguments": (
+                        '{"scene_id":"intro","duration_seconds":987654321}'
+                    ),
+                },
+            }
+        ],
+        "987654321",
+    )
 
 
 @pytest.mark.parametrize(
