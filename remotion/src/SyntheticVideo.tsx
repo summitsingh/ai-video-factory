@@ -51,9 +51,15 @@ const SceneCard = ({scene}: {scene: EditScene}) => {
           lineHeight: 1.25,
           position: 'absolute',
           right: '10%',
+          color: '#94a3b8',
         }}
       >
         {scene.caption}
+        {scene.visual && (
+          <div style={{fontSize: Math.max(14, Math.round(height * 0.02)), marginTop: '4px'}}>
+            Visual: {scene.visual}
+          </div>
+        )}
       </div>
     </AbsoluteFill>
   );

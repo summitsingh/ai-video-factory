@@ -1,8 +1,10 @@
+"""Extended edit schema for AI Video Factory video production."""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -15,6 +17,13 @@ class EditScene(BaseModel):
     duration_frames: int = Field(gt=0)
     title: str = Field(min_length=1)
     caption: str = Field(min_length=1)
+    
+    # Extended fields for rich content
+    visual: str | None = None
+    narration: str | None = None
+    background: str = Field(default="gradient", description="Background type or color")
+    text_color: str = Field(default="#f8fafc", description="Text color in hex")
+    accent_color: str = Field(default="#22d3ee", description="Accent color in hex")
 
 
 class EditDocument(BaseModel):
@@ -26,6 +35,12 @@ class EditDocument(BaseModel):
     fps: int = Field(gt=0)
     duration_frames: int = Field(gt=0)
     scenes: list[EditScene]
+    
+    # Extended metadata
+    title: str | None = None
+    description: str | None = None
+    created_at: str | None = None
+    sources: list[str] = Field(default_factory=list)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -49,3 +64,9 @@ class EditDocument(BaseModel):
 
 def load_edit(path: Path) -> EditDocument:
     return EditDocument.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+
+def save_edit(document: EditDocument, path: Path) -> None:
+    """Save an edit document to a JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(document.model_dump_json(indent=2))

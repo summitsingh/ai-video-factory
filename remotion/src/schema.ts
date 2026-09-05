@@ -4,6 +4,11 @@ export type EditScene = {
   duration_frames: number;
   title: string;
   caption: string;
+  visual?: string;
+  narration?: string;
+  background?: string;
+  text_color?: string;
+  accent_color?: string;
 };
 
 export type EditDocument = {
@@ -13,6 +18,10 @@ export type EditDocument = {
   fps: number;
   duration_frames: number;
   scenes: EditScene[];
+  title?: string;
+  description?: string;
+  created_at?: string;
+  sources?: string[];
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
@@ -61,7 +70,7 @@ const parseScene = (value: unknown): EditScene => {
   }
   assertExactKeys(
     value,
-    ['id', 'from_frame', 'duration_frames', 'title', 'caption'],
+    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'visual', 'narration', 'background', 'text_color', 'accent_color'],
     'scene',
   );
 
@@ -71,6 +80,11 @@ const parseScene = (value: unknown): EditScene => {
     duration_frames: positiveInteger(value.duration_frames, 'scene duration_frames'),
     title: nonEmptyString(value.title, 'scene title'),
     caption: nonEmptyString(value.caption, 'scene caption'),
+    visual: typeof value.visual === 'string' ? value.visual : undefined,
+    narration: typeof value.narration === 'string' ? value.narration : undefined,
+    background: typeof value.background === 'string' ? value.background : 'gradient',
+    text_color: typeof value.text_color === 'string' ? value.text_color : '#f8fafc',
+    accent_color: typeof value.accent_color === 'string' ? value.accent_color : '#22d3ee',
   };
 };
 
@@ -80,7 +94,7 @@ export const parseEditDocument = (value: unknown): EditDocument => {
   }
   assertExactKeys(
     value,
-    ['schema_version', 'width', 'height', 'fps', 'duration_frames', 'scenes'],
+    ['schema_version', 'width', 'height', 'fps', 'duration_frames', 'scenes', 'title', 'description', 'created_at', 'sources'],
     'edit document',
   );
 
@@ -99,6 +113,10 @@ export const parseEditDocument = (value: unknown): EditDocument => {
     fps: positiveInteger(value.fps, 'fps'),
     duration_frames: positiveInteger(value.duration_frames, 'duration_frames'),
     scenes: value.scenes.map(parseScene),
+    title: typeof value.title === 'string' ? value.title : undefined,
+    description: typeof value.description === 'string' ? value.description : undefined,
+    created_at: typeof value.created_at === 'string' ? value.created_at : undefined,
+    sources: Array.isArray(value.sources) ? value.sources as string[] : undefined,
   };
   const ids = new Set<string>();
 

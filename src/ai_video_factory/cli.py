@@ -13,6 +13,8 @@ from ai_video_factory.inference_service import InferenceService
 from ai_video_factory.pipeline import failed_pipeline_result, run_synthetic_pipeline
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import sanitize_diagnostic
+from ai_video_factory.video_pipeline import VideoJob, run_video_pipeline
+
 
 app = typer.Typer(no_args_is_help=True)
 inference_app = typer.Typer(no_args_is_help=True)
@@ -130,4 +132,61 @@ def test_pipeline(json_output: bool = typer.Option(False, "--json")) -> None:
     else:
         typer.echo(result.status)
     if result.status != "pass":
+        raise typer.Exit(code=2)
+
+
+@app.command("video-pipeline")
+def video_pipeline(
+    topic: str = typer.Argument(..., help="The trending topic for the video"),
+    description: str = typer.Option(None, "--description", "-d", help="Video description"),
+    source_url: str = typer.Option(None, "--source", "-s", help="Source URL for the topic"),
+    output: str = typer.Option("data/projects/generated", "--output", "-o", help="Output directory"),
+    script_file: str = typer.Option(None, "--script-file", help="Pre-made worker script JSON to use instead of generating"),
+    json_output: bool = typer.Option(False, "--json", help="Output result as JSON"),
+) -> None:
+    """Run a complete video production pipeline for a trending topic.
+    
+    This pipeline:
+    1. Research the trending topic
+    2. Generate a sourced script using LM Studio
+    3. Create a storyboard/edit document
+    4. Render video with Remotion
+    5. Run quality checks
+    6. Render a draft
+    """
+    try:
+        project_root = Path(__file__).resolve().parents[2]
+        output_path = Path(output)
+        
+        # Create a video job
+        job = VideoJob(
+            topic=topic,
+            description=description or topic,
+            source_url=source_url or "https://example.com",
+            output_path=output_path,
+        )
+        
+        # Run the pipeline
+        result = run_video_pipeline(
+            project_root=project_root,
+            data_root=project_root / "data",
+            job=job,
+            script_path=Path(script_file) if script_file else None,
+        )
+        
+        if json_output:
+            typer.echo(json.dumps(result.to_dict(), indent=2))
+        else:
+            typer.echo(f"Video pipeline status: {result.status}")
+            typer.echo(f"Run ID: {result.run_id}")
+            typer.echo(f"Artifacts: {list(result.artifacts.keys())}")
+            
+            if result.metadata.get("selected_topic"):
+                typer.echo(f"Selected topic: {result.metadata['selected_topic']}")
+        
+        if result.status != "pass":
+            raise typer.Exit(code=2)
+            
+    except Exception as error:
+        typer.echo(sanitize_diagnostic(error), err=True)
         raise typer.Exit(code=2)
