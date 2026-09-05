@@ -93,7 +93,33 @@ def test_snapshot_exposes_only_the_five_known_auxiliary_routes() -> None:
         "title_generation",
         "background_review",
     }
-    assert "raw_config" not in snapshot.model_dump()
+    assert set(HermesSnapshot.model_fields) == {
+        "hermes_path",
+        "version",
+        "commit",
+        "config_path",
+        "profile",
+        "config_valid",
+        "parent_provider",
+        "parent_model",
+        "parent_base_url",
+        "delegation_model",
+        "delegation_base_url",
+        "delegation_api_mode",
+        "delegation_max_iterations",
+        "delegation_max_concurrent_children",
+        "delegation_max_spawn_depth",
+        "delegation_orchestrator_enabled",
+        "delegation_subagent_auto_approve",
+        "delegation_inherit_mcp_toolsets",
+        "auxiliary_routes",
+    }
+    assert {
+        "api_key",
+        "delegation_api_key",
+        "auxiliary_api_key",
+        "raw_config",
+    }.isdisjoint(HermesSnapshot.model_fields)
 
 
 @pytest.mark.parametrize(
@@ -117,21 +143,69 @@ def test_snapshot_rejects_missing_or_unrecognized_auxiliary_routes(
         HermesSnapshot.model_validate(data)
 
 
-def test_models_reject_boolean_schema_version_and_extra_fields() -> None:
+def result_data(**overrides: object) -> dict[str, object]:
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "command": "doctor",
+        "status": "pass",
+        "retryable": False,
+        "parent_provider": "nous",
+        "parent_model": "stepfun/step-3.7-flash:free",
+        "attempts": [],
+        "checks": {},
+        "metrics": {},
+        "artifacts": {},
+        "error": None,
+    }
+    result.update(overrides)
+    return result
+
+
+def test_result_rejects_boolean_schema_version() -> None:
     with pytest.raises(ValidationError):
-        HermesResult.model_validate(
-            {
-                "schema_version": True,
-                "command": "doctor",
-                "status": "pass",
-                "retryable": False,
-                "parent_provider": "nous",
-                "parent_model": "stepfun/step-3.7-flash:free",
-                "attempts": [],
-                "checks": {},
-                "metrics": {},
-                "artifacts": {},
-                "error": None,
-                "unexpected": "value",
-            }
-        )
+        HermesResult.model_validate(result_data(schema_version=True))
+
+
+def test_result_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        HermesResult.model_validate(result_data(unexpected="value"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": 1, "detail": None},
+        {"status": "ready", "detail": ["unsupported"]},
+        {"status": "ready", "detail": b"coercion"},
+    ],
+)
+def test_check_rejects_non_strict_public_values(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        HermesCheck.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"enabled": 1, "base_url": None, "model": None},
+        {"enabled": True, "base_url": 1234, "model": None},
+        {"enabled": True, "base_url": None, "model": 1234},
+        {
+            "enabled": True,
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "avf-qwen36-executor",
+            "api_key": "not-public",
+        },
+        {
+            "enabled": True,
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "avf-qwen36-executor",
+            "unexpected": "not-public",
+        },
+    ],
+)
+def test_auxiliary_route_rejects_non_strict_or_secret_values(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        HermesAuxiliaryRoute.model_validate(payload)

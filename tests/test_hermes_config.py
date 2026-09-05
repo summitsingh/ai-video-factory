@@ -68,3 +68,12 @@ def test_rejects_extra_configuration_values() -> None:
 
     with pytest.raises(ValidationError):
         HermesConfig.model_validate(config)
+
+
+def test_rejects_changed_parent_and_fallback_model_together() -> None:
+    config = hermes_config_data()
+    config["parent_model"] = "other/free-model:free"
+    config["fallback_model"] = "other/free-model:free"
+
+    with pytest.raises(ValidationError):
+        HermesConfig.model_validate(config)

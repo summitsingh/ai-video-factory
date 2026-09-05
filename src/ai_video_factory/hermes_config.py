@@ -18,7 +18,7 @@ class HermesConfig(BaseModel):
     required_commit: str = Field(pattern=r"^[0-9a-f]{8}$")
     profile: Literal["default"]
     parent_provider: Literal["nous"]
-    parent_model: str = Field(pattern=r"^[A-Za-z0-9._/-]+:free$")
+    parent_model: Literal["stepfun/step-3.7-flash:free"]
     delegation_base_url: str
     delegation_model: Literal["avf-qwen36-executor"]
     delegation_api_mode: Literal["chat_completions"]
@@ -27,7 +27,7 @@ class HermesConfig(BaseModel):
     max_iterations: int = Field(ge=1, le=100)
     vision_fixture: str
     fallback_provider: Literal["nous"]
-    fallback_model: str
+    fallback_model: Literal["stepfun/step-3.7-flash:free"]
 
     @field_validator(
         "schema_version", "max_concurrent_children", "max_iterations", mode="before"
@@ -42,10 +42,6 @@ class HermesConfig(BaseModel):
     def validate_routes(self) -> Self:
         if self.delegation_base_url != "http://127.0.0.1:1234/v1":
             raise ValueError("delegation endpoint must be the exact LM Studio loopback URL")
-        if self.fallback_model != self.parent_model:
-            raise ValueError("fallback model must be the unchanged parent model")
-        if not self.fallback_model.endswith(":free"):
-            raise ValueError("fallback model must be a free model")
         fixture = PurePosixPath(self.vision_fixture)
         if fixture.is_absolute() or ".." in fixture.parts:
             raise ValueError("vision fixture must be a contained project-relative path")
