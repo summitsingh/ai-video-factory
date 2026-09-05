@@ -68,6 +68,8 @@ class VideoJob:
     output_path: Path
     title: str | None = None
     description_override: str | None = None
+    duration_seconds: int = 90
+    assets_dir: Path | None = None
     
     # Output paths
     research_path: Path | None = None
@@ -253,6 +255,165 @@ def _required_tool(tools: Mapping[str, Mapping[str, Any]], name: str) -> Path:
     return Path(str(record["path"]))
 
 
+def cache_assets_for_remotion(
+    assets_dir: Path,
+    remotion_public: Path,
+) -> None:
+    """Copy scene assets to Remotion's public directory for rendering.
+    
+    The remotion render spawns a process that copies files from its own
+    public directory. We copy all scene media there beforehand so they
+    are available during rendering.
+    """
+    remotion_public.mkdir(parents=True, exist_ok=True)
+    for scene_dir in sorted(assets_dir.glob("scene-*")):
+        if not scene_dir.is_dir():
+            continue
+        # Copy clips
+        for clip in scene_dir.glob("*clip*.mp4"):
+            dst = remotion_public / clip.name
+            if not dst.exists():
+                shutil.copy2(clip, dst)
+        # Copy images
+        for img in scene_dir.glob("*"):
+            if img.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") and img.is_file():
+                dst = remotion_public / img.name
+                if not dst.exists():
+                    shutil.copy2(img, dst)
+
+
+def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocument:
+    """Attach downloaded stock image/clip paths to scenes by directory index.
+
+    Expects per-scene directories ``scene-00/``, ``scene-01/``, ... beneath
+    assets_dir. Prefers one clip then one image per scene; scenes without
+    assets keep the title-card look. Paths are stored as filenames that
+    will be copied to Remotion's public directory prior to rendering.
+    """
+    if assets_dir is None:
+        return edit
+    assets_dir = Path(assets_dir)
+    if not assets_dir.is_dir():
+        return edit
+    scenes: list[EditScene] = []
+    for i, scene in enumerate(edit.scenes):
+        scene_dir = assets_dir / f"scene-{i:02d}"
+        update: dict[str, Any] = {}
+        if scene_dir.is_dir():
+            clips = sorted(scene_dir.glob("*clip*.mp4"))
+            images = sorted(
+                [p for p in scene_dir.iterdir()
+                 if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+                 and p.is_file()]
+            )
+            # Use simple filenames that staticFile() can resolve from public/
+            if clips:
+                update["clip"] = clips[0].name
+            if images:
+                update["image"] = images[0].name
+        scenes.append(scene.model_copy(update=update) if update else scene)
+    return edit.model_copy(update={"scenes": scenes})
+
+
+def _chunk_edit(edit: EditDocument, max_frames: int) -> list[EditDocument]:
+    """Split an edit into chunk documents of at most max_frames each.
+
+    Scene offsets are re-based to zero within each chunk so chunks render
+    independently and concatenate in order.
+    """
+    chunks: list[EditDocument] = []
+    current: list[EditScene] = []
+    current_frames = 0
+    for scene in edit.scenes:
+        if current and current_frames + scene.duration_frames > max_frames:
+            chunks.append(_finish_chunk(edit, current))
+            current = []
+            current_frames = 0
+        offset = current_frames
+        current.append(scene.model_copy(update={
+            "from_frame": offset,
+            "id": f"{scene.id}",
+        }))
+        current_frames += scene.duration_frames
+    if current:
+        chunks.append(_finish_chunk(edit, current))
+    return chunks
+
+
+def _finish_chunk(edit: EditDocument, scenes: list[EditScene]) -> EditDocument:
+    total = sum(s.duration_frames for s in scenes)
+    return EditDocument(
+        schema_version=1,
+        width=edit.width,
+        height=edit.height,
+        fps=edit.fps,
+        duration_frames=total,
+        scenes=scenes,
+        title=edit.title,
+        description=edit.description,
+        sources=edit.sources,
+        created_at=edit.created_at,
+    )
+
+
+def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None = None) -> None:
+    """Concatenate rendered chunk MP4s with stream copy (identical codecs)."""
+    destination = Path(destination).resolve()
+    filelist = destination.parent / "chunks.txt"
+    filelist.write_text(
+        "".join(f"file '{Path(c).resolve()}'\n" for c in chunks), encoding="utf-8"
+    )
+    _run_command(
+        (
+            str(ffmpeg) if ffmpeg is not None else "ffmpeg",
+            "-y", "-f", "concat", "-safe", "0",
+            "-i", str(filelist),
+            "-c", "copy", str(destination),
+        ),
+        cwd=destination.parent,
+        name="FFmpeg chunk concat",
+        timeout=600,
+    )
+
+
+_CHUNK_MAX_FRAMES = 2700  # ~90s per chunk keeps headless Chrome stable
+_RENDER_TIMEOUT_SECONDS = 1200
+
+
+def _render_chunked(
+    project_root: Path,
+    edit_path: Path,
+    output: Path,
+    run_directory: Path,
+    *,
+    browser: Path,
+    npm: Path,
+    ffmpeg: Path,
+) -> None:
+    """Render long compositions chunk by chunk, then concatenate."""
+    edit = load_edit(edit_path)
+    chunks = _chunk_edit(edit, _CHUNK_MAX_FRAMES)
+    if len(chunks) == 1:
+        _render_with_remotion(
+            project_root, edit_path, output,
+            browser=browser, npm=npm, timeout=_RENDER_TIMEOUT_SECONDS,
+        )
+        return
+    chunk_dir = run_directory / "chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    rendered: list[Path] = []
+    for i, chunk in enumerate(chunks):
+        chunk_edit_path = chunk_dir / f"chunk-{i:02d}.json"
+        save_edit(chunk, chunk_edit_path)
+        chunk_out = chunk_dir / f"chunk-{i:02d}.mp4"
+        _render_with_remotion(
+            project_root, chunk_edit_path, chunk_out,
+            browser=browser, npm=npm, timeout=_RENDER_TIMEOUT_SECONDS,
+        )
+        rendered.append(chunk_out)
+    _concat_chunks(rendered, output, ffmpeg=ffmpeg)
+
+
 def _render_with_remotion(
     project_root: Path,
     fixture: Path,
@@ -260,6 +421,7 @@ def _render_with_remotion(
     *,
     browser: Path | None = None,
     npm: Path | None = None,
+    timeout: int = 600,
 ) -> None:
     remotion_directory = project_root / "remotion"
     browser = browser or _find_local_browser()
@@ -277,7 +439,7 @@ def _render_with_remotion(
         ),
         cwd=remotion_directory,
         name="Remotion render",
-        timeout=600,
+        timeout=timeout,
     )
 
 
@@ -496,26 +658,39 @@ def run_video_pipeline(
         artifact_root = project_data / "runs"
         state_store = RunStore(project_data / "state", artifact_root=artifact_root)
 
-        # Step 1: Research trending topic
+        # Step 1: Research trending topic (skip if script provided)
         metadata["research_status"] = "in_progress"
         job.research_path = project_data / f"{job.topic.replace(' ', '_')}_research.json"
-        research_result = research_trending_topics(max_topics=1, min_engagement=100)
-        if not research_result.topics:
-            raise PipelineCommandError("No trending topics found for research")
-        save_research_result(research_result, job.research_path)
-        metadata["research_status"] = "complete"
-        metadata["selected_topic"] = research_result.topics[0].title
-        artifacts["research"] = str(job.research_path)
+        if script_path is None:
+            research_result = research_trending_topics(max_topics=1, min_engagement=100)
+            if not research_result.topics:
+                raise PipelineCommandError("No trending topics found for research")
+            save_research_result(research_result, job.research_path)
+            trending_topic = research_result.topics[0]
+            metadata["selected_topic"] = trending_topic.title
+            metadata["source_url"] = trending_topic.url
+            artifacts["research"] = str(job.research_path)
+        else:
+            # When script provided, just create minimal research stub
+            trending_topic = TrendingTopic(
+                title=job.topic,
+                description=job.description or job.topic,
+                source=job.source_url,
+                url=job.source_url or "https://example.com",
+                timestamp=datetime.now(),
+            )
+            job.research_path.write_text(json.dumps({"topic": job.topic, "sources": []}))
+            metadata["research_status"] = "skipped_script_provided"
+            metadata["selected_topic"] = job.topic
 
         # Step 2: Generate script with LM Studio (or load a worker-made script)
         metadata["script_status"] = "in_progress"
         job.script_path = project_data / f"{job.topic.replace(' ', '_')}_script.json"
-        trending_topic = research_result.topics[0]
         if script_path is not None:
             worker_data = json.loads(Path(script_path).read_text(encoding="utf-8"))
             script = ScriptOutput(
                 title=str(worker_data["title"]),
-                narration=str(worker_data["narration"]),
+                narration=str(worker_data["narration_full"]),
                 scenes=list(worker_data["scenes"]),
                 sources=list(worker_data.get("sources", [trending_topic.url])),
                 captions=list(worker_data.get("captions", [])),
@@ -524,6 +699,7 @@ def run_video_pipeline(
                 json.dumps(worker_data, indent=2), encoding="utf-8"
             )
             metadata["script_origin"] = "worker"
+            artifacts["script"] = str(job.script_path)
         else:
             script = generate_script(
                 topic_title=trending_topic.title,
@@ -533,9 +709,9 @@ def run_video_pipeline(
                 use_local_model=True,
             )
             metadata["script_origin"] = "local_model"
+            artifacts["script"] = str(job.script_path)
         job.title = script.title
         metadata["script_status"] = "complete"
-        artifacts["script"] = str(job.script_path)
 
         # Step 3: Create storyboard/edit document
         metadata["edit_status"] = "in_progress"
@@ -543,7 +719,7 @@ def run_video_pipeline(
 
         # Create edit document from script
         fps = 30
-        duration_seconds = 90  # 90 seconds video
+        duration_seconds = job.duration_seconds
         total_frames = duration_seconds * fps
 
         # Distribute the full composition duration evenly across scenes so no
@@ -587,6 +763,12 @@ def run_video_pipeline(
             created_at=job.created_at,
         )
         save_edit(edit_doc, job.edit_path)
+        if job.assets_dir is not None:
+            edit_doc = attach_scene_assets(edit_doc, job.assets_dir)
+            save_edit(edit_doc, job.edit_path)
+            metadata["assets_attached"] = sum(
+                1 for s in edit_doc.scenes if s.clip or s.image
+            )
         metadata["edit_status"] = "complete"
         artifacts["edit"] = str(job.edit_path)
 
@@ -626,14 +808,21 @@ def run_video_pipeline(
             state_store.event(render_run.run_id, "render_started", {"topic": job.topic})
             run_directory.mkdir(parents=True, exist_ok=True)
             run_master = run_directory / "master.mp4"
+            
+            # Copy assets to Remotion public directory for rendering
+            if job.assets_dir is not None:
+                remotion_public = root / "remotion" / "public"
+                cache_assets_for_remotion(Path(job.assets_dir), remotion_public)
 
             if render is None:
-                _render_with_remotion(
+                _render_chunked(
                     root,
                     job.edit_path,
                     temporary_path,
+                    run_directory,
                     browser=_required_tool(tools, "browser"),
                     npm=_required_tool(tools, "npm"),
+                    ffmpeg=_required_tool(tools, "ffmpeg"),
                 )
                 edit_doc_render = load_edit(job.edit_path)
                 narration_track = _synthesize_narration_track(

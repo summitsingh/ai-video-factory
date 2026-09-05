@@ -142,6 +142,8 @@ def video_pipeline(
     source_url: str = typer.Option(None, "--source", "-s", help="Source URL for the topic"),
     output: str = typer.Option("data/projects/generated", "--output", "-o", help="Output directory"),
     script_file: str = typer.Option(None, "--script-file", help="Pre-made worker script JSON to use instead of generating"),
+    duration: int = typer.Option(90, "--duration", help="Target video duration in seconds"),
+    assets_dir: str = typer.Option(None, "--assets-dir", help="Per-scene stock asset directories (scene-00/, ...)"),
     json_output: bool = typer.Option(False, "--json", help="Output result as JSON"),
 ) -> None:
     """Run a complete video production pipeline for a trending topic.
@@ -164,6 +166,8 @@ def video_pipeline(
             description=description or topic,
             source_url=source_url or "https://example.com",
             output_path=output_path,
+            duration_seconds=duration,
+            assets_dir=Path(assets_dir) if assets_dir else None,
         )
         
         # Run the pipeline

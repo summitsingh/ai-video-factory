@@ -1,7 +1,10 @@
 import {
   AbsoluteFill,
+  Img,
+  OffthreadVideo,
   Sequence,
   interpolate,
+  staticFile,
   useCurrentFrame,
   useVideoConfig,
 } from 'remotion';
@@ -12,6 +15,51 @@ const BACKGROUNDS = [
   'linear-gradient(135deg, #3d071a 0%, #000000 100%)',
   'linear-gradient(135deg, #073d2a 0%, #000000 100%)',
 ];
+
+const toLocalSrc = (path: string): string => {
+  if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('file://')) {
+    return path;
+  }
+  return staticFile(path);
+};
+
+const SceneMedia = ({scene}: {scene: EditScene}) => {
+  const frame = useCurrentFrame();
+  if (scene.clip) {
+    return (
+      <AbsoluteFill>
+        <OffthreadVideo
+          loop
+          muted
+          src={toLocalSrc(scene.clip)}
+          style={{height: '100%', objectFit: 'cover', width: '100%'}}
+        />
+        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.55)'}} />
+      </AbsoluteFill>
+    );
+  }
+  if (scene.image) {
+    const zoom = interpolate(frame, [0, scene.duration_frames], [1, 1.15], {
+      extrapolateLeft: 'clamp',
+      extrapolateRight: 'clamp',
+    });
+    return (
+      <AbsoluteFill>
+        <Img
+          src={toLocalSrc(scene.image)}
+          style={{
+            height: '100%',
+            objectFit: 'cover',
+            transform: `scale(${zoom})`,
+            width: '100%',
+          }}
+        />
+        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.55)'}} />
+      </AbsoluteFill>
+    );
+  }
+  return null;
+};
 
 const SceneCard = ({
   scene,
@@ -57,6 +105,7 @@ const SceneCard = ({
         opacity: Math.min(enter, exit),
       }}
     >
+      <SceneMedia scene={scene} />
       <AbsoluteFill
         style={{
           alignItems: 'center',

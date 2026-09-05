@@ -1,9 +1,11 @@
 .env
 .venv/
+.tts-venv/
 .pytest_cache/
 __pycache__/
 node_modules/
 remotion/dist/
+remotion/public/
 models/
 cache/
 temp/

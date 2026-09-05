@@ -24,6 +24,8 @@ class EditScene(BaseModel):
     background: str = Field(default="gradient", description="Background type or color")
     text_color: str = Field(default="#f8fafc", description="Text color in hex")
     accent_color: str = Field(default="#22d3ee", description="Accent color in hex")
+    image: str | None = Field(default=None, description="Local still image path (Ken Burns)")
+    clip: str | None = Field(default=None, description="Local video clip path (muted bed)")
 
 
 class EditDocument(BaseModel):

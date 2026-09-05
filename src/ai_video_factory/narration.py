@@ -22,6 +22,13 @@ _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _BARE_URL = re.compile(r"https?://\S+")
 _MARKDOWN_CHARS = re.compile(r"[*_#>`~]")
 
+_PIPER_VENV_BIN = (
+    Path(__file__).resolve().parents[2] / ".tts-venv" / "bin" / "piper"
+)
+_PIPER_MODEL = (
+    Path(__file__).resolve().parents[2] / "models" / "tts" / "en_US-lessac-high.onnx"
+)
+
 
 def clean_for_speech(text: str) -> str:
     """Strip markdown citations/URLs so they are speakable prose."""
@@ -35,18 +42,63 @@ def synthesize_to_wav(
     text: str,
     output: Path,
     *,
+    engine: str = "piper",
     voice: str = "en",
     speed_wpm: int = 170,
     pitch: int = 50,
     espeak: str = "espeak-ng",
-    timeout: int = 120,
+    timeout: int = 300,
 ) -> Path:
-    """Synthesize speakable text to a WAV file with the local engine."""
+    """Synthesize speakable text to a WAV file with a local engine.
+
+    Engines: 'piper' (neural, preferred when installed) or 'espeak'
+    (formant fallback, always available). Falls back to espeak when the
+    Piper binary or voice model is absent.
+    """
     speakable = clean_for_speech(text)
     if not speakable:
         raise NarrationError("no speakable text after cleaning narration")
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    if engine == "piper" and _PIPER_VENV_BIN.is_file() and _PIPER_MODEL.is_file():
+        return _synthesize_piper(speakable, output, timeout=timeout)
+    return _synthesize_espeak(
+        speakable, output, voice=voice, speed_wpm=speed_wpm, pitch=pitch,
+        espeak=espeak, timeout=timeout,
+    )
+
+
+def _synthesize_piper(text: str, output: Path, *, timeout: int) -> Path:
+    try:
+        completed = subprocess.run(
+            (str(_PIPER_VENV_BIN), "--model", str(_PIPER_MODEL),
+             "--output_file", str(output)),
+            input=text.encode("utf-8"),
+            shell=False,
+            timeout=timeout,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NarrationError(sanitize_diagnostic(f"piper could not run: {error}")) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "ignore").strip()[-500:] or f"exit {completed.returncode}"
+        raise NarrationError(sanitize_diagnostic(f"piper failed: {detail}"))
+    if not output.is_file() or output.stat().st_size == 0:
+        raise NarrationError("piper produced no audio output")
+    return output
+
+
+def _synthesize_espeak(
+    speakable: str,
+    output: Path,
+    *,
+    voice: str,
+    speed_wpm: int,
+    pitch: int,
+    espeak: str,
+    timeout: int,
+) -> Path:
     try:
         completed = subprocess.run(
             (espeak, "--stdout", "-v", voice, "-s", str(speed_wpm), "-p", str(pitch), speakable),
@@ -72,7 +124,7 @@ def mix_scenes_to_track(
     *,
     sample_rate: int = 48000,
     ffmpeg: str = "ffmpeg",
-    timeout: int = 180,
+    timeout: int = 600,
 ) -> Path:
     """Mix per-scene WAVs at start offsets into one padded stereo track.
 
