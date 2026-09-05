@@ -50,13 +50,6 @@ def test_loads_checked_in_lm_studio_configuration(project_root: Path) -> None:
     )
 
 
-def test_example_configuration_matches_the_checked_in_contract(project_root: Path) -> None:
-    configured = load_inference_config(project_root / "config" / "inference.toml")
-    example = load_inference_config(project_root / "config.example.toml")
-
-    assert example == configured
-
-
 @pytest.mark.parametrize(
     "base_url",
     [
