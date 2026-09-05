@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -36,7 +37,7 @@ def config() -> HermesConfig:
 
 
 def result(stdout: str) -> ProcessResult:
-    return ProcessResult(0, stdout, "", "/safe/hermes")
+    return ProcessResult(0, stdout, "", "/home/summit/.local/bin/hermes")
 
 
 class FakeRunner:
@@ -74,7 +75,9 @@ def test_allowlist_contains_only_the_fixed_read_only_vectors() -> None:
     assert ALLOWED_COMMANDS == frozenset(snapshot_outputs())
 
 
-def test_default_runner_uses_resolved_executable_without_shell(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_runner_uses_resolved_executable_without_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
     class Completed:
@@ -86,14 +89,18 @@ def test_default_runner_uses_resolved_executable_without_shell(monkeypatch: pyte
         calls.append((argv, kwargs))
         return Completed()
 
-    monkeypatch.setattr("ai_video_factory.hermes_backend._resolved_hermes", lambda: "/safe/hermes")
+    executable = tmp_path / "hermes"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+    monkeypatch.setattr("ai_video_factory.hermes_backend._HERMES_PATH", executable)
+    monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: str(executable))
     monkeypatch.setattr("ai_video_factory.hermes_backend.subprocess.run", fake_run)
 
     observed = run_process(("hermes", "--version"), timeout=15.0)
 
-    assert observed.executable_path == "/safe/hermes"
+    assert observed.executable_path == str(executable)
     assert calls == [
-        (("/safe/hermes", "--version"), {
+        ((str(executable), "--version"), {
             "shell": False,
             "capture_output": True,
             "text": True,
@@ -101,6 +108,102 @@ def test_default_runner_uses_resolved_executable_without_shell(monkeypatch: pyte
             "check": False,
         })
     ]
+
+
+def test_default_runner_maps_only_documented_missing_config_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    executable = tmp_path / "hermes"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    class Completed:
+        returncode = 1
+        stdout = ""
+        stderr = "Config key not set: delegation.model\n"
+
+    monkeypatch.setattr("ai_video_factory.hermes_backend._HERMES_PATH", executable)
+    monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: str(executable))
+    monkeypatch.setattr("ai_video_factory.hermes_backend.subprocess.run", lambda *_args, **_kwargs: Completed())
+
+    observed = run_process(("hermes", "config", "get", "delegation.model"), timeout=15.0)
+
+    assert observed.missing is True
+
+
+def test_default_runner_rejects_nonzero_exit_that_is_not_exact_missing_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    executable = tmp_path / "hermes"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    class Completed:
+        returncode = 1
+        stdout = ""
+        stderr = "Config key not set: delegation.model\nextra"
+
+    monkeypatch.setattr("ai_video_factory.hermes_backend._HERMES_PATH", executable)
+    monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: str(executable))
+    monkeypatch.setattr("ai_video_factory.hermes_backend.subprocess.run", lambda *_args, **_kwargs: Completed())
+
+    with pytest.raises(HermesError, match="unsuccessfully"):
+        run_process(("hermes", "config", "get", "delegation.model"), timeout=15.0)
+
+
+def test_default_runner_rejects_combined_oversized_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    executable = tmp_path / "hermes"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    class Completed:
+        returncode = 0
+        stdout = "x" * (33 * 1024)
+        stderr = "y" * (33 * 1024)
+
+    monkeypatch.setattr("ai_video_factory.hermes_backend._HERMES_PATH", executable)
+    monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: str(executable))
+    monkeypatch.setattr("ai_video_factory.hermes_backend.subprocess.run", lambda *_args, **_kwargs: Completed())
+
+    with pytest.raises(HermesError, match="64 KiB"):
+        run_process(("hermes", "--version"), timeout=15.0)
+
+
+def test_resolver_rejects_symlink_and_detects_replacement_after_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    target.chmod(0o700)
+    executable = tmp_path / "hermes"
+    executable.symlink_to(target)
+    monkeypatch.setattr("ai_video_factory.hermes_backend._HERMES_PATH", executable)
+    monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: str(executable))
+
+    with pytest.raises(HermesError, match="canonical"):
+        run_process(("hermes", "--version"), timeout=15.0)
+
+    executable.unlink()
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    class Completed:
+        returncode = 0
+        stdout = "Hermes Agent v0.21.0 (2026.8.31) · upstream b0ab2e16"
+        stderr = ""
+
+    def swap(*_args: object, **_kwargs: object) -> Completed:
+        replacement = tmp_path / "replacement"
+        replacement.write_text("#!/bin/sh\n# replacement\n", encoding="utf-8")
+        replacement.chmod(0o700)
+        os.replace(replacement, executable)
+        return Completed()
+
+    monkeypatch.setattr("ai_video_factory.hermes_backend.subprocess.run", swap)
+    with pytest.raises(HermesError, match="changed"):
+        run_process(("hermes", "--version"), timeout=15.0)
 
 
 @pytest.mark.parametrize(
@@ -121,13 +224,20 @@ def test_default_runner_rejects_timeout_above_fixed_bound() -> None:
         run_process(("hermes", "--version"), timeout=15.1)
 
 
+def test_default_runner_rejects_missing_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("ai_video_factory.hermes_backend.shutil.which", lambda _: None)
+
+    with pytest.raises(HermesError, match="not found"):
+        run_process(("hermes", "--version"), timeout=15.0)
+
+
 def test_snapshot_uses_individual_nonsecret_reads_and_typed_values() -> None:
     runner = FakeRunner(snapshot_outputs())
 
     snapshot = HermesBackend(config(), runner=runner).snapshot()
 
     assert snapshot.model_dump() == {
-        "hermes_path": "/safe/hermes",
+        "hermes_path": "/home/summit/.local/bin/hermes",
         "version": "0.21.0",
         "commit": "b0ab2e16",
         "config_path": "/safe/config.yaml",
@@ -157,7 +267,7 @@ def test_snapshot_represents_missing_delegation_keys_as_unconfigured() -> None:
     outputs = snapshot_outputs()
     for argv in list(outputs):
         if argv[3:4] == ("delegation.model",) or argv[3:4] == ("delegation.base_url",):
-            outputs[argv] = ProcessResult(1, "", "key not found", "/safe/hermes")
+            outputs[argv] = ProcessResult(1, "", "key not found", "/home/summit/.local/bin/hermes", missing=True)
 
     snapshot = HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()
 
@@ -173,3 +283,46 @@ def test_snapshot_rejects_secret_or_multiline_values_without_exposure() -> None:
         HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()
 
     assert "not-for-report" not in str(exc_info.value)
+
+
+def test_snapshot_rejects_url_credentials_and_ambiguous_typed_values() -> None:
+    outputs = snapshot_outputs()
+    outputs[("hermes", "config", "get", "model.base_url")] = result("https://token@nous.example/v1\n")
+    with pytest.raises(HermesError, match="invalid"):
+        HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()
+
+    outputs = snapshot_outputs()
+    outputs[("hermes", "config", "get", "delegation.orchestrator_enabled")] = result("TRUE\n")
+    with pytest.raises(HermesError, match="invalid"):
+        HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()
+
+
+@pytest.mark.parametrize(
+    "version_text",
+    [
+        "Hermes Agent v0.21.0 (2026.8.31) · upstream B0AB2E16\n",
+        "Hermes Agent v0.21.0 (2026.8.31) · upstream b0ab2e16\nHermes Agent v0.21.0 (2026.8.31) · upstream b0ab2e16\n",
+        "Hermes Agent v0.21 (2026.8.31) · upstream b0ab2e16\n",
+    ],
+)
+def test_snapshot_rejects_malformed_or_duplicate_version_identity(version_text: str) -> None:
+    outputs = snapshot_outputs()
+    outputs[("hermes", "--version")] = result(version_text)
+
+    with pytest.raises(HermesError, match="invalid"):
+        HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()
+
+
+def test_snapshot_rejects_nonzero_injected_config_get_even_when_optional() -> None:
+    outputs = snapshot_outputs()
+    outputs[("hermes", "config", "get", "delegation.model")] = ProcessResult(
+        1, "", "arbitrary failure", "/home/summit/.local/bin/hermes",
+    )
+
+    with pytest.raises(HermesError, match="unsuccessfully"):
+        HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()
+
+    outputs = snapshot_outputs()
+    outputs[("hermes", "config", "get", "delegation.max_iterations")] = result("+50\n")
+    with pytest.raises(HermesError, match="invalid"):
+        HermesBackend(config(), runner=FakeRunner(outputs)).snapshot()

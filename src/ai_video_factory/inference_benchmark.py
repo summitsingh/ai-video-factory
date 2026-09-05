@@ -337,6 +337,26 @@ def _load_verified_report(
     return report
 
 
+def current_text_capability(
+    service: InferenceService, store: RunStore, data_root: Path,
+) -> bool:
+    """Read the current, integrity-checked three-probe report without resuming it."""
+    try:
+        inputs = service.capability_inputs(Path(data_root))
+        run = store.completed_read_only(_STAGE, inputs)
+        if run is None:
+            return False
+        report_path = Path(str(run.artifacts["report"]))
+        report = _load_verified_report(report_path, run_id=run.run_id, inputs=inputs)
+    except (KeyError, OSError, ValueError, LmStudioError):
+        return False
+    return report.checks == {
+        "ordinary_generation": "pass",
+        "structured_output": "pass",
+        "tool_calling": "pass",
+    }
+
+
 def run_capability_benchmark(
     service: InferenceService,
     store: RunStore,

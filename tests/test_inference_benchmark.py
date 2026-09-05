@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from ai_video_factory.inference_benchmark import run_capability_benchmark
+from ai_video_factory.inference_benchmark import current_text_capability, run_capability_benchmark
 from ai_video_factory.inference_config import InferenceConfig
 from ai_video_factory.inference_service import InferenceService
 from ai_video_factory.lm_studio import LmStudioError, LmStudioModel
@@ -408,6 +408,25 @@ def test_resumes_only_matching_verified_report(tmp_path: Path) -> None:
     assert second.metrics["resumed"] is True
     assert second.metrics["run_id"] == first.metrics["run_id"]
     assert len(transport.calls) == 3
+
+
+def test_current_text_capability_is_read_only_and_requires_current_intact_report(
+    tmp_path: Path,
+) -> None:
+    service, store, data_root, _transport = benchmark_fixture(tmp_path)
+    result = run_capability_benchmark(service, store, data_root)
+    report_path = Path(result.artifacts["report"])
+    manifest_path = (
+        data_root / "projects" / "system" / "state" / "lm-studio-capability"
+        / str(result.metrics["run_id"]) / "manifest.json"
+    )
+
+    assert current_text_capability(service, store, data_root) is True
+
+    report_path.write_text("{}\n", encoding="utf-8")
+    before = manifest_path.read_text(encoding="utf-8")
+    assert current_text_capability(service, store, data_root) is False
+    assert manifest_path.read_text(encoding="utf-8") == before
 
 
 def test_tampered_report_is_invalidated_and_reexecuted(tmp_path: Path) -> None:

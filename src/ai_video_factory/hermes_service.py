@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
+from typing import Literal
 
-from ai_video_factory.hermes_backend import HermesBackend, HermesError, HermesFileOps
+from ai_video_factory.hermes_backend import (
+    HERMES_EXECUTABLE_PATH,
+    HermesBackend,
+    HermesError,
+    HermesFileOps,
+)
 from ai_video_factory.hermes_config import HermesConfig
 from ai_video_factory.hermes_models import HermesCheck, HermesResult, HermesSnapshot
+from ai_video_factory.inference_benchmark import current_text_capability
+from ai_video_factory.inference_service import InferenceService
+from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import sanitize_diagnostic
 
 
 TextCapability = Callable[[], bool]
-
-
-def _unavailable_text_capability() -> bool:
-    """Task 3 supplies the persisted capability proof; absence is not readiness."""
-    return False
 
 
 class HermesService:
@@ -26,12 +31,18 @@ class HermesService:
         config: HermesConfig,
         *,
         backend: HermesBackend | None = None,
-        text_capability: TextCapability = _unavailable_text_capability,
+        text_capability: TextCapability | None = None,
+        inference_service: InferenceService | None = None,
+        run_store: RunStore | None = None,
+        data_root: Path | None = None,
         file_ops: HermesFileOps | None = None,
     ) -> None:
         self.config = config
         self.backend = backend or HermesBackend(config, file_ops=file_ops)
         self.text_capability = text_capability
+        self.inference_service = inference_service
+        self.run_store = run_store
+        self.data_root = None if data_root is None else Path(data_root)
         self.file_ops = file_ops
 
     @staticmethod
@@ -44,7 +55,7 @@ class HermesService:
             and snapshot.version == self.config.required_version
             and snapshot.commit == self.config.required_commit
             and snapshot.profile == self.config.profile
-            and bool(snapshot.hermes_path)
+            and snapshot.hermes_path == HERMES_EXECUTABLE_PATH
             and bool(snapshot.config_path)
         )
         return self._check(ready)
@@ -68,8 +79,10 @@ class HermesService:
             snapshot.delegation_subagent_auto_approve,
             snapshot.delegation_inherit_mcp_toolsets,
         )
-        if any(value is None for value in values):
+        if all(value is None for value in values):
             return self._check(False, "delegation is not configured"), True
+        if any(value is None for value in values):
+            return self._check(False), False
         ready = (
             snapshot.delegation_model == self.config.delegation_model
             and snapshot.delegation_base_url == self.config.delegation_base_url
@@ -97,14 +110,14 @@ class HermesService:
     def _result(
         self,
         *,
-        status: str,
+        status: Literal["pass", "fail", "not_ready"],
         retryable: bool,
         checks: dict[str, HermesCheck],
         error: str | None = None,
     ) -> HermesResult:
         return HermesResult(
             command="doctor",
-            status=status,  # type: ignore[arg-type]
+            status=status,
             retryable=retryable,
             parent_provider="nous",
             parent_model=self.config.parent_model,
@@ -114,6 +127,19 @@ class HermesService:
             artifacts={},
             error=error,
         )
+
+    def _current_text_capability(self) -> bool:
+        if self.text_capability is not None:
+            return self.text_capability() is True
+        if (
+            self.inference_service is None
+            or self.run_store is None
+            or self.data_root is None
+        ):
+            return False
+        return current_text_capability(
+            self.inference_service, self.run_store, self.data_root
+        ) is True
 
     def doctor(self) -> HermesResult:
         """Inspect Hermes identity/routes and require a current text capability proof."""
@@ -125,7 +151,7 @@ class HermesService:
                 "parent_route": self._parent_route_check(snapshot),
                 "delegation_route": delegation_route,
                 "delegation_safety": self._delegation_safety_check(snapshot, unconfigured),
-                "text_capability": self._check(bool(self.text_capability())),
+                "text_capability": self._check(self._current_text_capability()),
             }
             if any(
                 checks[name].status != "ready"

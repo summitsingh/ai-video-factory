@@ -63,6 +63,24 @@ class RunStore:
         self._append_event(manifest, "run_started", {"status": manifest.status})
         return manifest
 
+    def completed_read_only(self, stage: str, inputs: dict[str, Any]) -> RunManifest | None:
+        """Find the newest integrity-valid completed run without changing any state."""
+        self._validate_stage(stage)
+        fingerprint = fingerprint_inputs(inputs)
+        stage_directory = self.root / stage
+        if not stage_directory.is_dir():
+            return None
+        matches: list[RunManifest] = []
+        for path in self._manifest_paths_for_stage(stage_directory):
+            manifest = self._read_manifest(path)
+            if (
+                manifest.status is StageStatus.completed
+                and manifest.input_fingerprint == fingerprint
+                and self._artifact_integrity_error(manifest) is None
+            ):
+                matches.append(manifest)
+        return max(matches, key=lambda manifest: manifest.updated_at, default=None)
+
     def resume(self, run_id: str, inputs: dict[str, Any]) -> RunManifest:
         manifest = self._load_run(run_id)
         if manifest.input_fingerprint != fingerprint_inputs(inputs):
