@@ -420,9 +420,15 @@ vectors assembled from canonical constants:
 
 ```python
 ("hermes", "chat", "--query-file", contained_query_path, "--oneshot", "--quiet",
- "--toolsets", "delegation", "--in", project_root, "--source", "tool",
+ "--toolsets", "delegation,web", "--in", project_root, "--source", "tool",
  "--run-budget", "900")
 ```
+
+The text smoke tells the local child to retrieve `https://example.com/` with
+the inherited web tool and return its exact `Example Domain` title plus the
+synthetic output marker. This proves real web research access while keeping the
+fixture public and non-sensitive. Treat external network unavailability as a
+retryable smoke failure, not proof that local inference is broken.
 
 Vision uses `delegation,vision`; it passes the contained fixture path in the
 synthetic query rather than attaching the image to the cloud parent. Reject any
