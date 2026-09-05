@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -445,6 +445,41 @@ def test_capability_inputs_cache_configured_model_beneath_data_root(
     assert list((tmp_path / "data" / "system" / "model-digests").glob("*.json"))
     assert fingerprint_inputs(inputs) == fingerprint_inputs(service.capability_inputs(tmp_path / "data"))
     assert not backend.mutating_calls
+
+
+def test_chat_completion_uses_injected_loopback_transport_without_credentials(
+    config: InferenceConfig,
+) -> None:
+    service, backend, _clock = service_fixture(config)
+    calls: list[
+        tuple[str, str, dict[str, object] | None, Mapping[str, str], float]
+    ] = []
+
+    def http(
+        method: str,
+        url: str,
+        body: dict[str, object] | None,
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> dict[str, object]:
+        calls.append((method, url, body, headers, timeout))
+        return {"choices": []}
+
+    backend.http = http  # type: ignore[attr-defined]
+    payload = {"model": config.identifier, "stream": False}
+
+    response = service.chat_completion(payload, timeout=9.0)
+
+    assert response == {"choices": []}
+    assert calls == [
+        (
+            "POST",
+            "http://127.0.0.1:1234/v1/chat/completions",
+            payload,
+            {"Content-Type": "application/json", "Accept": "application/json"},
+            9.0,
+        )
+    ]
 
 
 class ExplodingBackend:

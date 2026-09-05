@@ -133,6 +133,10 @@ class InferenceService:
     def capability_inputs(self, data_root: Path) -> dict[str, object]:
         """Build read-only, cache-backed provenance for a capability benchmark."""
         snapshot = self.backend.snapshot()
+        if not snapshot.server_running:
+            raise LmStudioError("LM Studio server is not running")
+        if not snapshot.configured_model_loaded:
+            raise LmStudioError("configured LM Studio model is not loaded")
         cache = ModelDigestCache(
             Path(data_root) / "system" / "model-digests",
             model_root=Path(self.config.models_directory),
@@ -144,6 +148,18 @@ class InferenceService:
             snapshot,
             identity,
             _CAPABILITY_CORPUS_VERSION,
+        )
+
+    def chat_completion(
+        self, body: dict[str, object], *, timeout: float
+    ) -> dict[str, object]:
+        """Send one JSON completion through the backend's injected transport."""
+        return self.backend.http(
+            "POST",
+            f"{self.config.base_url}/chat/completions",
+            body,
+            {"Content-Type": "application/json", "Accept": "application/json"},
+            timeout,
         )
 
     def doctor(self) -> InferenceResult:
