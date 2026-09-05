@@ -24,6 +24,21 @@ EXPECTED_READ_ONLY_COMMANDS = [
     ("lms", "ps", "--json"),
 ]
 
+EXPECTED_ESTIMATE_COMMAND = (
+    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
+    "--context-length", "65536", "--no-speculative-draft-mtp",
+    "--estimate-only", "-y",
+)
+EXPECTED_LOAD_COMMAND = (
+    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
+    "--context-length", "65536", "--parallel", "1", "--ttl", "3600",
+    "--no-speculative-draft-mtp", "--identifier", "avf-qwen36-executor", "-y",
+)
+EXPECTED_SERVER_START_COMMAND = (
+    "lms", "server", "start", "--port", "1234", "--bind", "127.0.0.1",
+)
+EXPECTED_UNLOAD_COMMAND = ("lms", "unload", "avf-qwen36-executor")
+
 
 @pytest.fixture
 def config(tmp_path: Path) -> InferenceConfig:
@@ -130,6 +145,13 @@ def inventory_runner(
             ("lms", "ps", "--json"): ok(loaded),
         }
     )
+
+
+def backend_with_estimate(
+    config: InferenceConfig, output: str,
+) -> tuple[lm_studio.LmStudioBackend, RecordingRunner]:
+    runner = RecordingRunner({EXPECTED_ESTIMATE_COMMAND: ok(output)})
+    return lm_studio.LmStudioBackend(config, runner=runner), runner
 
 
 def test_snapshot_uses_only_read_only_fixed_commands(config: InferenceConfig) -> None:
@@ -343,3 +365,174 @@ def test_request_json_rejects_responses_over_two_mib(monkeypatch: pytest.MonkeyP
         )
 
     assert response.read_limits == [2 * 1024 * 1024 + 1]
+
+
+def test_estimate_uses_exact_nonloading_vector(config: InferenceConfig) -> None:
+    backend, runner = backend_with_estimate(
+        config,
+        "Estimated GPU Memory: 17.36 GiB\n"
+        "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n",
+    )
+
+    estimate = backend.estimate()
+
+    assert estimate.gpu_gib == 17.36
+    assert estimate.total_gib == 17.36
+    assert estimate.confidence == "LOW"
+    assert estimate.allowed is True
+    assert runner.calls == [EXPECTED_ESTIMATE_COMMAND]
+    assert runner.timeouts == [60.0]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Estimated GPU Memory: 17.36 GiB\nConfidence: LOW\n",
+        (
+            "Estimated GPU Memory: 17.36 GiB\n"
+            "Estimated GPU Memory: 17.36 GiB\n"
+            "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n"
+        ),
+        (
+            "Estimated GPU Memory: 17.36 GiB\n"
+            "Estimated GPU Memory: malformed\n"
+            "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n"
+        ),
+        (
+            "Estimated GPU Memory: -1 GiB\n"
+            "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n"
+        ),
+        (
+            "Estimated GPU Memory: NaN GiB\n"
+            "Estimated Total Memory: 17.36 GiB\nConfidence: LOW\n"
+        ),
+        (
+            "Estimated GPU Memory: 17.36 GiB\n"
+            "Estimated Total Memory: inf GiB\nConfidence: LOW\n"
+        ),
+    ],
+)
+def test_estimate_rejects_missing_duplicate_or_nonfinite_values(
+    config: InferenceConfig, output: str,
+) -> None:
+    backend, _runner = backend_with_estimate(config, output)
+
+    with pytest.raises(LmStudioError, match="estimate output"):
+        backend.estimate()
+
+
+def test_estimate_converts_runner_timeout_to_bounded_error(config: InferenceConfig) -> None:
+    runner = RecordingRunner(
+        {EXPECTED_ESTIMATE_COMMAND: subprocess.TimeoutExpired(EXPECTED_ESTIMATE_COMMAND, 60)}
+    )
+
+    with pytest.raises(LmStudioError, match="60 seconds"):
+        lm_studio.LmStudioBackend(config, runner=runner).estimate()
+
+    assert runner.timeouts == [60.0]
+
+
+def test_model_start_uses_exact_vector_and_600_second_timeout(
+    config: InferenceConfig,
+) -> None:
+    runner = RecordingRunner({EXPECTED_LOAD_COMMAND: ok("loaded")})
+
+    lm_studio.LmStudioBackend(config, runner=runner).start()
+
+    assert runner.calls == [EXPECTED_LOAD_COMMAND]
+    assert runner.timeouts == [600.0]
+
+
+def test_server_start_and_stop_use_only_targeted_vectors(config: InferenceConfig) -> None:
+    runner = RecordingRunner(
+        {
+            EXPECTED_SERVER_START_COMMAND: ok("server started"),
+            EXPECTED_UNLOAD_COMMAND: ok("model unloaded"),
+        }
+    )
+    backend = lm_studio.LmStudioBackend(config, runner=runner)
+
+    backend.start_server()
+    backend.stop()
+
+    assert runner.calls == [EXPECTED_SERVER_START_COMMAND, EXPECTED_UNLOAD_COMMAND]
+    assert runner.timeouts == [15.0, 15.0]
+
+
+def test_api_model_identifiers_requires_exact_models_endpoint(
+    config: InferenceConfig,
+) -> None:
+    calls: list[tuple[str, str, object, object, float]] = []
+
+    def http(method: str, url: str, body: object, headers: object, timeout: float) -> dict[str, object]:
+        calls.append((method, url, body, headers, timeout))
+        return {
+            "object": "list",
+            "data": [
+                {"id": config.identifier, "object": "model", "owned_by": "organization_owner"},
+                {"id": "user-model", "object": "model", "owned_by": "organization_owner"},
+            ],
+        }
+
+    identifiers = lm_studio.LmStudioBackend(config, http=http).api_model_identifiers()
+
+    assert identifiers == (config.identifier, "user-model")
+    assert calls == [(
+        "GET",
+        "http://127.0.0.1:1234/v1/models",
+        None,
+        {"Content-Type": "application/json", "Accept": "application/json"},
+        15.0,
+    )]
+
+
+def test_default_runner_allows_only_exact_task_3_vectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lm_studio, "_resolved_lms", lambda: "/safe/lms")
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv: Sequence[str], **_kwargs: object) -> object:
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(lm_studio.subprocess, "run", run)
+    approved = [
+        EXPECTED_ESTIMATE_COMMAND,
+        EXPECTED_SERVER_START_COMMAND,
+        EXPECTED_LOAD_COMMAND,
+        EXPECTED_UNLOAD_COMMAND,
+    ]
+
+    for command in approved:
+        lm_studio.run_process(command, 15)
+
+    assert calls == approved
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("lms", "get", "qwen3.6-35b-a3b-udt-mtp"),
+        ("lms", "runtime", "select", "llama.cpp"),
+        ("lms", "runtime", "update"),
+        ("lms", "unload", "--all"),
+        ("lms", "server", "stop"),
+        (
+            "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
+            "--context-length", "65536", "--estimate-only", "-y",
+        ),
+    ],
+)
+def test_default_runner_rejects_forbidden_or_weakened_vectors_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch, command: tuple[str, ...],
+) -> None:
+    monkeypatch.setattr(lm_studio, "_resolved_lms", lambda: "/safe/lms")
+    monkeypatch.setattr(
+        lm_studio.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("subprocess must not be invoked"),
+    )
+
+    with pytest.raises(LmStudioError, match="approved"):
+        lm_studio.run_process(command, 15)

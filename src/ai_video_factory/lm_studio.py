@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -18,7 +20,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from ai_video_factory.inference_config import InferenceConfig
-from ai_video_factory.inference_models import InferenceCheck, ModelIdentity
+from ai_video_factory.inference_models import InferenceCheck, MemoryEstimate, ModelIdentity
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
 
 
@@ -33,6 +35,33 @@ _READ_ONLY_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("lms", "ls", "--json"),
     ("lms", "ps", "--json"),
 )
+_ESTIMATE_COMMAND = (
+    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
+    "--context-length", "65536", "--no-speculative-draft-mtp",
+    "--estimate-only", "-y",
+)
+_SERVER_START_COMMAND = (
+    "lms", "server", "start", "--port", "1234", "--bind", "127.0.0.1",
+)
+_MODEL_START_COMMAND = (
+    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
+    "--context-length", "65536", "--parallel", "1", "--ttl", "3600",
+    "--no-speculative-draft-mtp", "--identifier", "avf-qwen36-executor", "-y",
+)
+_MODEL_STOP_COMMAND = ("lms", "unload", "avf-qwen36-executor")
+_APPROVED_COMMANDS = _READ_ONLY_COMMANDS + (
+    _ESTIMATE_COMMAND,
+    _SERVER_START_COMMAND,
+    _MODEL_START_COMMAND,
+    _MODEL_STOP_COMMAND,
+)
+_ESTIMATE_TIMEOUT_SECONDS = 60.0
+_MODEL_LOAD_TIMEOUT_SECONDS = 600.0
+_ESTIMATE_PATTERNS = {
+    "gpu_gib": re.compile(r"^Estimated GPU Memory:\s*(\S+)\s+GiB\s*$"),
+    "total_gib": re.compile(r"^Estimated Total Memory:\s*(\S+)\s+GiB\s*$"),
+    "confidence": re.compile(r"^Confidence:\s*(LOW|MEDIUM|HIGH|UNKNOWN)\s*$"),
+}
 
 
 class LmStudioError(RuntimeError):
@@ -104,8 +133,15 @@ class _LoadedModel(BaseModel):
     identifier: str
 
 
+class _ApiModel(BaseModel):
+    model_config = ConfigDict(strict=True, extra="ignore")
+
+    id: str
+
+
 _INVENTORY_ADAPTER = TypeAdapter(list[_InventoryModel])
 _LOADED_ADAPTER = TypeAdapter(list[_LoadedModel])
+_API_MODELS_ADAPTER = TypeAdapter(list[_ApiModel])
 
 
 @lru_cache(maxsize=1)
@@ -122,8 +158,10 @@ def _resolved_lms() -> str:
 
 def run_process(argv: Sequence[str], timeout: float) -> ProcessResult:
     """Run a fixed LM Studio command without a shell or inherited stdin."""
-    if tuple(argv) not in _READ_ONLY_COMMANDS:
-        raise LmStudioError("LM Studio command is not an approved read-only command")
+    if tuple(argv) not in _APPROVED_COMMANDS:
+        raise LmStudioError(
+            "LM Studio command is not an approved read-only or configured lifecycle command"
+        )
     _resolved_lms()
     try:
         completed = subprocess.run(
@@ -223,15 +261,21 @@ class LmStudioBackend:
         self.runner = runner
         self.http = http
 
-    def _command(self, argv: tuple[str, ...], *, allow_failure: bool = False) -> ProcessResult:
+    def _command(
+        self,
+        argv: tuple[str, ...],
+        *,
+        allow_failure: bool = False,
+        timeout: float = _COMMAND_TIMEOUT_SECONDS,
+    ) -> ProcessResult:
         try:
-            result = self.runner(argv, _COMMAND_TIMEOUT_SECONDS)
+            result = self.runner(argv, timeout)
         except FileNotFoundError as exc:
             raise LmStudioError("LM Studio executable not found") from exc
         except PermissionError as exc:
             raise LmStudioError("LM Studio executable permission denied") from exc
         except subprocess.TimeoutExpired as exc:
-            raise LmStudioError("LM Studio command timed out after 15 seconds") from exc
+            raise LmStudioError(f"LM Studio command timed out after {timeout:g} seconds") from exc
         except LmStudioError:
             raise
         except OSError as exc:
@@ -242,6 +286,111 @@ class LmStudioBackend:
                 detail = f"exit code {result.returncode}"
             raise LmStudioError(f"LM Studio command {' '.join(argv)} failed: {detail}")
         return result
+
+    @staticmethod
+    def _parse_estimate(raw_estimate: str) -> MemoryEstimate:
+        matched: dict[str, list[str]] = {name: [] for name in _ESTIMATE_PATTERNS}
+        prefixes = {
+            "gpu_gib": "Estimated GPU Memory:",
+            "total_gib": "Estimated Total Memory:",
+            "confidence": "Confidence:",
+        }
+        for line in raw_estimate.splitlines():
+            for name, pattern in _ESTIMATE_PATTERNS.items():
+                match = pattern.fullmatch(line)
+                if match is not None:
+                    matched[name].append(match.group(1))
+                elif line.startswith(prefixes[name]):
+                    raise LmStudioError("LM Studio estimate output is invalid")
+
+        if any(len(values) != 1 for values in matched.values()):
+            raise LmStudioError("LM Studio estimate output is invalid")
+        try:
+            gpu_gib = float(matched["gpu_gib"][0])
+            total_gib = float(matched["total_gib"][0])
+        except ValueError as exc:
+            raise LmStudioError("LM Studio estimate output is invalid") from exc
+        if not all(math.isfinite(value) and value >= 0 for value in (gpu_gib, total_gib)):
+            raise LmStudioError("LM Studio estimate output is invalid")
+        return MemoryEstimate(
+            gpu_gib=gpu_gib,
+            total_gib=total_gib,
+            confidence=matched["confidence"][0],
+            allowed=True,
+        )
+
+    def estimate(self) -> MemoryEstimate:
+        """Estimate configured model memory without loading the model."""
+        argv = (
+            self.config.lms_binary,
+            "load",
+            self.config.model_key,
+            "--gpu",
+            self.config.gpu,
+            "--context-length",
+            str(self.config.context_length),
+            "--no-speculative-draft-mtp",
+            "--estimate-only",
+            "-y",
+        )
+        result = self._command(argv, timeout=_ESTIMATE_TIMEOUT_SECONDS)
+        return self._parse_estimate(result.stdout)
+
+    def start_server(self) -> None:
+        """Start only the configured loopback LM Studio server."""
+        self._command(
+            (
+                self.config.lms_binary,
+                "server",
+                "start",
+                "--port",
+                "1234",
+                "--bind",
+                "127.0.0.1",
+            )
+        )
+
+    def start(self) -> None:
+        """Load only the configured model under its stable identifier."""
+        self._command(
+            (
+                self.config.lms_binary,
+                "load",
+                self.config.model_key,
+                "--gpu",
+                self.config.gpu,
+                "--context-length",
+                str(self.config.context_length),
+                "--parallel",
+                str(self.config.parallel),
+                "--ttl",
+                str(self.config.ttl_seconds),
+                "--no-speculative-draft-mtp",
+                "--identifier",
+                self.config.identifier,
+                "-y",
+            ),
+            timeout=_MODEL_LOAD_TIMEOUT_SECONDS,
+        )
+
+    def stop(self) -> None:
+        """Unload only the configured stable identifier."""
+        self._command((self.config.lms_binary, "unload", self.config.identifier))
+
+    def api_model_identifiers(self) -> tuple[str, ...]:
+        """Return model identifiers visible from the fixed loopback API."""
+        response = self.http(
+            "GET",
+            f"{self.config.base_url}/models",
+            None,
+            {"Content-Type": "application/json", "Accept": "application/json"},
+            _COMMAND_TIMEOUT_SECONDS,
+        )
+        try:
+            records = _API_MODELS_ADAPTER.validate_python(response.get("data"), strict=True)
+        except ValidationError as exc:
+            raise LmStudioError("LM Studio API model list JSON is invalid") from exc
+        return tuple(record.id for record in records)
 
     def _inventory(self, raw_inventory: str) -> tuple[LmStudioModel, ...]:
         try:
