@@ -437,10 +437,13 @@ def apply_voice_variation(
     filters = [f"[0:a]atempo={speed_ratio:.4f}"]
 
     # Pitch: rubberband shifts register without changing tempo (already applied
-    # by atempo above). Only used when a non-zero shift is requested and the
-    # filter exists in this ffmpeg build.
+    # by atempo above). The pitch parameter is a frequency ratio, so convert the
+    # requested semitone offset to a ratio via 2^(semitones/12) — e.g. +1 st ->
+    # ~1.0595, -1 st -> ~0.9439. Only used when a non-zero shift is requested and
+    # the filter exists in this ffmpeg build.
     if pitch_shift_semitones:
-        filters.append(f"rubberband=pitch={pitch_shift_semitones:.2f}")
+        pitch_ratio = 2 ** (pitch_shift_semitones / 12.0)
+        filters.append(f"rubberband=pitch={pitch_ratio:.4f}")
 
     # Presence boost around speech fundamentals for clarity; then pad to a
     # minimum length so downstream timing math is unaffected by the small speed

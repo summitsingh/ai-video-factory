@@ -194,3 +194,7 @@ def video_pipeline(
     except Exception as error:
         typer.echo(sanitize_diagnostic(error), err=True)
         raise typer.Exit(code=2)
+
+
+if __name__ == "__main__":
+    app()

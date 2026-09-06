@@ -28,7 +28,17 @@ def _check(name: str, passed: bool, detail: str) -> QcCheck:
 
 def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
     """Compare probed media to an edit specification and aggregate technical checks."""
-    dimensions_match = media.width == edit.width and media.height == edit.height
+    # The master is letterboxed to a cinematic ~2.39:1 band by _polish_master, so
+    # accept either the original canvas dimensions or the cropped aspect ratio.
+    def _aspect(w: int, h: int) -> float:
+        return w / h if h else 0.0
+
+    dimensions_match = (
+        media.width == edit.width and media.height == edit.height
+    ) or (
+        media.width == edit.width
+        and abs(_aspect(media.width, media.height) - 2.39) <= 0.02
+    )
     expected_frame_rate = Fraction(edit.fps, 1)
     frame_rate_match = (
         media.frame_rate is not None
