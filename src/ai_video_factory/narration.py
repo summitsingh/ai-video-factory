@@ -1,15 +1,25 @@
-"""Local text-to-speech narration using espeak-ng (formant synthesis).
+"""Local text-to-speech narration.
 
-No model downloads: espeak-ng is a compiled formant synthesizer shipped by
-the OS package manager. Output is normalized to 48 kHz stereo WAV so the
-pipeline's FFmpeg stage can mux it directly.
+Default engine is Kokoro (neural, ONNX runtime via `kokoro-onnx`), which runs
+on CPU and produces broadcast-quality English narration for long-form content.
+Piper (`piper-tts`) and espeak-ng remain available as fallback engines. All
+engines normalize output to 48 kHz stereo WAV so the pipeline's FFmpeg stage
+can mux it directly.
+
+Model files live under `models/tts/` (downloaded once, not fetched at runtime):
+  - kokoro-v1.0.onnx        (Kokoro neural model)
+  - voices-v1.0.bin         (Kokoro voice weights)
+  - en_US-lessac-high.onnx  (Piper voice model)
 """
 
 from __future__ import annotations
 
+import io
 import re
 import subprocess
+import wave
 from pathlib import Path
+from typing import Any
 
 from ai_video_factory.sanitization import sanitize_diagnostic
 
@@ -29,6 +39,31 @@ _PIPER_MODEL = (
     Path(__file__).resolve().parents[2] / "models" / "tts" / "en_US-lessac-high.onnx"
 )
 
+_KOKORO_MODEL = (
+    Path(__file__).resolve().parents[2] / "models" / "tts" / "kokoro-v1.0.onnx"
+)
+_KOKORO_VOICES = (
+    Path(__file__).resolve().parents[2] / "models" / "tts" / "voices-v1.0.bin"
+)
+
+# Default narrator voice for Kokoro (a clear, warm English voice). Override via
+# the `voice` argument to synthesize_to_wav() or per-scene in the edit doc.
+_KOKORO_DEFAULT_VOICE = "af_heart"
+
+# Module-level cache so we don't reload the ~325 MB ONNX model once per scene.
+_kokoro_model_cache: dict[str, object] = {}
+
+
+def _load_kokoro() -> Any:
+    """Load (and cache) the Kokoro ONNX model + voice weights."""
+    import kokoro_onnx  # local import; only needed when Kokoro is used
+
+    key = f"{_KOKORO_VOICES}|{_KOKORO_VOICES}"
+    if key not in _kokoro_model_cache:
+        model = kokoro_onnx.Kokoro(str(_KOKORO_MODEL), str(_KOKORO_VOICES))
+        _kokoro_model_cache[key] = model
+    return _kokoro_model_cache[key]
+
 
 def clean_for_speech(text: str) -> str:
     """Strip markdown citations/URLs so they are speakable prose."""
@@ -42,8 +77,8 @@ def synthesize_to_wav(
     text: str,
     output: Path,
     *,
-    engine: str = "piper",
-    voice: str = "en",
+    engine: str = "kokoro",
+    voice: str = "af_heart",
     speed_wpm: int = 170,
     pitch: int = 50,
     espeak: str = "espeak-ng",
@@ -51,21 +86,103 @@ def synthesize_to_wav(
 ) -> Path:
     """Synthesize speakable text to a WAV file with a local engine.
 
-    Engines: 'piper' (neural, preferred when installed) or 'espeak'
-    (formant fallback, always available). Falls back to espeak when the
-    Piper binary or voice model is absent.
+    Default engine is 'kokoro' (neural ONNX TTS, broadcast-quality English for
+    long-form narration). 'piper' and 'espeak' remain available as fallbacks;
+    the pipeline falls back to espeak only when neither Kokoro nor Piper can run.
     """
     speakable = clean_for_speech(text)
     if not speakable:
         raise NarrationError("no speakable text after cleaning narration")
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    if engine == "kokoro" and _KOKORO_MODEL.is_file() and _KOKORO_VOICES.is_file():
+        return _synthesize_kokoro(
+            speakable, output, voice=voice or _KOKORO_DEFAULT_VOICE, timeout=timeout
+        )
     if engine == "piper" and _PIPER_VENV_BIN.is_file() and _PIPER_MODEL.is_file():
         return _synthesize_piper(speakable, output, timeout=timeout)
     return _synthesize_espeak(
         speakable, output, voice=voice, speed_wpm=speed_wpm, pitch=pitch,
         espeak=espeak, timeout=timeout,
     )
+
+
+def _synthesize_kokoro(
+    speakable: str,
+    output: Path,
+    *,
+    voice: str = "af_heart",
+    speed: float = 1.0,
+    timeout: int = 300,
+) -> Path:
+    """Synthesize text with the Kokoro ONNX model and normalize to 48 kHz stereo WAV.
+
+    Kokoro emits a mono float32 array at 24 kHz. We write that as an intermediate
+    WAV, then use FFmpeg to resample to 48 kHz and upmix to stereo so the result
+    muxes directly into the pipeline's narration track. The model is loaded once
+    per process (module-level cache) since each scene synthesizes separately.
+    """
+    import array
+    import wave
+
+    kokoro = _load_kokoro()
+
+    try:
+        audio, sample_rate = kokoro.create(speakable, voice=voice, speed=speed)
+    except Exception as error:  # noqa: BLE001 - surface any synthesis failure
+        raise NarrationError(
+            sanitize_diagnostic(f"kokoro could not synthesize: {error}")
+        ) from error
+
+    if audio is None or len(audio) == 0:
+        raise NarrationError("kokoro produced no audio output")
+
+    # Normalize float32 in [-1, 1] to int16 PCM using stdlib only (the pipeline
+    # venv has no numpy). Tolerate a numpy array, list, or array.array.
+    samples = getattr(audio, "tolist", None)
+    if callable(samples):
+        floats = samples()
+    else:
+        floats = list(audio)
+
+    pcm = array.array("h")  # signed short (int16)
+    for value in floats:
+        clipped = -1.0 if value < -1.0 else (1.0 if value > 1.0 else value)
+        pcm.append(int(clipped * 32767.0))
+
+    # Write intermediate mono WAV at the model's native sample rate.
+    tmp_wav = output.with_suffix(".raw.wav")
+    with wave.open(str(tmp_wav), "wb") as wav_out:
+        wav_out.setnchannels(1)
+        wav_out.setsampwidth(2)  # int16
+        wav_out.setframerate(int(sample_rate))
+        wav_out.writeframes(pcm.tobytes())
+
+    try:
+        completed = subprocess.run(
+            (
+                "ffmpeg", "-y", "-i", str(tmp_wav),
+                "-ar", "48000", "-ac", "2",
+                "-c:a", "pcm_s16le", str(output),
+            ),
+            shell=False, timeout=timeout, capture_output=True, text=True, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NarrationError(
+            sanitize_diagnostic(f"kokoro audio could not be normalized: {error}")
+        ) from error
+    finally:
+        if tmp_wav.is_file():
+            tmp_wav.unlink()
+
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()[-500:] or f"exit {completed.returncode}"
+        raise NarrationError(
+            sanitize_diagnostic(f"kokoro audio normalization failed: {detail}")
+        )
+    if not output.is_file() or output.stat().st_size == 0:
+        raise NarrationError("kokoro produced no normalized audio output")
+    return output
 
 
 def _synthesize_piper(text: str, output: Path, *, timeout: int) -> Path:
