@@ -34,6 +34,7 @@ from ai_video_factory.qc import evaluate_qc, write_qc_reports
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
+from ai_video_factory.subtitle_export import write_subtitles
 from ai_video_factory.script_generator import ScriptOutput, generate_script
 
 
@@ -1205,6 +1206,28 @@ def run_video_pipeline(
             )
         metadata["edit_status"] = "complete"
         artifacts["edit"] = str(job.edit_path)
+
+        # Step 4.5: Export styled subtitle files (.srt + WebVTT) and YouTube
+        # chapters from the edit document (#7). These are written next to the
+        # output so they can be attached to a publish step later; nothing is
+        # uploaded here.
+        try:
+            subtitle_artifacts = write_subtitles(
+                edit_doc,
+                Path(job.output_path),
+                base_name="subtitles",
+            )
+            artifacts["srt"] = str(subtitle_artifacts["srt"])
+            artifacts["webvtt"] = str(subtitle_artifacts["webvtt"])
+            artifacts["chapters_webvtt"] = str(
+                subtitle_artifacts["chapters_webvtt"]
+            )
+            artifacts["chapters_json"] = str(
+                subtitle_artifacts["chapters_json"]
+            )
+            metadata["subtitle_status"] = "complete"
+        except Exception as error:  # noqa: BLE001 - subtitles are best-effort
+            metadata["subtitle_status"] = f"failed: {sanitize_diagnostic(error)}"
 
         # Step 4: Render video with Remotion
         metadata["render_status"] = "in_progress"
