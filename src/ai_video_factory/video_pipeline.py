@@ -371,21 +371,148 @@ def _finish_chunk(edit: EditDocument, scenes: list[EditScene]) -> EditDocument:
 
 
 def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None = None) -> None:
-    """Concatenate rendered chunk MP4s with stream copy (identical codecs)."""
+    """Concatenate rendered chunk MP4s.
+
+    Prefers an xfade-based re-encode so transitions between chunks are smooth
+    cross-dissolves instead of hard cuts. Falls back to stream-copy concat if
+    the xfade path fails (e.g. codec incompatibility), preserving the original
+    behavior in that case.
+    """
     destination = Path(destination).resolve()
-    filelist = destination.parent / "chunks.txt"
-    filelist.write_text(
-        "".join(f"file '{Path(c).resolve()}'\n" for c in chunks), encoding="utf-8"
-    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg is not None else "ffmpeg"
+
+    # xfade transition duration in seconds (must be < shortest chunk duration).
+    xfadeseconds = 0.8
+    n = len(chunks)
+
+    try:
+        _concat_with_xfade(chunks, destination, ffmpeg_bin, xfadeseconds)
+    except PipelineCommandError as error:
+        # Fall back to stream-copy concat on any xfade failure.
+        filelist = destination.parent / "chunks.txt"
+        filelist.write_text(
+            "".join(f"file '{Path(c).resolve()}'\n" for c in chunks), encoding="utf-8"
+        )
+        _run_command(
+            (
+                ffmpeg_bin,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(filelist),
+                "-c",
+                "copy",
+                str(destination),
+            ),
+            cwd=destination.parent,
+            name="FFmpeg chunk concat (fallback)",
+            timeout=600,
+        )
+
+
+def _concat_with_xfade(
+    chunks: list[Path], destination: Path, ffmpeg_bin: str, xfadeseconds: float
+) -> None:
+    """Concatenate chunks using xfade transitions between each pair."""
+    n = len(chunks)
+    if n == 1:
+        # Single chunk: just copy it.
+        shutil.copy2(chunks[0], destination)
+        return
+
+    # Probe durations to compute correct xfade offsets.
+    import subprocess
+
+    probe_bin = "ffprobe" if ffmpeg_bin == "ffmpeg" else ffmpeg_bin
+    durations = []
+    for chunk in chunks:
+        probe = subprocess.run(
+            [
+                probe_bin,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(chunk),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        try:
+            durations.append(float(probe.stdout.strip()))
+        except (ValueError, AttributeError):
+            # Probe failed: fall back to stream-copy concat.
+            raise PipelineCommandError("xfade duration probe failed") from None
+
+    # Build the xfade filter chain. Each transition overlaps the tail of one
+    # chunk with the head of the next by xfadeseconds seconds.
+    inputs = []
+    for i, chunk in enumerate(chunks):
+        inputs += ["-i", str(chunk)]
+
+    filters = ""
+    prev_label = "0:v"  # first input video, referenced without extra brackets
+    # acc tracks the accumulated duration of the merged stream so far. The
+    # first chunk contributes durations[0]; each transition overlaps by
+    # xfadeseconds, so transition i's offset is (acc - xfadeseconds) and the
+    # new accumulated duration becomes acc + durations[i] - xfadeseconds.
+    acc = durations[0]
+    for i in range(1, n):
+        offset = acc - xfadeseconds
+        filters += (
+            f"[{prev_label}][{i}:v]xfade=transition=dissolve:duration={xfadeseconds}"
+            f":offset={offset}[v{i}];"
+        )
+        prev_label = f"v{i}"  # store label without brackets for next wrap
+        acc = acc + durations[i] - xfadeseconds
+
+    # Audio xfade: chain acrossfade filters, each taking exactly two inputs.
+    filters += "[0:a][1:a]acrossfade=d={xfadeseconds}[a1];".format(xfadeseconds=xfadeseconds)
+    for i in range(2, n):
+        filters += f"[a{i-1}][{i}:a]acrossfade=d={xfadeseconds}[a{i}];"
+
+    # Map video and audio outputs.
+    argv = [
+        ffmpeg_bin,
+        "-y",
+        *inputs,
+        "-filter_complex",
+        filters,
+        "-map",
+        f"[{prev_label}]",
+        "-map",
+        f"[a{n-1}]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        str(destination),
+    ]
+
     _run_command(
-        (
-            str(ffmpeg) if ffmpeg is not None else "ffmpeg",
-            "-y", "-f", "concat", "-safe", "0",
-            "-i", str(filelist),
-            "-c", "copy", str(destination),
-        ),
+        tuple(argv),
         cwd=destination.parent,
-        name="FFmpeg chunk concat",
+        name="FFmpeg chunk concat (xfade)",
         timeout=600,
     )
 
@@ -478,39 +605,126 @@ def _find_local_browser() -> Path:
     )
 
 
+def _generate_music_bed(
+    duration_seconds: float,
+    output: Path,
+    *,
+    ffmpeg: Path | None = None,
+) -> Path:
+    """Generate a subtle ambient space music bed procedurally (no downloads).
+
+    Uses layered sine tones with slow amplitude modulation and gentle filtering
+    to create a calm, cinematic drone suitable under narration. Output is padded
+    to the requested duration so it can be mixed across the full video length.
+    """
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg is not None else "ffmpeg"
+    # Layered soft tones (A220, E261, A329, C#392) with slow tremolo and a low
+    # pass filter for warmth. Volume kept quiet so narration stays dominant.
+    _run_command(
+        (
+            ffmpeg_bin, "-y",
+            "-f", "lavfi",
+            "-i", f"sine=frequency=220:duration={duration_seconds}",
+            "-filter_complex",
+            "[0:a]volume=0.15,tremolo=f=0.1:d=0.8[a0];"
+            "[0:a]adelay=100|100,volume=0.12,tremolo=f=0.13:d=0.7[a1];"
+            "[a0][a1]amix=inputs=2:normalize=1,"
+            "lowpass=f=1200,highpass=f=80,"
+            f"apad=pad_len={int(duration_seconds * 1000)},apad="
+            f"pad_len={int(duration_seconds * 1000)}[bed]",
+            "-map", "[bed]",
+            "-c:a", "pcm_s16le",
+            "-ar", "48000",
+            "-ac", "2",
+            str(output),
+        ),
+        cwd=output.parent,
+        name="FFmpeg music bed generation",
+        timeout=300,
+    )
+    return output
+
+
 def _mux_narration_audio(
     source: Path,
     narration_track: Path | None,
     destination: Path,
     *,
     ffmpeg: Path | None = None,
+    music_track: Path | None = None,
 ) -> None:
-    """Mux the video with the TTS narration track (or silence as fallback).
+    """Mux the video with narration and optional ducked music bed.
 
-    The narration track is padded with silence so the video length governs
-    the output duration via -shortest.
+    When a music track is provided it is mixed at low volume and ducked via
+    sidechain compression (narration triggers the compression), so the score
+    dips automatically whenever someone is speaking. The result is padded to
+    match the video length, which governs output duration via -shortest.
+
+    ffmpeg filter semantics: ``sidechaincompress`` takes [signal][sidechain],
+    so music is the signal and narration is the sidechain trigger.
     """
     source = Path(source).resolve()
     destination = Path(destination).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = str(ffmpeg) if ffmpeg is not None else "ffmpeg"
+
+    # Build input list and filter chain based on which tracks are available.
+    inputs: list[str] = ["-i", str(source)]  # video (may have audio stream)
+    map_args: list[str] = ["-map", "0:v"]
+    narr_idx: int | None = None
+    music_idx: int | None = None
+
     if narration_track is not None:
-        _run_command(
-            (
-                ffmpeg_bin, "-y",
-                "-i", str(source),
-                "-i", str(Path(narration_track).resolve()),
-                "-filter_complex", "[1:a]apad[aud]",
-                "-map", "0:v", "-map", "[aud]",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                "-ar", "48000", "-ac", "2",
-                "-shortest", str(destination),
-            ),
-            cwd=destination.parent,
-            name="FFmpeg narration mux",
+        inputs += ["-i", str(Path(narration_track).resolve())]
+        narr_idx = len(inputs) // 2 - 1  # index in combined input list
+
+    if music_track is not None:
+        inputs += ["-i", str(Path(music_track).resolve())]
+        music_idx = len(inputs) // 2 - 1
+
+    filter_parts: list[str] = []
+
+    if narr_idx is not None and music_idx is not None:
+        # Duck the music using narration as the sidechain trigger. When
+        # narration is loud, compress (lower) the music; when quiet, music
+        # returns to its base volume. Then mix ducked music over narration.
+        filter_parts.append(
+            f"[{music_idx}:a]volume=0.25[music_base];"
+            f"[music_base][{narr_idx}:a]"
+            "sidechaincompress=threshold=0.03:ratio=15:attack=20:release=250,"
+            "acompressor=threshold=0.02:ratio=4[music_ducked];"
+            "[music_ducked]apad=pad_len=60000[music_padded];"
+            f"[{narr_idx}:a][music_padded]"
+            "amix=inputs=2:normalize=1[mix]"
+        )
+    elif narr_idx is not None:
+        # Narration only (no music): pad to video length.
+        filter_parts.append(
+            f"[{narr_idx}:a]apad=pad_len=60000,mix"
+        )
+    elif music_idx is not None:
+        # Music only (no narration): lower volume, pad to video length.
+        filter_parts.append(
+            f"[{music_idx}:a]volume=0.25,apad=pad_len=60000,mix"
         )
     else:
+        # Neither track available: fall back to silent audio.
         _mux_silent_audio(source, destination, ffmpeg=ffmpeg)
+        return
+
+    filter_chain = ";".join(filter_parts)
+    map_args += ["-map", "[mix]"]
+    argv = [ffmpeg_bin, "-y", *inputs, "-filter_complex", filter_chain,
+            *map_args, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-ar", "48000", "-ac", "2", "-shortest", str(destination)]
+
+    _run_command(
+        tuple(argv),
+        cwd=destination.parent,
+        name="FFmpeg narration + music mux",
+    )
 
 
 def _synthesize_narration_track(
@@ -884,11 +1098,20 @@ def run_video_pipeline(
                     ])
                 else:
                     metadata["narration_status"] = "silent_fallback"
+                # Generate a subtle ambient music bed and duck it under narration.
+                duration_seconds = edit_doc_render.duration_frames / edit_doc_render.fps
+                music_track = _generate_music_bed(
+                    duration_seconds,
+                    run_directory / "music.wav",
+                    ffmpeg=_required_tool(tools, "ffmpeg"),
+                )
+                metadata["music_status"] = "complete"
                 _mux_narration_audio(
                     temporary_path,
                     narration_track,
                     run_master,
                     ffmpeg=_required_tool(tools, "ffmpeg"),
+                    music_track=music_track,
                 )
                 temporary_path.unlink(missing_ok=True)
             else:

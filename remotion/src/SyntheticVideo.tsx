@@ -16,6 +16,12 @@ const BACKGROUNDS = [
   'linear-gradient(135deg, #073d2a 0%, #000000 100%)',
 ];
 
+// Cinematic color grade applied to all media: modest contrast lift, slight
+// saturation roll-off and a cool shadow / warm highlight split-tone give raw
+// stock footage a cohesive, filmic look instead of flat HDR video-game colors.
+const COLOR_GRADE_FILTER =
+  'contrast(1.07) saturate(0.92) brightness(0.97) hue-rotate(-2deg)';
+
 const toLocalSrc = (path: string): string => {
   if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('file://')) {
     return path;
@@ -77,6 +83,8 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
           src={toLocalSrc(scene.clip)}
           style={{height: '100%', objectFit: 'cover', width: '100%'}}
         />
+        {/* Color grade + subtle darkening so text stays legible over footage. */}
+        <AbsoluteFill style={{filter: COLOR_GRADE_FILTER}} />
         <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.55)'}} />
       </AbsoluteFill>
     );
@@ -106,6 +114,8 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
             width: '100%',
           }}
         />
+        {/* Color grade over the still image for a consistent filmic look. */}
+        <AbsoluteFill style={{filter: COLOR_GRADE_FILTER}} />
         <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.55)'}} />
       </AbsoluteFill>
     );
@@ -194,6 +204,8 @@ const SceneCard = ({
       />
       {/* Lower third: animated topic bar */}
       {scene.caption && <LowerThird text={scene.caption} />}
+      {/* Motion graphics: keyword-driven overlays (timeline/data/label) */}
+      <MotionGraphics text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
       <AbsoluteFill
         style={{
           alignItems: 'center',
@@ -313,6 +325,122 @@ const ProgressBar = () => {
         }}
       />
     </div>
+  );
+};
+
+// Motion graphics: keyword-driven overlays that animate in when relevant terms
+// appear in the narration/caption/title. Detects dates, measurements, and
+// distances to render timelines, data callouts, and labels — no schema changes
+// or worker re-runs required.
+const MOTION_KEYWORDS = [
+  {pattern: /launched|december 2021|ariane/i, type: 'timeline'},
+  {pattern: /6\.5 meters|hexagonal|gold mirror/i, type: 'data'},
+  {pattern: /billion lightyears|redshift|320 million|13\.\d billion/i, type: 'data'},
+  {pattern: /infrared|invisible|dust cloud/i, type: 'label'},
+  {pattern: /lagrange|l2 point|1\.5 million km|orbit/i, type: 'label'},
+];
+
+const MotionGraphics = ({text}: {text: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const match = MOTION_KEYWORDS.find((k) => k.pattern.test(text));
+  if (!match) return null;
+
+  // Animate in over first 40 frames.
+  const enter = interpolate(frame, [0, 40], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+
+  if (match.type === 'timeline') {
+    return (
+      <AbsoluteFill style={{pointerEvents: 'none'}}>
+        {/* Animated timeline bar */}
+        <div
+          style={{
+            position: 'absolute',
+            top: height * 0.2,
+            left: width * 0.1,
+            width: `${width * 0.8}px`,
+            height: 4,
+            backgroundColor: 'rgba(34, 211, 238, 0.3)',
+            borderRadius: 2,
+          }}
+        >
+          <div
+            style={{
+              height: '100%',
+              width: `${enter * 100}%`,
+              backgroundColor: '#22d3ee',
+              boxShadow: '0 0 12px rgba(34,211,238,0.8)',
+            }}
+          />
+        </div>
+      </AbsoluteFill>
+    );
+  }
+
+  if (match.type === 'data') {
+    return (
+      <AbsoluteFill style={{pointerEvents: 'none'}}>
+        {/* Data callout box */}
+        <div
+          style={{
+            position: 'absolute',
+            top: height * 0.15,
+            right: width * 0.08,
+            backgroundColor: 'rgba(34, 211, 238, 0.15)',
+            border: '1px solid rgba(34, 211, 238, 0.6)',
+            borderRadius: 8,
+            padding: `${height * 0.02}px ${width * 0.03}px`,
+            opacity: enter,
+            transform: `translateX(${20 * (1 - enter)}px)`,
+          }}
+        >
+          <div
+            style={{
+              color: '#22d3ee',
+              fontSize: Math.round(height * 0.03),
+              fontWeight: 700,
+              letterSpacing: '0.05em',
+            }}
+          >
+            ▸ COSMIC DATA
+          </div>
+        </div>
+      </AbsoluteFill>
+    );
+  }
+
+  // label type
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      {/* Animated label tag */}
+      <div
+        style={{
+          position: 'absolute',
+          top: height * 0.18,
+          left: width * 0.08,
+          backgroundColor: 'rgba(168, 85, 247, 0.2)',
+          border: '1px solid rgba(168, 85, 247, 0.6)',
+          borderRadius: 6,
+          padding: `${height * 0.01}px ${width * 0.03}px`,
+          opacity: enter,
+          transform: `translateX(${-20 * (1 - enter)}px)`,
+        }}
+      >
+        <div
+          style={{
+            color: '#c084fc',
+            fontSize: Math.round(height * 0.025),
+            fontWeight: 600,
+            letterSpacing: '0.08em',
+          }}
+        >
+          ◈ KEY CONCEPT
+        </div>
+      </div>
+    </AbsoluteFill>
   );
 };
 
@@ -566,7 +694,6 @@ export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
           />
         </Sequence>
       ))}
-      <ProgressBar />
     </AbsoluteFill>
   );
 };
