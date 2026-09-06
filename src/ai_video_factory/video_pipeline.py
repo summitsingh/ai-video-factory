@@ -35,6 +35,7 @@ from ai_video_factory.research import TrendingTopic, research_trending_topics, s
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
 from ai_video_factory.subtitle_export import write_subtitles
+from ai_video_factory.nasa_media import populate_assets_from_nasa
 from ai_video_factory.thumbnail import build_thumbnails, validate_thumbnails
 from ai_video_factory.script_generator import ScriptOutput, generate_script
 
@@ -1199,8 +1200,23 @@ def run_video_pipeline(
             created_at=job.created_at,
         )
         save_edit(edit_doc, job.edit_path)
-        if job.assets_dir is not None:
-            edit_doc = attach_scene_assets(edit_doc, job.assets_dir)
+        # Resolve the assets directory used to attach per-scene media. If the
+        # caller did not supply one (--assets-dir), populate an internal
+        # directory from NASA's public-domain library so scenes get real footage
+        # by default. This reuses attach_scene_assets() unchanged; nothing is
+        # uploaded or published here.
+        assets_dir_used: Path | None = job.assets_dir
+        if assets_dir_used is None:
+            internal_assets = project_data / "nasa_assets"
+            try:
+                nasa_summary = populate_assets_from_nasa(edit_doc, internal_assets)
+                metadata["nasa_assets"] = nasa_summary
+                assets_dir_used = internal_assets
+            except Exception as error:  # noqa: BLE001 - best-effort; keep title cards on failure
+                metadata["nasa_assets"] = {"error": sanitize_diagnostic(error)}
+                assets_dir_used = None
+        if assets_dir_used is not None:
+            edit_doc = attach_scene_assets(edit_doc, assets_dir_used)
             save_edit(edit_doc, job.edit_path)
             metadata["assets_attached"] = sum(
                 1 for s in edit_doc.scenes if s.clip or s.image
