@@ -12,6 +12,8 @@ export type EditScene = {
   accent_color?: string;
   image?: string;
   clip?: string;
+  subtitle?: string;
+  pip?: boolean;
 };
 
 export type EditDocument = {
@@ -73,7 +75,7 @@ const parseScene = (value: unknown): EditScene => {
   }
   assertExactKeys(
     value,
-    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'kind', 'visual', 'narration', 'background', 'text_color', 'accent_color', 'image', 'clip'],
+    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'kind', 'visual', 'narration', 'background', 'text_color', 'accent_color', 'image', 'clip', 'subtitle', 'pip'],
     'scene',
   );
 
@@ -93,6 +95,8 @@ const parseScene = (value: unknown): EditScene => {
     accent_color: typeof value.accent_color === 'string' ? value.accent_color : '#22d3ee',
     image: typeof value.image === 'string' ? value.image : undefined,
     clip: typeof value.clip === 'string' ? value.clip : undefined,
+    subtitle: typeof value.subtitle === 'string' ? value.subtitle : undefined,
+    pip: value.pip === true,
   };
 };
 

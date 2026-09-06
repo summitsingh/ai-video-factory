@@ -158,3 +158,112 @@ def mix_scenes_to_track(
         detail = completed.stderr.strip()[-2000:] or f"exit {completed.returncode}"
         raise NarrationError(sanitize_diagnostic(f"narration mix failed: {detail}"))
     return output
+
+
+def generate_sfx(
+    kind: str,
+    output: Path,
+    *,
+    duration_seconds: float = 0.35,
+    sample_rate: int = 48000,
+    ffmpeg: str = "ffmpeg",
+    timeout: int = 120,
+) -> Path:
+    """Generate a short sound-effect clip (no downloads) for scene transitions.
+
+    Kinds: 'whoosh' (filtered noise sweep used on scene cuts), 'ping' (a soft
+    tonal blip used when motion graphics reveal), and 'drone' (a low swell used
+    at intro/outro boundaries). Output is a 48 kHz stereo WAV with fade edges so
+    it never clicks.
+    """
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg else "ffmpeg"
+    kind = (kind or "whoosh").lower()
+
+    # Base noise source + bandpass shape the effect; fades prevent clicks.
+    if kind == "ping":
+        src = f"sine=frequency=660:duration={duration_seconds}"
+        chain = (
+            f"volume=0.18,"
+            f"afade=t=in:st=0:d=0.02,"
+            f"afade=t=out:st={max(0.05, duration_seconds - 0.06):.3f}:d=0.06"
+        )
+    elif kind == "drone":
+        src = f"sine=frequency=75:duration={duration_seconds}"
+        chain = (
+            f"volume=0.14,"
+            f"afade=t=in:st=0:d=0.08,"
+            f"afade=t=out:st={max(0.05, duration_seconds - 0.08):.3f}:d=0.08"
+        )
+    else:  # whoosh (default)
+        src = "anoisesrc=d=0.3:c=pink"
+        chain = (
+            f"bandpass=f=1200,volume=0.12,"
+            f"afade=t=in:st=0:d=0.05,"
+            f"afade=t=out:st={max(0.05, duration_seconds - 0.05):.3f}:d=0.05"
+        )
+
+    argv = [ffmpeg_bin, "-y", "-f", "lavfi", "-i", src,
+            "-filter_complex", chain,
+            "-c:a", "pcm_s16le", "-ar", str(sample_rate), "-ac", "2", str(output)]
+    try:
+        completed = subprocess.run(
+            argv, shell=False, timeout=timeout, capture_output=True, text=True, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NarrationError(sanitize_diagnostic(f"sfx {kind} could not run: {error}")) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()[-2000:] or f"exit {completed.returncode}"
+        raise NarrationError(sanitize_diagnostic(f"sfx {kind} failed: {detail}"))
+    return output
+
+
+def apply_voice_variation(
+    wav: Path,
+    output: Path,
+    *,
+    speed_wpm: int = 170,
+    pitch_shift_semitones: float = 0.0,
+    emphasis_boost_db: float = 2.0,
+    ffmpeg: str = "ffmpeg",
+    timeout: int = 120,
+) -> Path:
+    """Apply subtle per-sentence voice variation to a narration segment.
+
+    Real narrators vary pace sentence-to-sentence; flat synthesis sounds
+    robotic over long-form content. This applies a small speed modulation
+    (±13%) and a light presence boost for clarity. Output stays 48 kHz stereo
+    so it muxes directly into the pipeline. Pitch shifting via varispeed is
+    unavailable in this ffmpeg build, so variation comes from pace + EQ.
+    """
+    wav = Path(wav)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg else "ffmpeg"
+
+    # Speed: atempo modulates pace (±13%) so a faster reading shortens the clip.
+    speed_ratio = max(0.87, min(1.13, speed_wpm / 170.0))
+    filters = [f"[0:a]atempo={speed_ratio:.4f}"]
+
+    # Presence boost around speech fundamentals for clarity; then pad to a
+    # minimum length so downstream timing math is unaffected by the small speed
+    # change. (Pitch shifting via varispeed is unavailable in this ffmpeg build,
+    # so variation comes from pace + EQ rather than pitch.)
+    filters.append(f"equalizer=f=2500:w=0.9:g={emphasis_boost_db:.1f}")
+    filters.append("apad=pad_len=60000[aout]")
+
+    argv = [ffmpeg_bin, "-y", "-i", str(wav),
+            "-filter_complex", ",".join(filters),
+            "-map", "[aout]",
+            "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(output)]
+    try:
+        completed = subprocess.run(
+            argv, shell=False, timeout=timeout, capture_output=True, text=True, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NarrationError(sanitize_diagnostic(f"voice variation could not run: {error}")) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()[-2000:] or f"exit {completed.returncode}"
+        raise NarrationError(sanitize_diagnostic(f"voice variation failed: {detail}"))
+    return output

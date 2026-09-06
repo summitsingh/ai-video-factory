@@ -36,6 +36,44 @@ const starHash = (i: number): number => {
   return x - Math.floor(x);
 };
 
+// Deterministic per-scene seed derived from the scene id, so motion, pan
+// direction, and data-viz placement stay stable within a render while varying
+// between scenes (gives each scene its own "feel" instead of identical motion).
+const sceneSeed = (id: string): number => {
+  let h = 216613626;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 100000) / 100000; // 0..1
+};
+
+// Extract up to `limit` number+unit statistics from a string (e.g. "13.5
+// billion", "6.5 meters", "1.5 million km"). Returns [value, unit] pairs with
+// the raw numeric value so they can be rendered as animated bars.
+const extractStats = (text: string, limit = 3): Array<[number, string]> => {
+  const re = /(\d+(?:\.\d+)?)\s*(billion|million|trillion|lightyears?|kilometers?|km|meters?|seconds?|minutes?|hours?|days?|years?|°C|K)\b/gi;
+  const out: Array<[number, string]> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) && out.length < limit) {
+    const value = parseFloat(m[1]);
+    if (!Number.isNaN(value)) out.push([value, m[2].toLowerCase()]);
+  }
+  return out;
+};
+
+// Human-friendly unit label for a detected statistic.
+const formatUnit = (unit: string): string => {
+  const map: Record<string, string> = {
+    billion: 'B', million: 'M', trillion: 'T', lightyear: 'ly',
+    lightyears: 'ly', kilometer: 'km', kilometers: 'km', km: 'km',
+    meter: 'm', meters: 'm', second: 's', seconds: 's', minute: 'min',
+    minutes: 'min', hour: 'h', hours: 'h', day: 'd', days: 'd',
+    year: 'yr', years: 'yr',
+  };
+  return map[unit] || unit;
+};
+
 // Animated starfield: twinkling stars with slow parallax drift. Pure CSS, no
 // external assets. Adds depth behind title cards and subtle motion over media.
 const StarField = ({count = 90}: {count?: number}) => {
@@ -90,19 +128,28 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
     );
   }
   if (scene.image) {
-    const zoom = interpolate(frame, [0, scene.duration_frames], [1, 1.12], {
+    // Per-scene Ken Burns variation (#8): deterministic pan/zoom direction and
+    // speed derived from the scene id so stills never move identically.
+    const seed = sceneSeed(scene.id);
+    const zoom = interpolate(frame, [0, scene.duration_frames], [1, 1 + seed * 0.12], {
       extrapolateLeft: 'clamp',
       extrapolateRight: 'clamp',
     });
-    // Slow deliberate pan so stills feel alive (Ken Burns).
-    const panX = interpolate(frame, [0, scene.duration_frames], [-3, 3], {
-      extrapolateLeft: 'clamp',
-      extrapolateRight: 'clamp',
-    });
-    const panY = interpolate(frame, [0, scene.duration_frames], [-2, 2], {
-      extrapolateLeft: 'clamp',
-      extrapolateRight: 'clamp',
-    });
+    // Pan direction and magnitude vary per scene (seed drives sign/scale).
+    const panX = interpolate(
+      frame,
+      [0, scene.duration_frames],
+      [(1 - seed) * 6 - 3, seed * 6 - 3],
+      {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'},
+    );
+    const panY = interpolate(
+      frame,
+      [0, scene.duration_frames],
+      [-2, 2],
+      {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'},
+    );
+    // Slow ease so motion feels deliberate rather than linear.
+    const eased = Math.min(1, frame / scene.duration_frames);
     return (
       <AbsoluteFill>
         <Img
@@ -121,6 +168,212 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
     );
   }
   return null;
+};
+
+// Burned-in subtitle (#1): a legible caption anchored to the lower third that
+// fades in/out with the scene. Uses the explicit `subtitle` field when present,
+// falling back to the scene caption so every scene has one.
+const Subtitle = ({text}: {text: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const fadeIn = Math.min(15, text.length > 0 ? 15 : 0);
+  const enter = interpolate(frame, [0, fadeIn], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      <div
+        style={{
+          position: 'absolute',
+          bottom: height * 0.06,
+          left: width * 0.05,
+          right: width * 0.05,
+          textAlign: 'center',
+          opacity: enter,
+          transform: `translateY(${-8 * (1 - enter)}px)`,
+        }}
+      >
+        <div
+          style={{
+            display: 'inline-block',
+            backgroundColor: 'rgba(0, 0, 0, 0.72)',
+            borderRadius: 6,
+            padding: `${height * 0.01}px ${width * 0.03}px`,
+            color: '#f8fafc',
+            fontSize: Math.round(height * 0.03),
+            fontWeight: 500,
+            lineHeight: 1.35,
+            fontFamily: 'Arial, sans-serif',
+            textShadow: '0 1px 4px rgba(0,0,0,0.9)',
+          }}
+        >
+          {text}
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+
+// Picture-in-picture inset (#5): shows the scene's secondary asset (image when a
+// clip is primary, or vice versa) as a framed corner window with a subtle drop
+// shadow and entrance animation.
+const PictureInPicture = ({scene}: {scene: EditScene}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  if (!scene.clip && !scene.image) return null;
+  // Prefer the clip as primary (full-bleed); show image as inset. If only an
+  // image exists, show nothing extra to avoid duplicating full-bleed media.
+  const insetSrc = scene.clip ? scene.image : null;
+  if (!insetSrc) return null;
+
+  const size = Math.min(width, height) * 0.32;
+  const enter = interpolate(frame, [0, 30], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      <div
+        style={{
+          position: 'absolute',
+          top: height * 0.1,
+          right: width * 0.06,
+          width: `${size}px`,
+          height: `${size}px`,
+          opacity: enter,
+          transform: `scale(${0.8 + 0.2 * enter})`,
+        }}
+      >
+        <div
+          style={{
+            position: 'relative',
+            width: '100%',
+            height: '100%',
+            borderRadius: 8,
+            overflow: 'hidden',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+            border: '2px solid rgba(255,255,255,0.15)',
+          }}
+        >
+          <Img
+            src={toLocalSrc(insetSrc)}
+            style={{width: '100%', height: '100%', objectFit: 'cover'}}
+          />
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+
+// Animated data visualization (#7): renders detected statistics as horizontal
+// bars that fill on entry. Placed upper-left so it sits opposite the lower-third.
+const DataViz = ({text}: {text: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const stats = extractStats(text);
+  if (stats.length === 0) return null;
+
+  const enter = interpolate(frame, [0, 45], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  const barMaxWidth = Math.min(width * 0.32, 320);
+  // Normalize values so the largest fills to full width (log scale for readability).
+  const maxVal = Math.max(...stats.map(([v]) => v), 1);
+
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      <div
+        style={{
+          position: 'absolute',
+          top: height * 0.14,
+          left: width * 0.06,
+          backgroundColor: 'rgba(10, 18, 40, 0.78)',
+          border: '1px solid rgba(34, 211, 238, 0.4)',
+          borderRadius: 8,
+          padding: `${height * 0.015}px ${width * 0.025}px`,
+          opacity: enter,
+          transform: `translateX(${-16 * (1 - enter)}px)`,
+        }}
+      >
+        {stats.map(([value, unit], i) => (
+          <div key={i} style={{marginBottom: i < stats.length - 1 ? height * 0.012 : 0}}>
+            <div
+              style={{
+                color: '#94a3b8',
+                fontSize: Math.round(height * 0.02),
+                fontFamily: 'Arial, sans-serif',
+                marginBottom: 3,
+              }}
+            >
+              {formatUnit(unit)}
+            </div>
+            <div
+              style={{
+                width: `${barMaxWidth}px`,
+                height: 10,
+                backgroundColor: 'rgba(255,255,255,0.12)',
+                borderRadius: 5,
+                overflow: 'hidden',
+              }}
+            >
+              <div
+                style={{
+                  width: `${Math.min(100, (value / maxVal) * 100 * enter)}%`,
+                  height: '100%',
+                  backgroundColor: '#22d3ee',
+                  boxShadow: '0 0 8px rgba(34,211,238,0.7)',
+                }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </AbsoluteFill>
+  );
+};
+
+// Chapter markers (#6): a thin progress track with labeled dots marking each
+// scene boundary along the bottom edge, so long-form content feels navigable.
+const ChapterMarkers = ({scenes}: {scenes: EditScene[]}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const totalFrames = scenes.reduce((a, s) => a + s.duration_frames, 0);
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 0,
+          left: 0,
+          right: 0,
+          height: 4,
+          display: 'flex',
+          alignItems: 'stretch',
+        }}
+      >
+        {scenes.map((scene) => {
+          const frac = scene.duration_frames / totalFrames;
+          // Fade each marker in as its scene begins.
+          const sceneStart = scenes.slice(0, scenes.indexOf(scene)).reduce((a, s) => a + s.duration_frames, 0);
+          const appear = interpolate(frame - sceneStart, [0, 12], [0, 1], {
+            extrapolateLeft: 'clamp',
+            extrapolateRight: 'clamp',
+          });
+          return (
+            <div
+              key={scene.id}
+              style={{
+                width: `${frac * 100}%`,
+                backgroundColor: `rgba(34, 211, 238, ${0.5 * appear})`,
+              }}
+            />
+          );
+        })}
+      </div>
+    </AbsoluteFill>
+  );
 };
 
 const SceneCard = ({
@@ -192,6 +445,8 @@ const SceneCard = ({
       }}
     >
       <SceneMedia scene={scene} />
+      {/* Picture-in-picture inset (#5): secondary asset in a corner window */}
+      {scene.pip && <PictureInPicture scene={scene} />}
       {/* Animated starfield for depth behind title cards */}
       <StarField count={80} />
       {/* Cinematic vignette to focus the eye and add a filmic look */}
@@ -204,8 +459,16 @@ const SceneCard = ({
       />
       {/* Lower third: animated topic bar */}
       {scene.caption && <LowerThird text={scene.caption} />}
+      {/* Burned-in subtitle (#1): legible caption anchored to the lower area */}
+      {scene.subtitle ? (
+        <Subtitle text={scene.subtitle} />
+      ) : scene.caption ? (
+        <Subtitle text={scene.caption} />
+      ) : null}
       {/* Motion graphics: keyword-driven overlays (timeline/data/label) */}
       <MotionGraphics text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
+      {/* Data visualization (#7): animated bars for detected statistics */}
+      <DataViz text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
       <AbsoluteFill
         style={{
           alignItems: 'center',
@@ -675,6 +938,11 @@ export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
           />
         </Sequence>
       ))}
+      {/* Chapter markers (#6): full-composition progress track with per-scene
+          segments so long-form content feels navigable. */}
+      <Sequence durationInFrames={scenes.reduce((a, s) => a + s.duration_frames, 0)}>
+        <ChapterMarkers scenes={scenes} />
+      </Sequence>
       {/* Cross-dissolve transitions: fade the next scene in over the tail of
           the current one. Only valid within a chunk (boundaries hard-cut). */}
       {scenes.slice(0, -1).map((scene, index) => (

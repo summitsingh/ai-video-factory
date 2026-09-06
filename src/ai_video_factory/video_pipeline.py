@@ -21,7 +21,13 @@ from typing import Any, Literal
 from ai_video_factory.edit_schema import EditDocument, EditScene, load_edit, save_edit
 from ai_video_factory.lm_studio import LmStudioError
 from ai_video_factory.media_probe import MediaProbeError, probe_media
-from ai_video_factory.narration import NarrationError, mix_scenes_to_track, synthesize_to_wav
+from ai_video_factory.narration import (
+    NarrationError,
+    apply_voice_variation,
+    generate_sfx,
+    mix_scenes_to_track,
+    synthesize_to_wav,
+)
 from ai_video_factory.qc import evaluate_qc, write_qc_reports
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
 from ai_video_factory.run_store import RunStore
@@ -654,12 +660,16 @@ def _mux_narration_audio(
     *,
     ffmpeg: Path | None = None,
     music_track: Path | None = None,
+    sfx_track: Path | None = None,
 ) -> None:
-    """Mux the video with narration and optional ducked music bed.
+    """Mux the video with narration, ducked music, and sound design.
 
     When a music track is provided it is mixed at low volume and ducked via
     sidechain compression (narration triggers the compression), so the score
-    dips automatically whenever someone is speaking. The result is padded to
+    dips automatically whenever someone is speaking. An optional SFX track adds
+    transient effects (whooshes/drones) at scene boundaries. The final mix is
+    loudness-normalized to EBU R128 / YouTube (~-16 LUFS, -2 dBTP) so output
+    stays consistent and competitive in level (#2). The result is padded to
     match the video length, which governs output duration via -shortest.
 
     ffmpeg filter semantics: ``sidechaincompress`` takes [signal][sidechain],
@@ -675,6 +685,7 @@ def _mux_narration_audio(
     map_args: list[str] = ["-map", "0:v"]
     narr_idx: int | None = None
     music_idx: int | None = None
+    sfx_idx: int | None = None
 
     if narration_track is not None:
         inputs += ["-i", str(Path(narration_track).resolve())]
@@ -684,8 +695,13 @@ def _mux_narration_audio(
         inputs += ["-i", str(Path(music_track).resolve())]
         music_idx = len(inputs) // 2 - 1
 
+    if sfx_track is not None:
+        inputs += ["-i", str(Path(sfx_track).resolve())]
+        sfx_idx = len(inputs) // 2 - 1
+
     filter_parts: list[str] = []
 
+    # Step 1: duck the music under narration, then mix them -> [voice_music].
     if narr_idx is not None and music_idx is not None:
         # Duck the music using narration as the sidechain trigger. When
         # narration is loud, compress (lower) the music; when quiet, music
@@ -695,28 +711,46 @@ def _mux_narration_audio(
             f"[music_base][{narr_idx}:a]"
             "sidechaincompress=threshold=0.03:ratio=15:attack=20:release=250,"
             "acompressor=threshold=0.02:ratio=4[music_ducked];"
-            "[music_ducked]apad=pad_len=60000[music_padded];"
+            "[music_ducked]apad=pad_len=60000[music_padded]"
+        )
+        filter_parts.append(
             f"[{narr_idx}:a][music_padded]"
-            "amix=inputs=2:normalize=1[mix]"
+            "amix=inputs=2:normalize=1,aresample=48000[voice_music]"
         )
     elif narr_idx is not None:
         # Narration only (no music): pad to video length.
         filter_parts.append(
-            f"[{narr_idx}:a]apad=pad_len=60000,mix"
+            f"[{narr_idx}:a]apad=pad_len=60000,aresample=48000[voice_music]"
         )
     elif music_idx is not None:
         # Music only (no narration): lower volume, pad to video length.
         filter_parts.append(
-            f"[{music_idx}:a]volume=0.25,apad=pad_len=60000,mix"
+            f"[{music_idx}:a]volume=0.25,apad=pad_len=60000,aresample=48000[voice_music]"
         )
     else:
         # Neither track available: fall back to silent audio.
         _mux_silent_audio(source, destination, ffmpeg=ffmpeg)
         return
 
-    filter_chain = ";".join(filter_parts)
-    map_args += ["-map", "[mix]"]
-    argv = [ffmpeg_bin, "-y", *inputs, "-filter_complex", filter_chain,
+    # Step 2: mix in SFX if present -> [mix]. Otherwise pass narration/music
+    # through unchanged.
+    if sfx_idx is not None:
+        filter_parts.append(
+            f"[{sfx_idx}:a]volume=0.35,apad=pad_len=60000[sfx_padded];"
+            "[voice_music][sfx_padded]"
+            "amix=inputs=2:normalize=1[mix]"
+        )
+    else:
+        # Relabel the pad without a filter (anull is a no-op audio passthrough).
+        filter_parts.append("[voice_music]anull[mix]")
+
+    # Step 3: loudness normalization to a consistent broadcast level.
+    filter_parts.append(
+        "[mix]loudnorm=I=-16:TP=-2:LRA=7,aresample=48000[aout]"
+    )
+
+    map_args += ["-map", "[aout]"]
+    argv = [ffmpeg_bin, "-y", *inputs, "-filter_complex", ";".join(filter_parts),
             *map_args, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
             "-ar", "48000", "-ac", "2", "-shortest", str(destination)]
 
@@ -733,7 +767,9 @@ def _synthesize_narration_track(
     """Synthesize per-scene narration and mix into one padded track.
 
     Returns None when no scene carries speakable narration (caller falls
-    back to a silent track).
+    back to a silent track). Each scene's narration is given subtle pace
+    variation (#9 voice variation) so the narrator does not sound robotic
+    over long-form content.
     """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -741,13 +777,61 @@ def _synthesize_narration_track(
     for i, scene in enumerate(edit.scenes):
         if not scene.narration or not scene.narration.strip():
             continue
-        wav = workdir / f"scene-{i}.wav"
-        synthesize_to_wav(scene.narration, wav)
-        segments.append((wav, scene.from_frame / edit.fps))
+        raw_wav = workdir / f"scene-{i}.raw.wav"
+        synthesize_to_wav(scene.narration, raw_wav)
+        # Deterministic per-scene WPM variation (±12 wpm around 170) so pace
+        # shifts sentence-to-sentence without being distracting.
+        speed_wpm = 170 + ((i * 37 + len(scene.narration)) % 25) - 12
+        varied_wav = workdir / f"scene-{i}.wav"
+        apply_voice_variation(
+            raw_wav, varied_wav, speed_wpm=speed_wpm, ffmpeg=str(ffmpeg) if ffmpeg else "ffmpeg",
+        )
+        segments.append((varied_wav, scene.from_frame / edit.fps))
     if not segments:
         return None
     return mix_scenes_to_track(
         segments, workdir / "narration.wav",
+        ffmpeg=str(ffmpeg) if ffmpeg is not None else "ffmpeg",
+    )
+
+
+def _generate_sfx_track(
+    edit: EditDocument, workdir: Path, *, ffmpeg: Path | None = None
+) -> Path | None:
+    """Generate a sound-design track with effects at scene boundaries (#4).
+
+    A whoosh marks each normal scene cut, a low drone marks the intro->first
+    scene and last-scene->outro transitions, and a soft ping accompanies scenes
+    that reveal motion graphics. Returns None when there are no content scenes
+    to place effects between.
+    """
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg is not None else "ffmpeg"
+
+    # Only normal (content) scenes get boundary effects; intro/outro are the
+    # two ends of the content run.
+    content_indices = [
+        i for i, s in enumerate(edit.scenes) if s.kind == "normal"
+    ]
+    if len(content_indices) < 2:
+        return None
+
+    segments: list[tuple[Path, float]] = []
+    first, last = content_indices[0], content_indices[-1]
+    for idx in content_indices:
+        scene = edit.scenes[idx]
+        start = scene.from_frame / edit.fps
+        if idx == first:
+            kind = "drone"  # intro -> first scene
+        elif idx == last:
+            kind = "drone"  # last scene -> outro
+        else:
+            kind = "whoosh"  # interior cut
+        segments.append((generate_sfx(kind, workdir / f"sfx-{idx}.wav", ffmpeg=ffmpeg_bin), start))
+
+    return mix_scenes_to_track(
+        segments, workdir / "sfx.wav",
         ffmpeg=str(ffmpeg) if ffmpeg is not None else "ffmpeg",
     )
 
@@ -980,6 +1064,12 @@ def run_video_pipeline(
         # Normal content scenes.
         for i, scene_data in enumerate(script.scenes):
             span = base_frames + (1 if i < remainder else 0)
+            subtitle_text = scene_data.get("subtitle") or scene_data.get("caption", "")
+            # Enable picture-in-picture when the scene has both a clip and an
+            # image so the secondary asset can show as an inset.
+            pip_enabled = bool(scene_data.get("pip")) or (
+                bool(scene_data.get("clip")) and bool(scene_data.get("image"))
+            )
             scene = EditScene(
                 id=f"scene-{i}",
                 from_frame=cursor,
@@ -988,6 +1078,8 @@ def run_video_pipeline(
                 caption=scene_data.get("caption", ""),
                 visual=scene_data.get("visual"),
                 narration=scene_data.get("narration"),
+                subtitle=subtitle_text or None,
+                pip=pip_enabled,
             )
             scenes.append(scene)
             cursor += span
@@ -1106,12 +1198,22 @@ def run_video_pipeline(
                     ffmpeg=_required_tool(tools, "ffmpeg"),
                 )
                 metadata["music_status"] = "complete"
+                # Generate a sound-design track (whooshes/drones at scene
+                # boundaries) to complement narration and music (#4).
+                sfx_track = _generate_sfx_track(
+                    edit_doc_render,
+                    run_directory / "sfx",
+                    ffmpeg=_required_tool(tools, "ffmpeg"),
+                )
+                if sfx_track is not None:
+                    metadata["sfx_status"] = "complete"
                 _mux_narration_audio(
                     temporary_path,
                     narration_track,
                     run_master,
                     ffmpeg=_required_tool(tools, "ffmpeg"),
                     music_track=music_track,
+                    sfx_track=sfx_track,
                 )
                 temporary_path.unlink(missing_ok=True)
             else:

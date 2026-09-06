@@ -27,6 +27,14 @@ class EditScene(BaseModel):
     accent_color: str = Field(default="#22d3ee", description="Accent color in hex")
     image: str | None = Field(default=None, description="Local still image path (Ken Burns)")
     clip: str | None = Field(default=None, description="Local video clip path (muted bed)")
+    subtitle: str | None = Field(
+        default=None,
+        description="Burned-in caption text; falls back to caption when omitted",
+    )
+    pip: bool = Field(
+        default=False,
+        description="Show the scene's secondary asset as a picture-in-picture inset",
+    )
 
 
 class EditDocument(BaseModel):
