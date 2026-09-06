@@ -36,6 +36,39 @@ const toLocalSrc = (path: string): string => {
   return staticFile(path);
 };
 
+// Transient-text timing (in frames at 30fps): captions/labels/title cards fade
+// in briefly, hold for a couple of seconds, then clear so only the footage
+// remains on screen instead of text lingering for the whole scene.
+const TEXT_IN_FRAMES = 12; // ~0.4s fade-in
+const TEXT_HOLD_FRAMES = 60; // 2s visible
+const TEXT_OUT_FRAMES = 12; // ~0.4s fade-out
+
+// Opacity envelope: ramp from 0 to 1 over `inFrames`, hold at 1 for
+// `holdFrames`, then ramp back to 0 over `outFrames`. Returns exactly 0 once the
+// window elapses so transient overlays never stay on screen.
+const opacityEnvelope = (
+  frame: number,
+  inFrames: number,
+  holdFrames: number,
+  outFrames: number,
+): number => {
+  const peakEnd = inFrames;
+  const endHold = inFrames + holdFrames;
+  const endFade = endHold + outFrames;
+  if (frame < 0 || frame >= endFade) return 0;
+  if (frame < peakEnd) {
+    return interpolate(frame, [0, peakEnd], [0, 1], {
+      extrapolateLeft: 'clamp',
+      extrapolateRight: 'clamp',
+    });
+  }
+  if (frame < endHold) return 1;
+  return interpolate(frame, [endHold, endFade], [1, 0], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+};
+
 // Deterministic pseudo-random per star index so the field is stable across
 // frames within a scene but varied between scenes.
 const starHash = (i: number): number => {
@@ -434,10 +467,14 @@ const SceneCard = ({
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
   });
-  const captionIn = interpolate(frame, [fadeIn, fadeIn + 12], [0, 1], {
-    extrapolateLeft: 'clamp',
-    extrapolateRight: 'clamp',
-  });
+  // Transient-text envelope: all captions/labels/title cards fade in briefly,
+  // hold ~2s, then clear so only the footage remains on screen.
+  const textOpacity = opacityEnvelope(
+    frame,
+    TEXT_IN_FRAMES,
+    TEXT_HOLD_FRAMES,
+    TEXT_OUT_FRAMES,
+  );
 
   // Intro / outro scenes render as dedicated branded sequences.
   if (scene.kind === 'intro') {
@@ -472,111 +509,113 @@ const SceneCard = ({
           pointerEvents: 'none',
         }}
       />
-      {/* Lower third: animated topic bar */}
-      {scene.caption && <LowerThird text={scene.caption} />}
-      {/* Burned-in subtitle (#1): legible caption anchored to the lower area */}
-      {scene.subtitle ? (
-        <Subtitle text={scene.subtitle} />
-      ) : scene.caption ? (
-        <Subtitle text={scene.caption} />
-      ) : null}
-      {/* Motion graphics: keyword-driven overlays (timeline/data/label) */}
-      <MotionGraphics text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
-      {/* Data visualization (#7): animated bars for detected statistics */}
-      <DataViz text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
-      {/* Keyword lower-third (#10): proper-noun/place labels from narration */}
-      <KeywordLowerThird text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
-      {/* Animated map graphic (#5): location markers from narration keywords */}
-      <MapGraphic text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
-      <AbsoluteFill
-        style={{
-          alignItems: 'center',
-          display: 'flex',
-          flexDirection: 'column',
-          fontFamily: 'Arial, sans-serif',
-          justifyContent: 'center',
-          padding: '8% 10%',
-          textAlign: 'center',
-          transform: `translateY(${rise}px)`,
-        }}
-      >
-        <div
+      {/* Transient-text group: captions, lower thirds, motion graphics, data
+          viz, keyword labels, map graphic, title card and sources. All fade in
+          briefly, hold ~2s, then clear so only the footage remains on screen. */}
+      <AbsoluteFill style={{opacity: textOpacity, pointerEvents: 'none'}}>
+        {/* Lower third: animated topic bar */}
+        {scene.caption && <LowerThird text={scene.caption} />}
+        {/* Burned-in subtitle (#1): legible caption anchored to the lower area */}
+        {scene.subtitle ? (
+          <Subtitle text={scene.subtitle} />
+        ) : scene.caption ? (
+          <Subtitle text={scene.caption} />
+        ) : null}
+        {/* Motion graphics: keyword-driven overlays (timeline/data/label) */}
+        <MotionGraphics text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
+        {/* Data visualization (#7): animated bars for detected statistics */}
+        <DataViz text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
+        {/* Keyword lower-third (#10): proper-noun/place labels from narration */}
+        <KeywordLowerThird text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
+        {/* Animated map graphic (#5): location markers from narration keywords */}
+        <MapGraphic text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
+        <AbsoluteFill
           style={{
-            color: '#22d3ee',
-            fontSize: Math.max(20, Math.round(height * 0.032)),
-            fontWeight: 700,
-            letterSpacing: '0.35em',
-            marginBottom: Math.round(height * 0.03),
+            alignItems: 'center',
+            display: 'flex',
+            flexDirection: 'column',
+            fontFamily: 'Arial, sans-serif',
+            justifyContent: 'center',
+            padding: '8% 10%',
+            textAlign: 'center',
+            transform: `translateY(${rise}px)`,
           }}
         >
-          PART {index + 1} OF {total}
-          {scene.narration ? '  ·  NARRATED' : ''}
-        </div>
-        <div
-          style={{
-            color: scene.text_color ?? '#f8fafc',
-            fontSize: Math.max(44, Math.round(height * 0.095)),
-            fontWeight: 800,
-            letterSpacing: '-0.03em',
-            lineHeight: 1.08,
-            maxWidth: '85%',
-            textShadow: '0 2px 12px rgba(0,0,0,0.7)',
-          }}
-        >
-          {scene.title}
-        </div>
-        <div
-          style={{
-            backgroundColor: scene.accent_color ?? '#22d3ee',
-            height: Math.max(6, Math.round(height * 0.01)),
-            margin: `${Math.round(height * 0.03)}px auto 0`,
-            width: '16%',
-          }}
-        />
-        <div
-          style={{
-            color: '#e2e8f0',
-            fontSize: Math.max(24, Math.round(height * 0.042)),
-            letterSpacing: '0.02em',
-            lineHeight: 1.3,
-            marginTop: Math.round(height * 0.03),
-            maxWidth: '80%',
-            opacity: captionIn,
-          }}
-        >
-          {scene.caption}
-        </div>
-        {scene.visual && (
           <div
             style={{
-              color: '#64748b',
-              fontSize: Math.max(15, Math.round(height * 0.024)),
-              fontStyle: 'italic',
-              marginTop: Math.round(height * 0.02),
-              opacity: captionIn,
+              color: '#22d3ee',
+              fontSize: Math.max(20, Math.round(height * 0.032)),
+              fontWeight: 700,
+              letterSpacing: '0.35em',
+              marginBottom: Math.round(height * 0.03),
             }}
           >
-            {scene.visual}
+            PART {index + 1} OF {total}
+            {scene.narration ? '  ·  NARRATED' : ''}
+          </div>
+          <div
+            style={{
+              color: scene.text_color ?? '#f8fafc',
+              fontSize: Math.max(44, Math.round(height * 0.095)),
+              fontWeight: 800,
+              letterSpacing: '-0.03em',
+              lineHeight: 1.08,
+              maxWidth: '85%',
+              textShadow: '0 2px 12px rgba(0,0,0,0.7)',
+            }}
+          >
+            {scene.title}
+          </div>
+          <div
+            style={{
+              backgroundColor: scene.accent_color ?? '#22d3ee',
+              height: Math.max(6, Math.round(height * 0.01)),
+              margin: `${Math.round(height * 0.03)}px auto 0`,
+              width: '16%',
+            }}
+          />
+          <div
+            style={{
+              color: '#e2e8f0',
+              fontSize: Math.max(24, Math.round(height * 0.042)),
+              letterSpacing: '0.02em',
+              lineHeight: 1.3,
+              marginTop: Math.round(height * 0.03),
+              maxWidth: '80%',
+            }}
+          >
+            {scene.caption}
+          </div>
+          {scene.visual && (
+            <div
+              style={{
+                color: '#64748b',
+                fontSize: Math.max(15, Math.round(height * 0.024)),
+                fontStyle: 'italic',
+                marginTop: Math.round(height * 0.02),
+              }}
+            >
+              {scene.visual}
+            </div>
+          )}
+        </AbsoluteFill>
+        {isLast && sources && sources.length > 0 && (
+          <div
+            style={{
+              bottom: '4%',
+              color: '#475569',
+              fontFamily: 'Arial, sans-serif',
+              fontSize: Math.max(13, Math.round(height * 0.02)),
+              left: '8%',
+              position: 'absolute',
+              right: '8%',
+              textAlign: 'center',
+            }}
+          >
+            Sources: {sources.join('  ·  ').slice(0, 160)}
           </div>
         )}
       </AbsoluteFill>
-      {isLast && sources && sources.length > 0 && (
-        <div
-          style={{
-            bottom: '4%',
-            color: '#475569',
-            fontFamily: 'Arial, sans-serif',
-            fontSize: Math.max(13, Math.round(height * 0.02)),
-            left: '8%',
-            opacity: captionIn,
-            position: 'absolute',
-            right: '8%',
-            textAlign: 'center',
-          }}
-        >
-          Sources: {sources.join('  ·  ').slice(0, 160)}
-        </div>
-      )}
     </AbsoluteFill>
   );
 };
