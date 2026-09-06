@@ -271,12 +271,26 @@ def cache_assets_for_remotion(
     remotion_public: Path,
 ) -> None:
     """Copy scene assets to Remotion's public directory for rendering.
-    
+
     The remotion render spawns a process that copies files from its own
     public directory. We copy all scene media there beforehand so they
     are available during rendering.
+
+    Stale ``scene-*`` files left over from previous runs are removed first,
+    because the per-scene naming scheme means an old clip/image for a given
+    scene would otherwise shadow (or be shadowed by) the current one. Oversized
+    clips are re-encoded down to a browser-friendly size so Chrome can decode
+    them without exhausting memory or timing out during render.
     """
     remotion_public.mkdir(parents=True, exist_ok=True)
+    # Remove stale per-scene media from prior runs (clips + images).
+    for stale in list(remotion_public.glob("scene-*")):
+        if stale.is_file() and (stale.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png", ".webp")):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
     for idx, scene_dir in enumerate(sorted(assets_dir.glob("scene-*"))):
         if not scene_dir.is_dir():
             continue
@@ -284,8 +298,7 @@ def cache_assets_for_remotion(
         # own media file (see attach_scene_assets).
         for clip in sorted(scene_dir.glob("*clip*.mp4")):
             dst = remotion_public / f"scene-{idx:02d}-clip{clip.suffix}"
-            if not dst.exists():
-                shutil.copy2(clip, dst)
+            _ensure_clip_ready(clip, dst)
         # Copy images using a scene-specific name. Prefer the first image so it
         # matches what attach_scene_assets stored; copy any extras too.
         for img in sorted(scene_dir.glob("*")):
@@ -294,6 +307,45 @@ def cache_assets_for_remotion(
             dst = remotion_public / f"scene-{idx:02d}-image{img.suffix}"
             if not dst.exists():
                 shutil.copy2(img, dst)
+
+
+def _ensure_clip_ready(src: Path, dst: Path, *, max_bytes: int = 80_000_000) -> None:
+    """Copy ``src`` to ``dst``, re-encoding oversized clips for browser playback.
+
+    NASA video files can be hundreds of MB at high bitrate/resolution; Chrome's
+    decoder struggles with those during a long looping render. If the source is
+    already small enough we copy it verbatim, otherwise we re-encode to H.264 at
+    720p with a modest bitrate so it decodes quickly and stays under ``max_bytes``.
+    """
+    if dst.exists():
+        return
+    try:
+        size = src.stat().st_size
+    except OSError:
+        shutil.copy2(src, dst)
+        return
+    if size <= max_bytes:
+        shutil.copy2(src, dst)
+        return
+    ffmpeg_bin = "ffmpeg"
+    argv = [
+        ffmpeg_bin, "-y", "-i", str(src),
+        # Downscale to 720p and cap bitrate so the clip is browser-friendly.
+        "-vf", "scale='min(1280,iw)':-2",
+        "-b:v", "3M", "-maxrate", "4M", "-bufsize", "6M",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-shortest",
+        str(dst),
+    ]
+    try:
+        subprocess.run(
+            argv, cwd=dst.parent, shell=False, timeout=600,
+            capture_output=True, text=True, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Fall back to a verbatim copy so we never lose the asset entirely.
+        shutil.copy2(src, dst)
 
 
 def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocument:
@@ -1211,6 +1263,9 @@ def run_video_pipeline(
             try:
                 nasa_summary = populate_assets_from_nasa(edit_doc, internal_assets)
                 metadata["nasa_assets"] = nasa_summary
+                # Assign to job.assets_dir so the render phase copies these
+                # assets into Remotion's public directory (see below).
+                job.assets_dir = internal_assets
                 assets_dir_used = internal_assets
             except Exception as error:  # noqa: BLE001 - best-effort; keep title cards on failure
                 metadata["nasa_assets"] = {"error": sanitize_diagnostic(error)}
