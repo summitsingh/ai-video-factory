@@ -230,6 +230,9 @@ def lm_studio_extract_claims(
         if cls not in {"confirmed fact", "reported claim", "estimate", "opinion", "analysis/speculation"}:
             cls = "reported claim"
         pairs.append((text, cls))  # type: ignore[arg-type] - cls normalized above
+    if not pairs:
+        # Deggraded/non-conforming model output must not silently drop all claims.
+        raise RuntimeError("LM Studio extractor produced no extractable claims")
     return pairs
 
 
