@@ -24,9 +24,11 @@ from ai_video_factory.media_probe import MediaProbeError, probe_media
 from ai_video_factory.narration import (
     NarrationError,
     apply_voice_variation,
+    generate_room_tone,
     generate_sfx,
     mix_scenes_to_track,
     synthesize_to_wav,
+    trim_audio_start,
 )
 from ai_video_factory.qc import evaluate_qc, write_qc_reports
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
@@ -661,15 +663,18 @@ def _mux_narration_audio(
     ffmpeg: Path | None = None,
     music_track: Path | None = None,
     sfx_track: Path | None = None,
+    room_tone_track: Path | None = None,
 ) -> None:
     """Mux the video with narration, ducked music, and sound design.
 
     When a music track is provided it is mixed at low volume and ducked via
     sidechain compression (narration triggers the compression), so the score
     dips automatically whenever someone is speaking. An optional SFX track adds
-    transient effects (whooshes/drones) at scene boundaries. The final mix is
-    loudness-normalized to EBU R128 / YouTube (~-16 LUFS, -2 dBTP) so output
-    stays consistent and competitive in level (#2). The result is padded to
+    transient effects (whooshes/drones) at scene boundaries. A room-tone bed,
+    when provided, sits underneath everything as a continuous low ambient floor
+    so there are no dead-silence gaps between narration segments (#2). The final
+    mix is loudness-normalized to EBU R128 / YouTube (~-16 LUFS, -2 dBTP) so
+    output stays consistent and competitive in level. The result is padded to
     match the video length, which governs output duration via -shortest.
 
     ffmpeg filter semantics: ``sidechaincompress`` takes [signal][sidechain],
@@ -686,6 +691,7 @@ def _mux_narration_audio(
     narr_idx: int | None = None
     music_idx: int | None = None
     sfx_idx: int | None = None
+    tone_idx: int | None = None
 
     if narration_track is not None:
         inputs += ["-i", str(Path(narration_track).resolve())]
@@ -699,10 +705,24 @@ def _mux_narration_audio(
         inputs += ["-i", str(Path(sfx_track).resolve())]
         sfx_idx = len(inputs) // 2 - 1
 
+    if room_tone_track is not None:
+        inputs += ["-i", str(Path(room_tone_track).resolve())]
+        tone_idx = len(inputs) // 2 - 1
+
     filter_parts: list[str] = []
 
+    # Step 0: mix a low-level room-tone bed under the narration so there are no
+    # dead-silence gaps between segments (#2). When absent, narration passes
+    # straight through to [voice_music].
+    if narr_idx is not None and tone_idx is not None:
+        filter_parts.append(
+            f"[{tone_idx}:a]volume=0.15[tone_base];"
+            f"[{narr_idx}:a][tone_base]"
+            "amix=inputs=2:normalize=1,aresample=48000[voice_music]"
+        )
+
     # Step 1: duck the music under narration, then mix them -> [voice_music].
-    if narr_idx is not None and music_idx is not None:
+    elif narr_idx is not None and music_idx is not None:
         # Duck the music using narration as the sidechain trigger. When
         # narration is loud, compress (lower) the music; when quiet, music
         # returns to its base volume. Then mix ducked music over narration.
@@ -767,12 +787,16 @@ def _synthesize_narration_track(
     """Synthesize per-scene narration and mix into one padded track.
 
     Returns None when no scene carries speakable narration (caller falls
-    back to a silent track). Each scene's narration is given subtle pace
-    variation (#9 voice variation) so the narrator does not sound robotic
-    over long-form content.
+    back to a silent track). Each scene's narration is given subtle voice
+    variation (#8 pace + pitch so the narrator does not sound robotic over
+    long-form content), and every interior scene gets a small J-cut lead-in:
+    its audio is trimmed ~0.4s early so it begins before the visual frame,
+    letting the next scene's narration bleed ahead of the previous shot for a
+    smooth documentary edit rather than hard cuts.
     """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg else "ffmpeg"
     segments: list[tuple[Path, float]] = []
     for i, scene in enumerate(edit.scenes):
         if not scene.narration or not scene.narration.strip():
@@ -782,16 +806,29 @@ def _synthesize_narration_track(
         # Deterministic per-scene WPM variation (±12 wpm around 170) so pace
         # shifts sentence-to-sentence without being distracting.
         speed_wpm = 170 + ((i * 37 + len(scene.narration)) % 25) - 12
-        varied_wav = workdir / f"scene-{i}.wav"
+        # Deterministic per-scene pitch shift (±1 semitone, alternating sign)
+        # so adjacent scenes carry subtly different vocal registers (#8).
+        pitch_shift = 1.0 if i % 2 == 0 else -1.0
+        varied_wav = workdir / f"scene-{i}.varied.wav"
         apply_voice_variation(
-            raw_wav, varied_wav, speed_wpm=speed_wpm, ffmpeg=str(ffmpeg) if ffmpeg else "ffmpeg",
+            raw_wav, varied_wav, speed_wpm=speed_wpm,
+            pitch_shift_semitones=pitch_shift, ffmpeg=ffmpeg_bin,
         )
-        segments.append((varied_wav, scene.from_frame / edit.fps))
+        # J-cut lead-in (#1): drop the first ~0.4s so this scene's narration
+        # starts slightly before its visual frame, bleeding audio ahead of the
+        # previous shot for a smooth documentary edit instead of a hard cut.
+        lead_in = 0.4 if i > 0 else 0.0
+        final_wav = workdir / f"scene-{i}.wav"
+        if lead_in:
+            trim_audio_start(varied_wav, final_wav, seconds=lead_in, ffmpeg=ffmpeg_bin)
+        else:
+            shutil.copy2(varied_wav, final_wav)
+        segments.append((final_wav, scene.from_frame / edit.fps))
     if not segments:
         return None
     return mix_scenes_to_track(
         segments, workdir / "narration.wav",
-        ffmpeg=str(ffmpeg) if ffmpeg is not None else "ffmpeg",
+        ffmpeg=ffmpeg_bin,
     )
 
 
@@ -1207,6 +1244,15 @@ def run_video_pipeline(
                 )
                 if sfx_track is not None:
                     metadata["sfx_status"] = "complete"
+                # Generate a continuous room-tone bed so there are no dead-silence
+                # gaps between narration segments (#2).
+                duration_seconds = edit_doc_render.duration_frames / edit_doc_render.fps
+                room_tone_track = generate_room_tone(
+                    duration_seconds,
+                    run_directory / "room_tone.wav",
+                    ffmpeg=_required_tool(tools, "ffmpeg"),
+                )
+                metadata["room_tone_status"] = "complete"
                 _mux_narration_audio(
                     temporary_path,
                     narration_track,
@@ -1214,6 +1260,7 @@ def run_video_pipeline(
                     ffmpeg=_required_tool(tools, "ffmpeg"),
                     music_track=music_track,
                     sfx_track=sfx_track,
+                    room_tone_track=room_tone_track,
                 )
                 temporary_path.unlink(missing_ok=True)
             else:

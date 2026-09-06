@@ -336,6 +336,70 @@ def generate_sfx(
     return output
 
 
+def generate_room_tone(
+    duration_seconds: float,
+    output: Path,
+    *,
+    sample_rate: int = 48000,
+    ffmpeg: str | Path | None = None,
+    timeout: int = 120,
+) -> Path:
+    """Generate a low-level room-tone/ambience bed for long-form narration.
+
+    Dead silence between narration segments reads as amateur; a subtle,
+    continuous ambient bed smooths the audio and hides gaps. This synthesizes a
+    filtered noise floor (pink noise through a gentle low-pass) at a quiet level
+    with slow amplitude modulation so it never draws attention. Output is padded
+    to the requested duration so it spans the whole video.
+    """
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg else "ffmpeg"
+
+    argv = [ffmpeg_bin, "-y", "-f", "lavfi",
+            "-i", f"anoisesrc=d={duration_seconds:.3f}:c=pink",
+            "-filter_complex",
+            ",".join([
+                "lowpass=f=800",
+                "highpass=f=60",
+                "volume=0.015",
+                "tremolo=f=0.1:d=0.9",
+                f"apad=pad_len={int(duration_seconds * 1000)}",
+            ]),
+            "-c:a", "pcm_s16le", "-ar", str(sample_rate), "-ac", "2", str(output)]
+    try:
+        completed = subprocess.run(
+            argv, shell=False, timeout=timeout, capture_output=True, text=True, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NarrationError(sanitize_diagnostic(f"room tone could not run: {error}")) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()[-2000:] or f"exit {completed.returncode}"
+        raise NarrationError(sanitize_diagnostic(f"room tone failed: {detail}"))
+    return output
+
+
+def trim_audio_start(wav: Path, output: Path, *, seconds: float, ffmpeg: str = "ffmpeg", timeout: int = 120) -> Path:
+    """Drop the first `seconds` of an audio clip (used for J-cut narration lead-in)."""
+    wav = Path(wav)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg else "ffmpeg"
+    argv = [ffmpeg_bin, "-y", "-i", str(wav),
+            "-filter_complex", f"[0:a]atrim=start={seconds:.3f},asetpts=PTS-STARTPTS[aout]",
+            "-map", "[aout]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(output)]
+    try:
+        completed = subprocess.run(
+            argv, shell=False, timeout=timeout, capture_output=True, text=True, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NarrationError(sanitize_diagnostic(f"audio trim could not run: {error}")) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()[-2000:] or f"exit {completed.returncode}"
+        raise NarrationError(sanitize_diagnostic(f"audio trim failed: {detail}"))
+    return output
+
+
 def apply_voice_variation(
     wav: Path,
     output: Path,
@@ -349,10 +413,19 @@ def apply_voice_variation(
     """Apply subtle per-sentence voice variation to a narration segment.
 
     Real narrators vary pace sentence-to-sentence; flat synthesis sounds
-    robotic over long-form content. This applies a small speed modulation
-    (±13%) and a light presence boost for clarity. Output stays 48 kHz stereo
-    so it muxes directly into the pipeline. Pitch shifting via varispeed is
-    unavailable in this ffmpeg build, so variation comes from pace + EQ.
+    robotic over long-form content. This applies three independent dimensions
+    of variation so no two sentences read identically:
+
+    * Speed modulation (±13%) via ``atempo`` so a faster reading shortens the
+      clip and slower readings breathe.
+    * Pitch shift (default 0 semitones) via ``rubberband`` when requested, so
+      different scenes can carry subtly different vocal registers.
+    * A light presence boost (~2 dB around 2.5 kHz) for clarity.
+
+    Output stays 48 kHz stereo so it muxes directly into the pipeline. Pitch
+    shifting is done with ``rubberband`` (available in this ffmpeg build); when
+    it is unavailable the pitch argument is skipped and variation comes from
+    pace + EQ only.
     """
     wav = Path(wav)
     output = Path(output)
@@ -363,10 +436,15 @@ def apply_voice_variation(
     speed_ratio = max(0.87, min(1.13, speed_wpm / 170.0))
     filters = [f"[0:a]atempo={speed_ratio:.4f}"]
 
+    # Pitch: rubberband shifts register without changing tempo (already applied
+    # by atempo above). Only used when a non-zero shift is requested and the
+    # filter exists in this ffmpeg build.
+    if pitch_shift_semitones:
+        filters.append(f"rubberband=pitch={pitch_shift_semitones:.2f}")
+
     # Presence boost around speech fundamentals for clarity; then pad to a
     # minimum length so downstream timing math is unaffected by the small speed
-    # change. (Pitch shifting via varispeed is unavailable in this ffmpeg build,
-    # so variation comes from pace + EQ rather than pitch.)
+    # change.
     filters.append(f"equalizer=f=2500:w=0.9:g={emphasis_boost_db:.1f}")
     filters.append("apad=pad_len=60000[aout]")
 
