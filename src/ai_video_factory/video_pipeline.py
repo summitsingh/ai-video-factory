@@ -35,6 +35,7 @@ from ai_video_factory.research import TrendingTopic, research_trending_topics, s
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
 from ai_video_factory.subtitle_export import write_subtitles
+from ai_video_factory.thumbnail import build_thumbnails, validate_thumbnails
 from ai_video_factory.script_generator import ScriptOutput, generate_script
 
 
@@ -1356,6 +1357,25 @@ def run_video_pipeline(
 
         artifacts["master"] = str(job.master_path)
         artifacts["draft"] = str(output_dir / "master.mp4")
+
+        # Step 4.6: Generate YouTube thumbnails from the finished master. These
+        # are written next to the output so they can be attached to a publish
+        # step later; nothing is uploaded here. Best-effort — a thumbnail
+        # failure must not fail an otherwise-passing render.
+        try:
+            thumb_artifacts = build_thumbnails(
+                edit_doc,
+                job.master_path,
+                output_dir / "thumbnails",
+                count=3,
+            )
+            artifacts["thumbnail_1"] = str(thumb_artifacts["thumbnail_1"])
+            artifacts["thumbnail_2"] = str(thumb_artifacts["thumbnail_2"])
+            artifacts["thumbnail_3"] = str(thumb_artifacts["thumbnail_3"])
+            metadata["thumbnail_status"] = "complete"
+        except Exception as error:  # noqa: BLE001 - thumbnails are best-effort
+            metadata["thumbnail_status"] = f"failed: {sanitize_diagnostic(error)}"
+
         metadata["render_status"] = "complete"
 
         # Step 5: Run quality checks
