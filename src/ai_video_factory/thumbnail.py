@@ -230,11 +230,12 @@ def _extract_iconic_frame(
     tmp_dir = frame_path.parent / ".thumb_frames"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     try:
-        # One frame every 2 seconds from t=5s to the end.
+        # Extract one frame every 2 seconds at full master resolution (avoiding
+        # the blur that came from upscaling a small extracted frame).
         cmd = [
             "ffmpeg", "-y",
             "-i", str(master),
-            "-vf", "fps=1/2,scale=480:-1",
+            "-vf", "fps=1/2,scale=-1:720",
             "-vsync", "0",
             str(tmp_dir / "frame-%04d.png"),
         ]
