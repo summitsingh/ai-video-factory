@@ -14,6 +14,18 @@ export type EditScene = {
   clip?: string;
   subtitle?: string;
   pip?: boolean;
+  voice?: string;
+  transition?: 'dissolve' | 'cut' | 'fade';
+  // Long-form fields (Phase 3). Optional with defaults so existing short-form
+  // documents continue to validate. Durations are in seconds.
+  start_seconds?: number;
+  duration_seconds?: number;
+  claim_ids?: string[];
+  editorial_purpose?: 'hook' | 'evidence' | 'explanation' | 'transition' | 'payoff';
+  visual_brief?: string;
+  asset_queries?: string[];
+  asset_strategy?: 'licensed_clip' | 'licensed_image' | 'public_domain' | 'map' | 'chart' | 'generated_visual' | 'source_excerpt';
+  on_screen_text?: string;
 };
 
 export type EditDocument = {
@@ -75,7 +87,7 @@ const parseScene = (value: unknown): EditScene => {
   }
   assertExactKeys(
     value,
-    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'kind', 'visual', 'narration', 'background', 'text_color', 'accent_color', 'image', 'clip', 'subtitle', 'pip'],
+    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'kind', 'visual', 'narration', 'background', 'text_color', 'accent_color', 'image', 'clip', 'subtitle', 'pip', 'voice', 'transition', 'start_seconds', 'duration_seconds', 'claim_ids', 'editorial_purpose', 'visual_brief', 'asset_queries', 'asset_strategy', 'on_screen_text'],
     'scene',
   );
 
@@ -97,6 +109,22 @@ const parseScene = (value: unknown): EditScene => {
     clip: typeof value.clip === 'string' ? value.clip : undefined,
     subtitle: typeof value.subtitle === 'string' ? value.subtitle : undefined,
     pip: value.pip === true,
+    voice: typeof value.voice === 'string' ? value.voice : undefined,
+    transition: value.transition === 'dissolve' || value.transition === 'cut' || value.transition === 'fade'
+      ? value.transition
+      : undefined,
+    start_seconds: typeof value.start_seconds === 'number' ? value.start_seconds : 0,
+    duration_seconds: typeof value.duration_seconds === 'number' ? value.duration_seconds : undefined,
+    claim_ids: Array.isArray(value.claim_ids) ? (value.claim_ids as string[]) : undefined,
+    editorial_purpose: ['hook', 'evidence', 'explanation', 'transition', 'payoff'].includes(value.editorial_purpose as string)
+      ? (value.editorial_purpose as EditScene['editorial_purpose'])
+      : undefined,
+    visual_brief: typeof value.visual_brief === 'string' ? value.visual_brief : undefined,
+    asset_queries: Array.isArray(value.asset_queries) ? (value.asset_queries as string[]) : undefined,
+    asset_strategy: ['licensed_clip', 'licensed_image', 'public_domain', 'map', 'chart', 'generated_visual', 'source_excerpt'].includes(value.asset_strategy as string)
+      ? (value.asset_strategy as EditScene['asset_strategy'])
+      : undefined,
+    on_screen_text: typeof value.on_screen_text === 'string' ? value.on_screen_text : undefined,
   };
 };
 
