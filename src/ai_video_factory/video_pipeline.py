@@ -917,6 +917,50 @@ def _run_command(argv: Sequence[str], *, cwd: Path, name: str, timeout: int = 18
         raise PipelineCommandError(sanitize_diagnostic(f"{name} failed: {detail}"))
 
 
+def _polish_master(
+    source: Path,
+    destination: Path,
+    *,
+    ffmpeg: Path | None = None,
+) -> None:
+    """Apply final visual polish to the muxed master (#3 film grain, #9 letterboxing).
+
+    Re-encodes the already-muxed master with two subtle, professional touches:
+
+    * Letterboxing (#9): crops 16:9 down to a cinematic ~2.39:1 and adds black
+      bars top/bottom so the frame reads as film rather than flat video.
+    * Film grain (#3): a very fine ``grain`` overlay ties disparate shots into a
+      single cohesive look and kills the "slideshow" feel of clean digital media.
+
+    The source is left untouched; the polished result is written to destination.
+    """
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = str(ffmpeg) if ffmpeg is not None else "ffmpeg"
+
+    # Letterbox: scale up, crop a ~2.386:1 band, then scale back down so black
+    # bars appear top/bottom (the output aspect keeps YouTube's player consistent).
+    # Then add subtle film grain via the `noise` filter (this ffmpeg build has no
+    # `grain` filter) to tie disparate shots into one cohesive look.
+    argv = [ffmpeg_bin, "-y", "-i", str(source),
+            "-filter_complex",
+            "[0:v]scale=w='trunc(ih*2.39/2)*2':h=720,"
+            "crop=1720:720:(iw-1720)/2:0,scale=1280:-1,"
+            "noise=alls=6:allf=t+u[v]",
+            "-map", "[v]", "-c:v", "libx264",
+            "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-r", "30",
+            "-map", "0:a", "-c:a", "copy",
+            str(destination)]
+    _run_command(
+        tuple(argv),
+        cwd=destination.parent,
+        name="FFmpeg master polish (grain + letterbox)",
+        timeout=600,
+    )
+
+
 def _validate_master(
     master_path: Path,
     fixture: Path,
@@ -1262,6 +1306,17 @@ def run_video_pipeline(
                     sfx_track=sfx_track,
                     room_tone_track=room_tone_track,
                 )
+                # Apply final visual polish (#3 film grain, #9 letterboxing) to
+                # the muxed master. Polish into a temp file then move it over
+                # run_master so the artifact path stays consistent for QC.
+                polished_path = run_directory / "master.polished.mp4"
+                _polish_master(
+                    run_master,
+                    polished_path,
+                    ffmpeg=_required_tool(tools, "ffmpeg"),
+                )
+                shutil.move(str(polished_path), str(run_master))
+                metadata["polish_status"] = "complete"
                 temporary_path.unlink(missing_ok=True)
             else:
                 render(job.edit_path, run_master)
