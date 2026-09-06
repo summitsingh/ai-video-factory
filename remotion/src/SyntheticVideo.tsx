@@ -16,11 +16,18 @@ const BACKGROUNDS = [
   'linear-gradient(135deg, #073d2a 0%, #000000 100%)',
 ];
 
-// Cinematic color grade applied to all media: modest contrast lift, slight
-// saturation roll-off and a cool shadow / warm highlight split-tone give raw
-// stock footage a cohesive, filmic look instead of flat HDR video-game colors.
-const COLOR_GRADE_FILTER =
-  'contrast(1.07) saturate(0.92) brightness(0.97) hue-rotate(-2deg)';
+// Per-scene color grade (#6): derive a small, deterministic variation on the
+// base grade from the scene seed so adjacent shots don't look identical — real
+// colorists grade each shot toward a consistent target but with per-shot
+// nuance. Contrast/saturation/brightness shift within a narrow band so the
+// overall look stays cohesive while no two scenes match exactly.
+const perSceneGrade = (seed: number): string => {
+  const contrast = 1.04 + seed * 0.06; // 1.04..1.10
+  const saturate = 0.89 + seed * 0.07; // 0.89..0.96
+  const brightness = 0.95 + seed * 0.05; // 0.95..1.00
+  const hueRotate = -2 + (seed - 0.5) * 4; // -4..0 deg
+  return `contrast(${contrast.toFixed(3)}) saturate(${saturate.toFixed(3)}) brightness(${brightness.toFixed(3)}) hue-rotate(${hueRotate.toFixed(1)}deg)`;
+};
 
 const toLocalSrc = (path: string): string => {
   if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('file://')) {
@@ -113,6 +120,9 @@ const StarField = ({count = 90}: {count?: number}) => {
 const SceneMedia = ({scene}: {scene: EditScene}) => {
   const frame = useCurrentFrame();
   if (scene.clip) {
+    // Per-scene color grade (#6): deterministic per-shot nuance so adjacent
+    // shots don't look identical while the overall filmic target stays cohesive.
+    const seed = sceneSeed(scene.id);
     return (
       <AbsoluteFill>
         <OffthreadVideo
@@ -121,8 +131,8 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
           src={toLocalSrc(scene.clip)}
           style={{height: '100%', objectFit: 'cover', width: '100%'}}
         />
-        {/* Color grade + subtle darkening so text stays legible over footage. */}
-        <AbsoluteFill style={{filter: COLOR_GRADE_FILTER}} />
+        {/* Color grade over the footage for a consistent filmic look. */}
+        <AbsoluteFill style={{filter: perSceneGrade(seed)}} />
         <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.55)'}} />
       </AbsoluteFill>
     );
@@ -150,6 +160,10 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
     );
     // Slow ease so motion feels deliberate rather than linear.
     const eased = Math.min(1, frame / scene.duration_frames);
+    // Motion blur (#4): apply a subtle Gaussian blur while the pan/zoom is in
+    // progress so moving stills feel cinematic instead of jittery/strobey. The
+    // blur fades out as movement completes at the end of the scene.
+    const moving = Math.sin((frame / scene.duration_frames) * Math.PI); // 0..1..0 across scene
     return (
       <AbsoluteFill>
         <Img
@@ -159,10 +173,11 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
             objectFit: 'cover',
             transform: `translate(${panX}px, ${panY}px) scale(${zoom})`,
             width: '100%',
+            filter: `blur(${moving * 1.2}px)`,
           }}
         />
         {/* Color grade over the still image for a consistent filmic look. */}
-        <AbsoluteFill style={{filter: COLOR_GRADE_FILTER}} />
+        <AbsoluteFill style={{filter: perSceneGrade(seed)}} />
         <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.55)'}} />
       </AbsoluteFill>
     );
@@ -469,6 +484,10 @@ const SceneCard = ({
       <MotionGraphics text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
       {/* Data visualization (#7): animated bars for detected statistics */}
       <DataViz text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
+      {/* Keyword lower-third (#10): proper-noun/place labels from narration */}
+      <KeywordLowerThird text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
+      {/* Animated map graphic (#5): location markers from narration keywords */}
+      <MapGraphic text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
       <AbsoluteFill
         style={{
           alignItems: 'center',
@@ -558,6 +577,125 @@ const SceneCard = ({
           Sources: {sources.join('  ·  ').slice(0, 160)}
         </div>
       )}
+    </AbsoluteFill>
+  );
+};
+
+// Keyword lower-third (#10): detects proper nouns and place names in the
+// narration/caption/title and renders them as animated labels at the bottom of
+// frame, so key entities are visually identified without schema changes.
+const KEYWORD_LOWER_THIRDS = [
+  {pattern: /\b(JWST|James Webb Space Telescope)\b/i, label: 'JWST'},
+  {pattern: /\b(Sun)\b/i, label: 'The Sun'},
+  {pattern: /\b(Earth)\b/i, label: 'Earth'},
+  {pattern: /\b(Lagrange L2|Lagrange point|Sun Earth L2)\b/i, label: 'Lagrange L2 Point'},
+  {pattern: /\b(Vera Rubin Observatory)\b/i, label: 'Vera Rubin Observatory'},
+  {pattern: /\b(Mars)\b/i, label: 'Mars'},
+  {pattern: /\b(Galaxy)\b/i, label: 'Galaxy'},
+  {pattern: /\b(Cosmic Web|filaments)\b/i, label: 'Cosmic Web'},
+];
+
+const KeywordLowerThird = ({text}: {text: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const match = KEYWORD_LOWER_THIRDS.find((k) => k.pattern.test(text));
+  if (!match) return null;
+
+  const enter = interpolate(frame, [0, 18], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      <div
+        style={{
+          position: 'absolute',
+          bottom: height * 0.2,
+          left: width * 0.06,
+          opacity: enter,
+          transform: `translateX(${-12 * (1 - enter)}px)`,
+        }}
+      >
+        <div
+          style={{
+            backgroundColor: 'rgba(15, 23, 42, 0.85)',
+            border: '1px solid rgba(148, 163, 184, 0.4)',
+            borderRadius: 6,
+            padding: `${height * 0.005}px ${width * 0.02}px`,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+          }}
+        >
+          <div
+            style={{
+              color: '#94a3b8',
+              fontSize: Math.round(height * 0.018),
+              fontWeight: 600,
+              letterSpacing: '0.05em',
+              textTransform: 'uppercase',
+            }}
+          >
+            {match.label}
+          </div>
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+
+// Animated map graphic (#5): renders a simple stylized location marker when
+// place keywords are detected in the narration, so viewers can follow where
+// things happen. No schema changes required — keyword-driven only.
+const MAP_KEYWORDS = [
+  {pattern: /\b(Sun)\b/i, x: 0.2, y: 0.3},
+  {pattern: /\b(Earth)\b/i, x: 0.35, y: 0.45},
+  {pattern: /\b(Mars)\b/i, x: 0.5, y: 0.4},
+  {pattern: /\b(Lagrange L2|Lagrange point|Sun Earth L2)\b/i, x: 0.65, y: 0.35},
+  {pattern: /\b(Vera Rubin Observatory|Chile)\b/i, x: 0.25, y: 0.7},
+];
+
+const MapGraphic = ({text}: {text: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const match = MAP_KEYWORDS.find((k) => k.pattern.test(text));
+  if (!match) return null;
+
+  const enter = interpolate(frame, [0, 30], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  const dotX = match.x * width;
+  const dotY = match.y * height;
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      {/* Simple map background */}
+      <div
+        style={{
+          position: 'absolute',
+          top: height * 0.1,
+          left: width * 0.1,
+          width: `${width * 0.8}px`,
+          height: `${height * 0.8}px`,
+          backgroundColor: 'rgba(15, 23, 42, 0.6)',
+          border: '1px solid rgba(148, 163, 184, 0.3)',
+          borderRadius: 8,
+          opacity: enter * 0.9,
+        }}
+      />
+      {/* Animated location dot */}
+      <div
+        style={{
+          position: 'absolute',
+          left: `${dotX}px`,
+          top: `${dotY}px`,
+          width: 12,
+          height: 12,
+          borderRadius: '50%',
+          backgroundColor: '#22d3ee',
+          boxShadow: '0 0 16px rgba(34,211,238,0.8)',
+          opacity: enter,
+          transform: `scale(${enter})`,
+        }}
+      />
     </AbsoluteFill>
   );
 };
