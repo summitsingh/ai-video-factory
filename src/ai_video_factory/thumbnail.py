@@ -361,6 +361,12 @@ def _apply_scrim(frame: Image.Image, *, strength: float = 0.55) -> Image.Image:
     return Image.composite(frame, Image.new("RGB", frame.size, (0, 0, 0)), overlay)
 
 
+def _measure_text(text: str, font: ImageFont.FreeTypeFont) -> tuple[int, int]:
+    """Return ``(width, height)`` of ``text`` under ``font`` without drawing."""
+    bbox = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox((0, 0), text, font=font)
+    return int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
+
+
 def _composite_title(
     frame: Image.Image,
     title: str,
@@ -381,7 +387,7 @@ def _composite_title(
     base_size = int(height * 0.12)
     font = _load_font_bold(max(24, base_size))
 
-    text_w, text_h = _draw_text_box(draw, (0, 0), hook, font, fill=accent)
+    text_w, text_h = _measure_text(hook, font)
 
     # Position: bottom-center with padding, or top-center for a variant.
     pad = int(height * 0.06)
