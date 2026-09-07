@@ -196,5 +196,48 @@ def video_pipeline(
         raise typer.Exit(code=2)
 
 
+@app.command("daily")
+def daily(
+    topic: str | None = typer.Option(None, "--topic", "-t", help="Fixed topic to research (skips trend discovery)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what a run would do; no network or rendering"),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Resume completed production stages from a prior run"),
+    json_output: bool = typer.Option(False, "--json", help="Output result as JSON"),
+) -> None:
+    """Run the daily production job (operator-scheduled, local only).
+
+    Discovers a trending topic, researches it with verified facts, builds a
+    15-20 minute documentary candidate, runs final QC on real artifacts, and
+    produces an upload-ready package pending explicit human approval. No system
+    cron or service is created; schedule this command yourself.
+    """
+    from ai_video_factory.daily_job import JobConfig, run_daily_job
+
+    try:
+        project_root = Path(__file__).resolve().parents[2]
+        config = JobConfig(dry_run=dry_run)
+        if topic:
+            config.topic_override = topic
+        result = run_daily_job(project_root, config=config)
+    except Exception as error:
+        from ai_video_factory.sanitization import sanitize_diagnostic
+
+        typer.echo(sanitize_diagnostic(error), err=True)
+        raise typer.Exit(code=2)
+
+    if json_output:
+        typer.echo(json.dumps(result.to_dict(), indent=2))
+    else:
+        typer.echo(f"Run ID: {result.run_id or '(dry-run)'}")
+        typer.echo(f"Status: {result.status}")
+        typer.echo(f"Topic: {result.topic}")
+        if result.gates_passed and result.approval_path:
+            typer.echo(f"Approval package: {result.approval_path}")
+        elif result.failure_reason:
+            typer.echo(f"Failed: {result.failure_reason}")
+
+    if result.status != "completed":
+        raise typer.Exit(code=2)
+
+
 if __name__ == "__main__":
     app()

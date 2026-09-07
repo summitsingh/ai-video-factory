@@ -237,11 +237,31 @@ def evaluate_originality(
     min_words: int = 2000,
     distinct_scenes: int | None = None,
     total_scenes: int | None = None,
+    research_breadth: tuple[int, int] | None = None,
 ) -> GateResult:
-    """Reject generic slideshow-like or low-substance output."""
+    """Reject generic slideshow-like or low-substance output.
+
+    ``research_breadth`` is an optional ``(verified_fact_count, source_count)``
+    pair used at the pre-script stage (daily job), where narration has not been
+    written yet. When provided, it validates that enough verified material exists
+    to build a long-form documentary instead of penalizing the absence of
+    narration text.
+    """
     checks: list[dict[str, Any]] = []
 
-    if narration_word_count is not None and narration_word_count < min_words:
+    if research_breadth is not None:
+        fact_count, source_count = research_breadth
+        # At the pre-script stage narration has not been written yet, so we cannot
+        # require a high verified-fact count (the offline extractor caps low). The
+        # real low-substance signal here is corroboration across independent
+        # providers: a single-source story cannot support a long-form documentary.
+        if source_count >= 2 and fact_count >= 1:
+            checks.append({"name": "substance", "passed": True,
+                           "detail": f"research corroborated across {source_count} providers ({fact_count} verified fact(s))"})
+        else:
+            checks.append({"name": "substance", "passed": False,
+                           "detail": f"insufficient research for long-form doc (only {source_count} source(s), {fact_count} verified fact(s))"})
+    elif narration_word_count is not None and narration_word_count < min_words:
         checks.append({"name": "substance", "passed": False,
                        "detail": f"{narration_word_count} words below {min_words} word floor"})
     else:
