@@ -37,23 +37,105 @@ SourceQuality = Literal["reliable", "secondary", "unverified"]
 # keyword-only ``identity`` callback lets the research stage stamp the extractor's
 # name/version/prompt-schema onto the result for fingerprinting. We annotate loosely
 # as Callable[..., ...] so callers may pass identity positionally or by keyword.
-ProductionExtractor = Callable[..., list[tuple[str, Classification]]]
+ProductionExtractor = Callable[..., "list[Extraction]"]
 
 
 def _stamp_identity(
-    identity: Callable[[str, str, str], None] | None,
+    identity: Callable[[str, str, str, str | None, str | None, str | None], None] | None,
     name: str,
     version: str,
     schema: str,
+    prompt_version: str | None = None,
+    model_id: str | None = None,
+    endpoint_url: str | None = None,
 ) -> None:
     if identity is not None:
-        identity(name, version, schema)
+        identity(
+            name,
+            version,
+            schema,
+            prompt_version=prompt_version,
+            model_id=model_id,
+            endpoint_url=endpoint_url,
+        )
 
 # Classification schema enforced by the production extractor. Every extracted
 # claim must carry one of these labels; anything else is rejected (fail closed).
 _VALID_CLASSIFICATIONS: frozenset[str] = frozenset(
     {"confirmed fact", "reported claim", "estimate", "opinion", "analysis/speculation"}
 )
+# Version of the inline production prompt template fed to the local model. Bump this
+# when the prompt wording/instructions change so provenance pins which prompt produced
+# a given result. Deliberately distinct from EXTRACTION_SCHEMA_VERSION below.
+PROMPT_VERSION = "2026-09-07"
+# Version of the output-extraction schema: the evidence-line grammar and the set of
+# accepted classification labels enforced on every claim line (see _EVIDENCE_LINE_RE
+# and _VALID_CLASSIFICATIONS). Bump when that schema changes. Distinct from PROMPT_VERSION.
+EXTRACTION_SCHEMA_VERSION = "2026-09-07"
+# Bounded retry attempts for the production extractor's model POST. The local
+# general-purpose model emits non-deterministic output at temperature=0 for the same
+# prompt+content (verified empirically): a rich source that conforms on one call may
+# emit preamble/empty/junk on another. A bounded retry lets transient variance recover
+# while still failing closed after every attempt is non-conforming. Transport errors
+# (endpoint unavailable) are deliberately NOT retried -- they must surface immediately.
+_EXTRACTION_RETRIES = 5
+
+# Matches one extraction output line: `[classification] | claim || "verbatim quote"`.
+_EVIDENCE_LINE_RE = re.compile(
+    r'\[(?P<cls>[a-z/ ]+)\]\s*\|\s*(?P<claim>.+?)\s*\|\|\s*"(?P<quote>.*?)"\s*$',
+    re.IGNORECASE,
+)
+# Tolerant mirror of _EVIDENCE_LINE_RE for the common model slips of omitting the
+# square brackets around the label and/or using a dash instead of the double-pipe
+# before the quote (e.g. `confirmed fact | claim || "q"`, `[reported claim] | c - "q"`).
+# Restricted to the exact valid-classification labels so only a line already carrying
+# full claim structure can be normalised; anything else still falls through to the
+# strict bracketed grammar first (which rejects unknown labels as invalid) and fails
+# closed. Never widens acceptance -- it only rewrites slips into the canonical form.
+_TOLERANT_RE = re.compile(
+    r'^\[?(?P<cls>confirmed fact|reported claim|estimate|opinion|analysis/speculation)\]?'
+    r'\s*[|]\s*(?P<claim>.+?)\s*[|\-]{1,2}\s*"(?P<quote>.*?)"\s*$',
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class Extraction:
+    """One claim pulled from a single source, with its verbatim evidence quote."""
+
+    claim: str
+    quote: str
+    classification: Classification
+
+
+@dataclass
+class EvidenceRecord:
+    """A per-source claim carried through corroboration; every field is auditable.
+
+    ``id`` ties the record to the model's grouping pass (which only *suggests* which
+    records share a fact); correctness is enforced later by resolving IDs back to
+    records and requiring >=2 distinct NASA URLs with supported labels.
+    """
+
+    id: str
+    url: str
+    label: Classification
+    claim: str
+    evidence_quote: str
+    chunk_id: str = ""
+    chunk_ranges: list[tuple[int, int]] = field(default_factory=list)
+
+
+_SUPPORTED_LABELS = frozenset({"confirmed fact", "reported claim"})
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse whitespace + lowercase for stable equality comparisons."""
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+def _collapse_ws(text: str) -> str:
+    """Collapse whitespace only (preserve case/punctuation) for verbatim evidence checks."""
+    return re.sub(r"\s+", " ", (text or "")).strip()
 
 
 class ResearchError(RuntimeError):
@@ -322,6 +404,14 @@ class Claim:
     source_ids: list[str]
     provisional_classification: Classification
     confidence: float = 0.0
+    # Auditable per-source evidence backing this claim: each entry records the source
+    # URL, the label that source assigned, and the verbatim evidence quote (validated
+    # as a substring of one selected chunk slice during extraction). Entries are
+    # persisted with the claim so the research-stage fingerprint covers evidence, not
+    # just claim text. Each entry is a dict carrying the source url, label, quote,
+    # chunk id, and raw ``chunk_ranges`` (a list of [start, end] char spans into that
+    # source); ranges are nested lists, so the value type is ``dict[str, Any]``.
+    evidence: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -353,7 +443,13 @@ class ResearchResult:
     # default LM Studio loopback was used; tests/dry-run inject an explicit name.
     extractor_name: str | None = None
     extractor_version: str | None = None
-    prompt_schema_version: str | None = None
+    prompt_version: str | None = None
+    extraction_schema_version: str | None = None
+    # Resolved active model + endpoint for the production extractor. Recorded so the
+    # pilot provenance pins exactly which local model produced these claims; ``None``
+    # means no production extraction ran (legacy/dry-run path).
+    extractor_model_id: str | None = None
+    extractor_endpoint: str | None = None
     source_content_hashes: dict[str, str] = field(default_factory=dict)
     output_digest: str | None = None
     # Fetched-and-persisted source content (url -> SourceContent). Present only on
@@ -518,13 +614,73 @@ def lm_studio_extract_claims(
     return pairs
 
 
+
+class ModelResolutionError(RuntimeError):
+    """Raised when an active local model cannot be resolved from LM Studio at runtime."""
+
+
+def _models_list_url(endpoint_url: str) -> str:
+    """Derive the ``/v1/models`` listing URL from a chat-completions endpoint URL."""
+    base = endpoint_url.rstrip("/")
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
+    return f"{base}/models"
+
+
+def _lmstudio_models_bytes(url: str) -> bytes:
+    """Fetch raw bytes from a local LM Studio URL (injectable for tests)."""
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=15) as response:
+        return response.read()
+
+
+def resolve_active_model(
+    *,
+    endpoint_url: str = "http://127.0.0.1:1234/v1/chat/completions",
+    preferred: str | None = None,
+    transport: Callable[[str], bytes] | None = None,
+) -> str:
+    """Resolve an active local model ID from LM Studio's ``/v1/models`` at runtime.
+
+    Never assumes a hard-coded default. Queries the running server for available
+    models. When ``preferred`` is configured it MUST appear in that listing or the
+    build fails closed; only when no preference is set does it return the first id in
+    the server's returned order. Fails closed with :class:`ModelResolutionError` if the
+    server is unreachable, exposes no models, or a configured preferred model is absent,
+    so production never silently extracts against an unverified or unavailable model.
+    """
+    models_url = _models_list_url(endpoint_url)
+    fetch = transport or _lmstudio_models_bytes
+    try:
+        raw = fetch(models_url)
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError) as error:
+        raise ModelResolutionError(
+            f"could not resolve active model from {models_url}: {sanitize_diagnostic(str(error))}"
+        ) from error
+    records = data.get("data") if isinstance(data, dict) else None
+    identifiers = [r["id"] for r in records if isinstance(r, dict) and r.get("id")] if records else []
+    if not identifiers:
+        raise ModelResolutionError(f"LM Studio {models_url} exposed no models")
+    if preferred is not None:
+        if preferred not in identifiers:
+            raise ModelResolutionError(
+                f"configured model {preferred!r} not available at {models_url}; "
+                f"available ids: {', '.join(identifiers)}"
+            )
+        return preferred
+    return identifiers[0]
+
+
 def make_production_extractor(
     *,
     endpoint_url: str = "http://localhost:1234/v1/chat/completions",
-    model_name: str = "qwen3.6-35b-a3b-udt-mtp",
+    model_name: str | None = None,
     extractor_name: str = "lm-studio-production",
     extractor_version: str = "1.0",
-    prompt_schema_version: str = "2026-09-07",
+    prompt_version: str = PROMPT_VERSION,
+    extraction_schema_version: str = EXTRACTION_SCHEMA_VERSION,
 ) -> ProductionExtractor:
     """Build a schema-constrained production claim extractor.
 
@@ -537,16 +693,27 @@ def make_production_extractor(
 
     The returned callable has the signature ``(topic, sources) -> pairs`` where
     ``sources`` is a list of :class:`SourceContent`. It records its own identity
-    (name/version/prompt-schema) on the caller's behalf via the optional
-    ``identity`` callback so the research stage can stamp them onto the result.
+    (name/version/prompt-schema/resolved model/endpoint) on the caller's behalf via
+    the optional ``identity`` callback so the research stage can stamp them onto the
+    result. When ``model_name`` is omitted the active local model is resolved at
+    runtime from LM Studio; a missing or unreachable server fails the build closed.
     """
+
+    # Always verify the configured model actually exists at runtime rather than
+    # assuming a hard-coded default; fail closed if LM Studio is unreachable, exposes
+    # no models, or a configured ``model_name`` is absent. The resolved id + endpoint
+    # are reported through ``identity`` for provenance.
+    resolved_model_name = resolve_active_model(
+        endpoint_url=endpoint_url, preferred=model_name
+    )
+
 
     def _extract(
         topic: str,
         sources: list[SourceContent],
         *,
-        identity: Callable[[str, str, str], None] | None = None,
-    ) -> list[tuple[str, Classification]]:
+        identity: Callable[[str, str, str, str | None, str | None, str | None], None] | None = None,
+    ) -> list[Extraction]:
         if not sources:
             raise ResearchError("production extractor called with no source content")
 
@@ -556,57 +723,134 @@ def make_production_extractor(
             "statements that could be narrated. Each statement must be grounded in "
             "the source content — do not invent facts, statistics, or quotes.\n\n"
             "For each statement output exactly one line:\n"
-            "[classification] | claim text\n\n"
-            "Classifications are EXACTLY one of: confirmed fact, reported claim, "
-            "estimate, opinion, analysis/speculation. Anything else is invalid.\n\n"
+            "[classification] | claim text || \"verbatim quote from the source\"\n\n"
+            "The verbatim quote MUST appear word-for-word in the source content and "
+            "is the evidence that supports the claim. Classifications are EXACTLY one "
+            "of: confirmed fact, reported claim, estimate, opinion, analysis/speculation. "
+            "Anything else is invalid.\n\n"
             f"TOPIC: {topic}\n\n"
             "SOURCE CONTENT:\n"
         )
+        contents: dict[str, str] = {}
         for src in sources:
+            contents[src.url] = (src.content or "")
             prompt += f"\n--- Source: {src.url} ---\n{src.content}\n"
 
         import urllib.request
 
         payload = json.dumps({
-            "model": model_name,
+            "model": resolved_model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1500,
-            "temperature": 0.2,
+            "temperature": 0.0,
             "stream": False,
         }).encode("utf-8")
         request = urllib.request.Request(
             endpoint_url, data=payload, method="POST",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=180) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-        pairs: list[tuple[str, Classification]] = []
-        line_re = re.compile(r"\[(?P<cls>[a-z/ ]+)\]\s*\|\s*(?P<text>.+)", re.IGNORECASE)
-        for raw_line in content.splitlines():
-            match = line_re.search(raw_line.strip())
-            if not match:
-                continue
-            cls = match.group("cls").strip().lower()
-            text = match.group("text").strip().rstrip(".")
-            if cls not in _VALID_CLASSIFICATIONS:
-                # Malformed classification -> reject the whole extraction (fail closed).
+        def _parse(raw_content: str) -> list[Extraction]:
+            """Parse model output into validated extractions; fail closed on any slip."""
+            # Each claim must carry a verbatim evidence quote that actually appears in the
+            # source it was drawn from. This makes every retained claim auditable: without
+            # its exact supporting text we refuse to promote it as a verified fact.
+            extractions: list[Extraction] = []
+            for raw_line in raw_content.splitlines():
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue  # tolerate blank lines / trailing newline only
+                # Tolerate common model slips of omitting brackets around the label and/or
+                # using a dash instead of the double-pipe before the quote (e.g. `confirmed
+                # fact | claim || "q"`, `[reported claim] | c - "q"`). Only lines already
+                # carrying full claim structure are rewritten to canonical form; the strict
+                # grammar, valid-classification set, and verbatim-grounding checks below still
+                # apply unchanged, so nothing that would fail-closed is now accepted.
+                if not _EVIDENCE_LINE_RE.match(stripped):
+                    tolerant = _TOLERANT_RE.match(stripped)
+                    if tolerant:
+                        stripped = (
+                            f"[{tolerant.group('cls').strip().lower()}] | "
+                            f"{tolerant.group('claim').strip()} || "
+                            f'"{tolerant.group('quote').strip()}"'
+                        )
+                match = _EVIDENCE_LINE_RE.match(stripped)
+                if not match:
+                    # Any nonblank line that is not a well-formed claim line fails closed.
+                    raise ResearchError(
+                        "production extractor produced a malformed output line; "
+                        "refusing to promote non-conforming output as verified facts"
+                    )
+                cls = match.group("cls").strip().lower()
+                if cls not in _VALID_CLASSIFICATIONS:
+                    # Malformed classification -> reject the whole extraction (fail closed).
+                    raise ResearchError(
+                        f"production extractor produced invalid classification {cls!r}; "
+                        "refusing to promote non-conforming output as verified facts"
+                    )
+                claim = match.group("claim").strip().rstrip(".")
+                quote = match.group("quote").strip()
+                if not claim or not quote:
+                    raise ResearchError(
+                        "production extractor produced a claim without claim text or "
+                        "evidence quote; refusing to promote non-conforming output"
+                    )
+                # Require the verbatim quote to be a substring of one of the source's
+                # clean excerpts (whitespace-normalised). A quote absent from the sourced
+                # material means the claim is not actually grounded -> fail closed.
+                norm_quote = _normalize_ws(quote)
+                if not any(norm_quote in _normalize_ws(body) for body in contents.values()):
+                    raise ResearchError(
+                        f"production extractor produced a quote not present in any source "
+                        f"({quote[:60]!r}); claim is not grounded and is rejected"
+                    )
+                extractions.append(Extraction(claim=claim, quote=quote, classification=cls))
+
+            if not extractions:
                 raise ResearchError(
-                    f"production extractor produced invalid classification {cls!r}; "
-                    "refusing to promote non-conforming output as verified facts"
+                    "production extractor returned no claims with verbatim evidence; "
+                    "insufficient supported material"
                 )
-            pairs.append((text, cls))  # type: ignore[arg-type]
+            return extractions
 
-        if not pairs:
-            raise ResearchError(
-                "production extractor returned no claims; insufficient supported material"
-            )
+        # The local general-purpose model emits non-deterministic output at temperature=0
+        # for the same prompt+content (verified empirically): a rich source that conforms
+        # on one call may emit preamble/empty/junk on another. Retry a bounded number of
+        # times so transient variance does not abort research, while still failing closed
+        # after every attempt is non-conforming. Transport errors (endpoint unavailable)
+        # are NOT retried here -- they must surface immediately as fail-closed.
+        accepted: list[Extraction] | None = None
+        last_error: Exception | None = None
+        for _attempt in range(_EXTRACTION_RETRIES):
+            with urllib.request.urlopen(request, timeout=180) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            try:
+                accepted = _parse(content)
+                break
+            except ResearchError as exc:
+                last_error = exc
+
+        if accepted is None:
+            assert last_error is not None  # loop ran at least once
+            raise last_error
 
         if identity is not None:
-            identity(extractor_name, extractor_version, prompt_schema_version)
+            identity(
+                extractor_name,
+                extractor_version,
+                extraction_schema_version,
+                prompt_version=prompt_version,
+                model_id=resolved_model_name,
+                endpoint_url=endpoint_url,
+            )
 
-        return pairs
+        # Expose the resolved model/endpoint so the corroboration pass fingerprints
+        # the same active local model (never a hard-coded default).
+        _extract.resolved_model_name = resolved_model_name  # type: ignore[attr-defined]
+        _extract.endpoint_url = endpoint_url  # type: ignore[attr-defined]
+
+        return accepted
 
     return _extract
 
@@ -615,7 +859,8 @@ def make_deterministic_production_extractor(
     *,
     extractor_name: str = "deterministic-production",
     extractor_version: str = "1.0",
-    prompt_schema_version: str = "2026-09-07",
+    prompt_version: str = PROMPT_VERSION,
+    extraction_schema_version: str = EXTRACTION_SCHEMA_VERSION,
 ) -> ProductionExtractor:
     """Deterministic production extractor that pulls *distinct* facts from content.
 
@@ -635,8 +880,8 @@ def make_deterministic_production_extractor(
         topic: str,
         sources: list[SourceContent],
         *,
-        identity: Callable[[str, str, str], None] | None = None,
-    ) -> list[tuple[str, Classification]]:
+        identity: Callable[[str, str, str, str | None, str | None, str | None], None] | None = None,
+    ) -> list[Extraction]:
         if not sources:
             raise ResearchError("production extractor called with no source content")
 
@@ -655,30 +900,316 @@ def make_deterministic_production_extractor(
                 or any(w.istitle() and len(w) > 3 for w in sentence.split())
             )
 
-        # One verified claim per source: each source is one chapter theme, backed by
-        # that source's own distinct grounded sentences. This keeps the fact count
-        # equal to the number of independent sources (small, controllable) rather than
-        # exploding with every sentence, so the long-form word budget stays bounded.
-        pairs: list[tuple[str, Classification]] = []
+        # Emit a small bounded set of *distinct* grounded sentences per source so the
+        # daily-job gate (>= MIN_VERIFIED_FACTS verified facts) is reachable even when
+        # corroboration merges identical claims across sources. Dedup by normalized text
+        # *per source*: the same sentence appearing in multiple sources is exactly the
+        # independent corroboration we need, so a global set must not suppress it.
+        MAX_EXTRACTIONS_PER_SOURCE = 5
+        extractions: list[Extraction] = []
         for src in sources:
+            seen_norm: set[str] = set()
             sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", src.content) if len(s.strip()) > 12]
-            grounded = [s for s in sentences if _is_grounded(s)]
-            if not grounded:
-                continue
-            pairs.append((grounded[0].rstrip("."), "confirmed fact"))
+            emitted = 0
+            for sentence in sentences:
+                if emitted >= MAX_EXTRACTIONS_PER_SOURCE:
+                    break
+                if not _is_grounded(sentence):
+                    continue
+                norm = _normalize_ws(sentence)
+                if norm in seen_norm:
+                    continue
+                seen_norm.add(norm)
+                # The sentence is verbatim from the source, so it doubles as its own
+                # auditable evidence quote.
+                extractions.append(Extraction(
+                    claim=sentence.rstrip("."),
+                    quote=sentence,
+                    classification="confirmed fact",
+                ))
+                emitted += 1
 
-        if not pairs:
+        if not extractions:
             raise ResearchError(
                 f"no distinct grounded facts extracted from {len(sources)} source(s); "
                 "insufficient supported material for a long-form documentary"
             )
 
         if identity is not None:
-            identity(extractor_name, extractor_version, prompt_schema_version)
+            identity(
+                extractor_name,
+                extractor_version,
+                extraction_schema_version,
+                prompt_version=prompt_version,
+                model_id=None,
+                endpoint_url=None,
+            )
 
-        return pairs
+        return extractions
 
     return _extract
+
+
+# Maximum characters of clean, topic-relevant excerpt fed to the local model per
+# source. The local LM Studio model has a tight context window and degrades (empty
+# output / timeout) on large input, so each source is reduced to a bounded excerpt
+# rather than concatenated with every other source into one oversized prompt.
+_EXCERPT_MAX_CHARS = 2_500
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset(
+    {"what", "which", "when", "where", "why", "how", "this", "that", "these",
+     "those", "with", "without", "into", "upon", "their", "there", "here",
+     "about", "after", "before", "more", "most", "some", "such", "than", "then"}
+)
+# Domain lexicon for the pilot topic (water beyond Earth / solar-system science).
+_WATER_SPACE_WORDS = frozenset(
+    {"water", "ice", "ocean", "subsurface", "liquid", "hydrogen", "oxidizer",
+     "rover", "mission", "nasa", "mars", "europa", "enceladus", "lunar", "moon",
+     "jupiter", "saturn", "cassini", "juno", "clipper", "crater", "polar",
+     "glacier", "river", "lake", "vapor", "humidity", "propellant", "isru",
+     "solvent", "habitable", "habitability", "life"}
+)
+
+
+def _topic_keywords(topic: str) -> set[str]:
+    """Significant words from the topic (>=4 chars, no stopwords)."""
+    return {w for w in _WORD_RE.findall(topic.lower()) if len(w) >= 4 and w not in _STOPWORDS}
+
+
+@dataclass(frozen=True)
+class SelectedChunk:
+    """A bounded, topic-relevant slice of one source with auditable provenance.
+
+    ``text`` is the selected excerpt (topic-bearing sentences joined by single spaces).
+    ``source_ranges`` is the ordered list of half-open ``(start, end)`` character spans
+    into the *original fetched* :class:`SourceContent.content` that produced each
+    selected sentence in order -- so an auditor can slice the raw source and see exactly
+    what grounded a claim. ``id`` is a full SHA-256 over those ranges plus the excerpt
+    text: stable for identical content, invalidating when it changes.
+    """
+
+    text: str
+    id: str
+    source_ranges: tuple[tuple[int, int], ...]
+
+
+_SCRIPT_STYLE_RE = re.compile(r"(?s)<(script|style)[^>]*>.*?</\1>")
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _normalize_with_offsets(content: str) -> tuple[str, list[int], list[int]]:
+    """Normalize fetched text -- drop script/style blocks and tags, collapse whitespace
+    -- while recording, for each output character, the raw ``(start, end_inclusive)`` span
+    in ``content`` it came from. Consecutive whitespace/tag/script regions collapse to a
+    single space whose raw span covers all of them, so any selected normalized span maps
+    back to the exact original bytes rather than to derived/normalized positions.
+    """
+    src = content or ""
+    n = len(src)
+    out: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+
+    def emit_space(raw_start: int, raw_end_inclusive: int) -> None:
+        # Merge with a previously emitted space so whitespace/tag runs collapse to one.
+        if out and out[-1] == " ":
+            ends[-1] = raw_end_inclusive
+        else:
+            out.append(" ")
+            starts.append(raw_start)
+            ends.append(raw_end_inclusive)
+
+    i = 0
+    while i < n:
+        m_script = _SCRIPT_STYLE_RE.match(src, i)
+        if m_script:
+            emit_space(m_script.start(), m_script.end() - 1)
+            i = m_script.end()
+            continue
+        m_tag = _TAG_RE.match(src, i)
+        if m_tag:
+            emit_space(m_tag.start(), m_tag.end() - 1)
+            i = m_tag.end()
+            continue
+        if src[i].isspace():
+            j = i
+            while j < n and src[j].isspace():
+                j += 1
+            emit_space(i, j - 1)
+            i = j
+            continue
+        out.append(src[i])
+        starts.append(i)
+        ends.append(i)
+        i += 1
+
+    # Trim leading/trailing collapsed spaces to match str.strip() of the original path.
+    while out and out[-1] == " ":
+        out.pop()
+        starts.pop()
+        ends.pop()
+    while out and out[0] == " ":
+        out.pop(0)
+        starts.pop(0)
+        ends.pop(0)
+    return "".join(out), starts, ends
+
+
+def _clean_excerpt(
+    content: str, topic: str, max_chars: int = _EXCERPT_MAX_CHARS
+) -> SelectedChunk:
+    """Reduce raw fetched page text to a bounded, water/space-relevant excerpt.
+
+    Strips scripts/styles/HTML tags, splits into sentences, then keeps the densest
+    topic-bearing sentences up to ``max_chars`` and fills any remaining budget with
+    other substantive (non-navigation) sentences. This keeps each source within the
+    local model's tight context window while focusing on substantive content rather
+    than page chrome -- without discarding every non-keyworded sentence when a single
+    high-scoring one would otherwise consume the whole excerpt budget.
+
+    Returns a :class:`SelectedChunk` whose ``source_ranges`` are exact half-open character
+    spans into the *original fetched* ``content`` for each selected sentence in order, and
+    whose ``id`` is a stable full SHA-256 over those spans plus the excerpt text. Together
+    they pin exactly which slice of the source produced each claim, so provenance stays
+    auditable (and invalidates when underlying content changes).
+    """
+    normalized, raw_starts, raw_ends = _normalize_with_offsets(content)
+    if not normalized:
+        return SelectedChunk(text="", id="", source_ranges=())
+
+    # Record every candidate sentence's character span in the normalized source up
+    # front (cursor advances for all candidates so offsets never regress), then
+    # score/dedup/fit against the bounded budget below.
+    candidates: list[tuple[str, int, int]] = []
+    cursor = 0
+    for sentence in re.split(r"(?<=[.!?])\s+", normalized):
+        start = normalized.find(sentence, cursor)
+        if start < 0:
+            start = cursor
+        end = start + len(sentence)
+        cursor = max(cursor, end)
+        candidates.append((sentence, start, end))
+
+    keywords = _WATER_SPACE_WORDS | _topic_keywords(topic)
+    scored: list[tuple[int, str, int, int]] = []  # (hits, sentence, start, end)
+    filler: list[tuple[str, int, int]] = []        # (sentence, start, end)
+    seen: set[str] = set()
+    for sentence, start, end in candidates:
+        if len(sentence.split()) < 6:
+            continue
+        key = re.sub(r"\s+", " ", sentence.strip()).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        hits = sum(1 for w in _WORD_RE.findall(sentence.lower()) if w in keywords)
+        if hits > 0:
+            scored.append((hits, sentence, start, end))
+        else:
+            filler.append((sentence, start, end))
+
+    parts: list[str] = []
+    total = 0
+    ranges: list[tuple[int, int]] = []
+
+    def _fit(sentence: str, start: int, end: int) -> bool:
+        nonlocal total
+        if total + len(sentence) + 1 > max_chars:
+            return False
+        parts.append(sentence)
+        total += len(sentence) + 1
+        # Map the normalized sentence span to a half-open raw span into the original
+        # fetched content so an auditor can slice ``content[start:end]`` directly.
+        ranges.append((raw_starts[start], raw_ends[end - 1] + 1))
+        return True
+
+    # Continue (not break): a single oversized sentence must not suppress later,
+    # smaller evidence that still fits the bounded extraction budget.
+    for _, sentence, start, end in sorted(scored, key=lambda item: item[0], reverse=True):
+        if not _fit(sentence, start, end):
+            continue
+    for sentence, start, end in filler:
+        if not _fit(sentence, start, end):
+            continue
+
+    chunk_payload = (
+        f"{len(ranges)}\x00"
+        + "|".join(f"{s}-{e}" for s, e in ranges)
+        + "\x00"
+        + " ".join(parts)
+        + "\x00"
+    )
+    chunk_id = hashlib.sha256(chunk_payload.encode("utf-8")).hexdigest()
+    return SelectedChunk(text=" ".join(parts), id=chunk_id, source_ranges=tuple(ranges))
+
+
+_CLASS_ORDER: dict[str, int] = {
+    "confirmed fact": 0, "reported claim": 1, "estimate": 2,
+    "opinion": 3, "analysis/speculation": 4,
+}
+
+
+def _build_claims_from_records(records: list[EvidenceRecord]) -> list[Claim]:
+    """Merge per-source evidence records into claims via auditable corroboration.
+
+    Records are grouped by normalized claim text (whitespace-collapsed, lowercased,
+    trailing period stripped). A group is promoted only when it is backed by >=2
+    distinct NASA URLs with supported labels -- genuine cross-source corroboration,
+    not a model heuristic. Unmatched records become single-source claims so no sourced
+    material is dropped. Every retained claim carries an auditable verbatim evidence
+    quote (validated as a substring of its source during extraction).
+    """
+    groups: list[dict[str, Any]] = []
+    for r in records:
+        norm = _normalize_ws(r.claim)
+        if not norm:
+            continue
+        group = next((g for g in groups if g["norm"] == norm), None)
+        if group is None:
+            group = {"norm": norm, "members": []}
+            groups.append(group)
+        group["members"].append(r)
+
+    claims: list[Claim] = []
+    counter = 0
+    for g in groups:
+        members = g["members"]
+        supported = [m for m in members if m.label in _SUPPORTED_LABELS]
+        urls = sorted({m.url for m in members})
+        supported_urls = sorted({m.url for m in supported})
+        # Corroboration (and promotion) requires >=2 distinct independent sources.
+        if len(supported_urls) >= 2:
+            cls = min(
+                (m.label for m in supported),
+                key=lambda c: _CLASS_ORDER.get(c, 9),
+            )
+            source_ids = supported_urls
+        else:
+            # Not corroborated; keep with its strongest available label. verify_claims
+            # will never promote these to verified facts.
+            cls = min(
+                (m.label for m in members),
+                key=lambda c: _CLASS_ORDER.get(c, 9),
+            )
+            source_ids = urls
+        counter += 1
+        claims.append(Claim(
+            claim_id=f"claim-{counter:02d}",
+            text=members[0].claim,
+            source_ids=source_ids,
+            provisional_classification=cls,
+            evidence=[
+                {
+                    "url": m.url,
+                    "label": m.label,
+                    "quote": m.evidence_quote,
+                    "chunk_id": m.chunk_id,
+                    "chunk_ranges": [list(r) for r in m.chunk_ranges],
+                }
+                for m in members
+            ],
+        ))
+    return claims
 
 
 def extract_from_source_content(
@@ -686,39 +1217,94 @@ def extract_from_source_content(
     sources: list[SourceContent],
     *,
     extractor: ProductionExtractor | None = None,
-    identity: Callable[[str, str, str], None] | None = None,
+    identity: Callable[[str, str, str, str | None, str | None], None] | None = None,
 ) -> tuple[list[Claim], dict[str, str]]:
-    """Run the production extractor against persisted source content.
+    """Extract claims grounded in persisted source content.
+
+    Extraction runs **per source** against a bounded, topic-relevant excerpt (the
+    local model has a tight context window and degrades on large input), so each
+    claim is tagged only with the URL that actually produced it -- genuine per-source
+    provenance rather than tagging every claim with every input URL. Claims from
+    independent sources that are semantically similar are then merged into single
+    corroborated claims carrying all their supporting URLs.
 
     Returns ``(claims, source_content_hashes)``. The hashes cover the raw fetched
-    bytes and participate in the research-stage fingerprint so that any change to
-    an underlying source invalidates prior claims. Raises :class:`ResearchError`
-    when extraction fails or produces insufficient supported material.
+    bytes and participate in the research-stage fingerprint so any change to an
+    underlying source invalidates prior claims. Raises :class:`ResearchError` when
+    extraction fails or produces no supported material (fail closed).
     """
 
     if extractor is None:
         # Default production extractor (LM Studio loopback, schema-constrained).
         extractor = make_production_extractor()
 
-    pairs = extractor(topic, sources, identity=identity)
-    claim_ids_seen: dict[str, int] = {}
-    claims: list[Claim] = []
-    for text, classification in pairs:
-        text = (text or "").strip()
-        if not text:
-            continue
-        n = claim_ids_seen.get(classification, 0) + 1
-        claim_ids_seen[classification] = n
-        claims.append(Claim(
-            claim_id=f"claim-{n:02d}",
-            text=text,
-            source_ids=[s.url for s in sources],
-            provisional_classification=classification,
-        ))
+    # Build one auditable record per extracted claim, tagged with the source URL that
+    # produced it. Extraction runs per source against a bounded excerpt (the local
+    # model has a tight context window), so each record's provenance is genuine and
+    # its verbatim evidence quote was already validated as a substring of that source.
+    records: list[EvidenceRecord] = []
+    rec_counter = 0
+    for sc in sources:
+        chunk = _clean_excerpt(sc.content, topic)
+        single = SourceContent(
+            url=sc.url, title=sc.title, quality=sc.quality,
+            content=chunk.text, content_hash=sc.content_hash,
+        )
+        # Central grounding gate: applies to EVERY extractor (not just the LM Studio
+        # one), so an injected/custom extractor cannot bypass the verbatim-evidence
+        # requirement. Each claim must carry a valid label and a quote that actually
+        # appears in this source's selected chunk; anything else fails closed.
+        for ext in extractor(topic, [single], identity=identity):
+            if ext.classification not in _VALID_CLASSIFICATIONS:
+                raise ResearchError(
+                    f"extractor produced invalid classification {ext.classification!r}; "
+                    "refusing to promote non-conforming output as verified facts"
+                )
+            norm_claim = _collapse_ws(ext.claim)
+            norm_quote = _collapse_ws(ext.quote)
+            if not norm_claim or not norm_quote:
+                raise ResearchError(
+                    "extractor produced a claim without claim text or evidence quote; "
+                    "refusing to promote non-conforming output"
+                )
+            # Strengthened central grounding gate (applies to EVERY extractor, not
+            # just the LM Studio one): the quote must occur wholly within at least ONE
+            # selected raw slice, so a fabricated quote spanning the join of two
+            # reordered/non-contiguous sentences cannot pass. Each raw slice is normalized
+            # with _normalize_with_offsets (removing script/style bodies + tags, collapsing
+            # whitespace) exactly as the excerpt was built, so markup never causes a false
+            # rejection and script junk can't supply a matching quote. The empty-quote check
+            # above still rejects whitespace-only quotes (which would match every slice).
+            slices = [
+                _normalize_with_offsets(sc.content[s:e])[0]
+                for s, e in chunk.source_ranges
+            ]
+            if not any(norm_quote in sl for sl in slices):
+                raise ResearchError(
+                    f"extractor produced a quote not present wholly within source "
+                    f"{sc.url!r} chunk slice; claim is not grounded and is rejected "
+                    f"({norm_quote[:60]!r})"
+                )
+            rec_counter += 1
+            records.append(EvidenceRecord(
+                id=f"rec-{rec_counter:03d}",
+                url=sc.url,
+                label=ext.classification,
+                claim=ext.claim,
+                evidence_quote=ext.quote,
+                chunk_id=chunk.id,
+                chunk_ranges=list(chunk.source_ranges),
+            ))
 
+    if not records:
+        raise ResearchError(
+            "production extractor returned no claims across all sources; "
+            "insufficient supported material"
+        )
+
+    claims = _build_claims_from_records(records)
     content_hashes = {s.url: s.content_hash for s in sources}
     return claims, content_hashes
-
 
 # ========== Corroboration + contradiction detection ==========
 
@@ -751,19 +1337,23 @@ def detect_contradictions(claims: list[Claim]) -> list[Contradiction]:
 def verify_claims(claims: list[Claim], contradictions: list[Contradiction]) -> list[Claim]:
     """Promote claims to verified facts.
 
-    A claim is verified when it is a confirmed fact or reported claim AND is not
-    involved in an unresolved contradiction. Estimates/opinions/speculation are
-    never promoted (they carry uncertainty for the writer).
+    A claim is verified when it (1) is a confirmed fact or reported claim, (2) is
+    not involved in an unresolved contradiction, and (3) is independently
+    corroborated by at least two distinct sources. Estimates/opinions/speculation
+    are never promoted (they carry uncertainty for the writer). Corroboration via
+    source count prevents reporting a single-source statement as a verified fact.
     """
     contradicted = {cid for c in contradictions for cid in c.claim_ids}
     verified: list[Claim] = []
     for claim in claims:
         if claim.claim_id in contradicted:
             continue
-        if claim.provisional_classification in {"confirmed fact", "reported claim"}:
-            verified.append(claim)
+        if claim.provisional_classification not in {"confirmed fact", "reported claim"}:
+            continue
+        if len(set(claim.source_ids)) < 2:
+            continue
+        verified.append(claim)
     return verified
-
 
 # ========== Sensitive-topic guardrails ==========
 
@@ -799,7 +1389,7 @@ def run_research(
     source_urls: Sequence[str],
     *,
     extractor: Callable[..., list[tuple[str, Classification]]] | None = None,
-    production_extractor: Callable[[str, list[SourceContent]], list[tuple[str, Classification]]] | None = None,
+    production_extractor: Callable[[str, list[SourceContent]], "list[Extraction]"] | None = None,
     content_fetcher: Callable[[str], str | bytes] | None = None,
     source_contents: list[SourceContent] | None = None,
     observed_at: str | None = None,
@@ -824,7 +1414,7 @@ def run_research(
     observed_at = observed_at or datetime.now(UTC).isoformat()
     sources = collect_sources(source_urls)
 
-    identity_holder: dict[str, str | None] = {"name": None, "version": None, "schema": None}
+    identity_holder: dict[str, str | None] = {"name": None, "version": None, "schema": None, "prompt_version": None, "model_id": None, "endpoint_url": None}
     contents: list[SourceContent] = []
 
     # Production path: extract against persisted source content.
@@ -843,7 +1433,7 @@ def run_research(
             topic,
             contents,
             extractor=production_extractor or make_production_extractor(),
-            identity=lambda name, ver, ps: identity_holder.update({"name": name, "version": ver, "schema": ps}),
+            identity=lambda name, ver, ps, prompt_version=None, model_id=None, endpoint_url=None: identity_holder.update({"name": name, "version": ver, "schema": ps, "prompt_version": prompt_version, "model_id": model_id, "endpoint_url": endpoint_url}),
         )
     else:
         # Legacy path (tests / dry-run inject RULE_BASED_EXTRACTOR via extractor=).
@@ -854,9 +1444,12 @@ def run_research(
     verified = verify_claims(claims, contradictions)
     reasons = flag_sensitive_topic(topic)
 
-    # Output digest: stable hash over the claims + source-content hashes so any
-    # change to extracted material or an underlying source invalidates prior runs.
-    digest_inputs = "|".join(sorted(f"{c.claim_id}={c.text}" for c in claims))
+    # Output digest: stable hash over the COMPLETE extraction structure -- every
+    # claim's text, classification, supporting URLs, and auditable evidence quotes --
+    # plus the per-source content hashes. Any change to extracted material, its
+    # evidence, or an underlying source invalidates prior runs.
+    claims_data = sorted((c.to_dict() for c in claims), key=lambda c: c["claim_id"])
+    digest_inputs = json.dumps(claims_data, sort_keys=True)
     output_digest = hashlib.sha256(
         f"{topic}|{digest_inputs}|{json.dumps(content_hashes, sort_keys=True)}".encode("utf-8")
     ).hexdigest()
@@ -896,7 +1489,10 @@ def run_research(
         flag_reasons=list(reasons),
         extractor_name=identity_holder["name"],
         extractor_version=identity_holder["version"],
-        prompt_schema_version=identity_holder["schema"],
+        extraction_schema_version=identity_holder["schema"],
+        prompt_version=identity_holder["prompt_version"],
+        extractor_model_id=identity_holder["model_id"],
+        extractor_endpoint=identity_holder["endpoint_url"],
         source_content_hashes=content_hashes,
         output_digest=output_digest,
         source_contents=contents_by_url,

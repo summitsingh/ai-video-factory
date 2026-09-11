@@ -857,7 +857,10 @@ def _synthesize_narration_track(
         if not scene.narration or not scene.narration.strip():
             continue
         raw_wav = workdir / f"scene-{i}.raw.wav"
-        synthesize_to_wav(scene.narration, raw_wav)
+        if scene.voice:
+            synthesize_to_wav(scene.narration, raw_wav, voice=scene.voice)
+        else:
+            synthesize_to_wav(scene.narration, raw_wav)
         # Deterministic per-scene WPM variation (±12 wpm around 170) so pace
         # shifts sentence-to-sentence without being distracting.
         speed_wpm = 170 + ((i * 37 + len(scene.narration)) % 25) - 12
@@ -1216,6 +1219,8 @@ def run_video_pipeline(
                 narration=scene_data.get("narration"),
                 subtitle=subtitle_text or None,
                 pip=pip_enabled,
+                voice=scene_data.get("voice") or None,
+                transition=scene_data.get("transition") or None,
             )
             scenes.append(scene)
             cursor += span

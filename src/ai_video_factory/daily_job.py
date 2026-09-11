@@ -81,7 +81,7 @@ from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import sanitize_diagnostic
 from ai_video_factory.subtitle_export import validate_subtitles
 from ai_video_factory.thumbnail import build_thumbnails, validate_thumbnails
-from ai_video_factory.trend import TrendCandidate, Transport as TrendTransport, discover_trends
+from ai_video_factory.trend import SourceSignal, TrendCandidate, Transport as TrendTransport, discover_trends
 
 
 class DailyJobError(RuntimeError):
@@ -101,6 +101,11 @@ class JobConfig:
     asset_transport: Callable[[str], bytes] | None = None
     now_iso: str | None = None
     topic_override: str | None = None
+    # Real source URLs for topic-override research. When set alongside
+    # ``topic_override``, these are fetched + persisted and ground the research in
+    # real authoritative content instead of the topic string alone. Required for a
+    # grounded live pilot; empty otherwise (trend-driven discovery).
+    research_source_urls: list[str] = field(default_factory=list)
     # When True, skip all network activity (offline research + no asset fetch).
     dry_run: bool = False
     # Research extractor selection. In production this is the explicit, schema-
@@ -193,6 +198,7 @@ def run_daily_job(
         "research_shortlist": config.research_shortlist,
         "min_words": config.min_words,
         "topic_override": config.topic_override,
+        "research_source_urls": list(config.research_source_urls),
         "dry_run": config.dry_run,
     }
     daily_run = state_store.start("daily", daily_inputs)
@@ -219,6 +225,10 @@ def run_daily_job(
                     first_seen_at=config.now_iso or _now(),
                     observed_at=config.now_iso or _now(),
                     cluster_key=" ".join((config.topic_override.lower().split()[:8] or ["topic"])),
+                    sources=[
+                        SourceSignal(provider="nasa", url=url, published_at=None)
+                        for url in config.research_source_urls
+                    ],
                 )
             ]
         else:
@@ -426,19 +436,24 @@ def _build_research_packages(
         results.append(result)
         dirs.append(str(paths["research_brief"].parent))
 
-        # Research-stage fingerprint: extractor identity + model/version/prompt-schema
-        # version, per-source content hashes, and output digest. Any change to the
-        # underlying source or the extracted material invalidates prior runs on resume.
+        # Research-stage fingerprint: extractor identity, resolved model + endpoint,
+        # prompt-version and extraction-schema versions, per-source content hashes, and
+        # output digest. Any change to the underlying source or the extracted material
+        # invalidates prior runs on resume.
         state_store.complete(
             research_run.run_id,
             {
                 "brief": str(paths["research_brief"]),
                 "dir": str(out_dir),
                 "topic": candidate.title,
+                "source_urls": [s.url for s in candidate.sources],
                 "verified_count": len(result.verified_facts),
                 "extractor_name": result.extractor_name,
                 "extractor_version": result.extractor_version,
-                "prompt_schema_version": result.prompt_schema_version,
+                "extractor_model_id": result.extractor_model_id,
+                "extractor_endpoint": result.extractor_endpoint,
+                "prompt_version": result.prompt_version,
+                "extraction_schema_version": result.extraction_schema_version,
                 "source_content_hashes": result.source_content_hashes,
                 "output_digest": result.output_digest,
             },

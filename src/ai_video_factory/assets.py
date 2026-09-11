@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
@@ -81,6 +81,15 @@ class RightsRecord:
     candidate_scene_ids: list[str] = field(default_factory=list)
     review_status: LicenseStatus = "pending_review"
     rejection_reason: str | None = None
+    # Per-asset provenance (operator asset policy, 2026-09-08).
+    nasa_id: str = ""
+    canonical_url: str = ""
+    retrieved_metadata: dict[str, Any] = field(default_factory=dict)
+    license_basis: str = ""
+    # Actual NASA media-usage terms reference (URL); a specific recorded policy, not a
+    # generated phrase. Required by nasa_eligible so generic "public domain" text is
+    # never treated as proof of public-domain status on its own.
+    usage_terms_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -132,6 +141,196 @@ def is_license_approved(license_name: str | None) -> bool:
     """A license is approved only when it resolves to a concrete accepted name."""
     return bool(license_name and license_name not in ("", "unknown"))
 
+# ========== NASA item-level eligibility (operator asset policy) ==========
+
+# The specific, recorded NASA media-usage terms reference. Generic phrases such as
+# "public domain" are never treated as proof of public-domain status on their own.
+NASA_MEDIA_USAGE_TERMS_URL = "https://www.nasa.gov/multimedia/guidelines/index.html"
+_NASA_USAGE_TERMS_URL_RE = re.compile(
+    r"^https?://(?:[^/]+\.)?nasa\.gov/multimedia/guidelines", re.IGNORECASE,
+)
+
+# NASA-provider auto-clearance is restricted to NASA and its operated centers. Other
+# U.S. agencies (NOAA, Interior/USGS, Smithsonian, Armed Forces, NRL, ...) are not
+# auto-cleared here; they would need their own explicit compatible item license/terms.
+# A structured author is acceptable when it names NASA (matched as a standalone token so
+# "nasal" does not match) or one of the known NASA centers. Contractor-operated facilities
+# such as JPL/Caltech are deliberately excluded here and rejected by the contractor-marker check.
+_NASA_AGENCY_MARKERS = (
+    "nasa",
+    "national aeronautics and space administration",
+)
+_NASA_CENTER_NAMES = (
+    "goddard space flight center",
+    "kennedy space center",
+    "johnson space center",
+    "ames research center",
+    "langley research center",
+    "marshall space flight center",
+    "armstrong flight center",
+    "glenn research center",
+)
+
+# Explicit mixed / contractor attribution in a structured author field supersedes
+# agency authorship and is rejected (JPL/Caltech and other FFRDC suffixes are included).
+_NASA_CONTRACTOR_MARKERS = (
+    "contractor", "third party", "third-party", "courtesy of",
+    "photo by ", "photos by ", "licensed from ", "rights held by",
+    "jpl", "caltech", "jet propulsion laboratory",
+)
+
+# Disqualifying restrictions/claims. Checked against the broader metadata blob
+# (title/description/metadata) because these signals can appear in captions.
+_NASA_RESTRICTED_MARKERS = (
+    "not for editorial use", "editorial use only", "editorial-only",
+    "human image release", "model release", "person released", "release required",
+    "trademark", "registered trademark", "all rights reserved",
+)
+
+# Identifiable human subjects are rejected outright (right-of-publicity concerns),
+# regardless of any model-release wording. Detected by keyword in the metadata blob;
+# a NASA-authored astronaut portrait with no "model release" phrase is still rejected.
+_NASA_HUMAN_SUBJECT_MARKERS = (
+    "photographer", "portrait", "portraits", "astronaut", "astronauts",
+    "crew", "mission crew", "people", "person ", "persons", "faces", "face of",
+    "human subject", "survivors", "victims",
+)
+
+_AMBIGUOUS_CREATORS = {"", "unknown", "unavailable", "n/a", "no creator"}
+
+
+def _structured_authors(record: RightsRecord) -> list[str]:
+    """Return the normalized structured author fields only (no title/URL blob)."""
+    authors: list[str] = []
+    candidate = (record.creator or "").strip()
+    if candidate:
+        authors.append(candidate.lower())
+    meta = record.retrieved_metadata or {}
+    if isinstance(meta, dict):
+        for key in ("creator", "secondary_creator", "center"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                authors.append(value.strip().lower())
+    # De-duplicate while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for author in authors:
+        if author not in seen:
+            seen.add(author)
+            unique.append(author)
+    return unique
+
+
+def _is_allowlisted_author(author: str) -> bool:
+    """True when a single normalized structured author names NASA or a NASA center."""
+    if not author:
+        return False
+    for marker in _NASA_AGENCY_MARKERS:
+        if re.search(r"(?<![a-z])" + re.escape(marker) + r"(?![a-z])", author):
+            return True
+    return any(author == center or author.startswith(center + " ")
+               for center in _NASA_CENTER_NAMES)
+
+
+def _nasa_authorship_eligible(record: RightsRecord) -> tuple[bool, str]:
+    """Every nonempty structured author must be NASA/NASA-center; no mixed credit.
+
+    Authorship is read only from the structured fields (creator / metadata
+    creator/secondary_creator/center) — never a title/description/URL blob — so an
+    item whose caption merely mentions NASA cannot satisfy this. Each nonempty author
+    must be allowlisted on its own; an unrecognized additional credit is ambiguous.
+    """
+    authors = _structured_authors(record)
+    if not authors:
+        return False, "no structured NASA author field on record"
+    for author in authors:
+        # Explicit mixed / contractor attribution (incl. JPL/Caltech) is always rejected.
+        if any(marker in author for marker in _NASA_CONTRACTOR_MARKERS):
+            return False, "structured author indicates contractor/mixed attribution"
+        if not _is_allowlisted_author(author):
+            return False, f"unrecognized additional author credit ({author!r})"
+    return True, ""
+
+
+def _nasa_restrictions_present(record: RightsRecord) -> str | None:
+    """Return the first disqualifying restriction found in the broader metadata blob."""
+    meta = record.retrieved_metadata or {}
+    parts = [
+        str(meta.get("title") if isinstance(meta, dict) else ""),
+        str(meta.get("description") if isinstance(meta, dict) else ""),
+        record.canonical_url or "",
+    ]
+    if isinstance(meta, dict):
+        parts.append(json.dumps(meta, ensure_ascii=False))
+    blob = " ".join(parts).lower()
+    for marker in _NASA_RESTRICTED_MARKERS:
+        if marker in blob:
+            return marker
+    return None
+
+def _nasa_human_subject_present(record: RightsRecord) -> str | None:
+    """Return the first identifiable-human keyword found in the metadata blob.
+
+    Detects human-subject material by keyword so an item is rejected even when it
+    carries no explicit model-release wording (e.g. a NASA astronaut portrait).
+    """
+    meta = record.retrieved_metadata or {}
+    parts = [
+        str(meta.get("title") if isinstance(meta, dict) else ""),
+        str(meta.get("description") if isinstance(meta, dict) else ""),
+    ]
+    if isinstance(meta, dict):
+        parts.append(json.dumps(meta, ensure_ascii=False))
+    blob = " ".join(parts).lower()
+    for marker in _NASA_HUMAN_SUBJECT_MARKERS:
+        if marker in blob:
+            return marker
+    return None
+
+
+def nasa_eligible(record: RightsRecord) -> tuple[bool, str]:
+    """Item-level NASA public-domain eligibility (operator asset policy).
+
+    Returns ``(True, "")`` when the item may render. The predicate is applied by
+    the approval gate regardless of prior review status, so a pre-approved record
+    cannot bypass it. Eligibility requires BOTH persisted applicable usage terms
+    AND affirmative U.S. government agency authorship, and rejects third-party/
+    contractor (incl. JPL/Caltech), trademark, identifiable-human/release, restricted,
+    or ambiguous material. A nonempty ``license_basis`` alone is never treated as proof.
+    """
+    # 1. Persisted applicable usage terms: a specific recorded NASA reference.
+    usage_url = (record.usage_terms_url or "").strip()
+    if not _NASA_USAGE_TERMS_URL_RE.match(usage_url):
+        return False, "no specific NASA media-usage terms persisted"
+    if not is_license_approved(record.license_name):
+        return False, "no concrete classified license on record"
+
+    # 2. Affirmative agency authorship from structured fields only (the real proof).
+    ok, reason = _nasa_authorship_eligible(record)
+    if not ok:
+        return False, reason
+
+    # 3a. Identifiable human subjects are rejected outright, regardless of any
+    # model-release wording (right-of-publicity concerns).
+    human = _nasa_human_subject_present(record)
+    if human is not None:
+        return False, f"metadata indicates an identifiable human subject ({human})"
+
+    # 3. Disqualifying restrictions/claims anywhere in the metadata blob.
+    restriction = _nasa_restrictions_present(record)
+    if restriction is not None:
+        return False, f"metadata carries a restricted/trademark/release marker ({restriction})"
+
+    # 4. Ambiguous provenance guards.
+    meta = record.retrieved_metadata or {}
+    has_title = bool(meta.get("title") if isinstance(meta, dict) else "") or bool(record.attribution)
+    if not (record.nasa_id and has_title):
+        return False, "ambiguous NASA provenance (missing nasa_id or title)"
+    if (record.creator or "").strip().lower() in _AMBIGUOUS_CREATORS:
+        return False, "ambiguous NASA authorship (empty/unknown creator)"
+
+    return True, ""
+
 
 # ========== Provider adapters (injectable transport) ==========
 
@@ -160,6 +359,16 @@ def search_nasa(
 
     ``transport`` is injected so tests can return canned JSON. Defaults to a real
     urllib GET of the public API.
+
+    Each returned item carries per-asset provenance fields required by the
+    operator's asset policy (2026-09-08): ``nasa_id``, ``creator``,
+    ``canonical_url`` (the item landing page), ``retrieved_metadata`` (raw NASA
+    metadata as fetched), and ``license_basis``. NASA items carry no license
+    field in the API, so public-domain approval is grounded on 17 U.S.C. § 105
+    (works of a U.S. government agency are not subject to copyright) recorded in
+    ``license_basis``; any item whose metadata carries an explicit restrictive
+    marker (e.g. "not for editorial use", trademark, or a human-image release
+    requirement) is rejected as ambiguous provenance.
     """
     transport = transport or _urlopen_default
     endpoint = "https://images-api.nasa.gov/search?q=" + query.replace(" ", "+")
@@ -171,20 +380,70 @@ def search_nasa(
 
     items: list[dict[str, Any]] = []
     for item in (data.get("collection") or {}).get("items", [])[:limit]:
-        metadata = item.get("metadata") or {}
+        # NASA's live API nests each asset's real metadata under a second "data"
+        # key (a one-element list); older/simplified payloads put fields at the
+        # top level. Fold every known location into one metadata dict so both work.
+        meta: dict[str, Any] = {}
+        raw_data = item.get("data")
+        if isinstance(raw_data, list) and raw_data:
+            meta = raw_data[0] or {}
+        elif isinstance(raw_data, dict):
+            meta = raw_data
+        for key in ("nasa_id", "title", "creator", "secondary_creator", "center"):
+            top_level = item.get(key)
+            if top_level and key not in meta:
+                meta[key] = top_level
+        nested_meta = item.get("metadata")
+        if isinstance(nested_meta, dict):
+            for key, value in nested_meta.items():
+                meta.setdefault(key, value)
+
         links = item.get("links") or []
-        media_link = next(
-            (link for link in links if link.get("rel") == "media" and link.get("href")),
-            links[0] if links else None,
+        canonical_link = next((l for l in links if l.get("rel") == "canonical"), None)
+        preview_link = next((l for l in links if l.get("rel") == "preview"), None)
+        media_link = next((l for l in links if l.get("rel") == "media"), None)
+
+        # Prefer a medium-resolution JPEG (~1280px) suitable for 720p render; the
+        # default preview link is only ~640px. Fall back to preview, media, canonical.
+        media_url = ""
+        if preview_link:
+            media_url = str(preview_link.get("href"))
+            if media_url.endswith("~thumb.jpg"):
+                media_url = media_url.replace("~thumb.jpg", "~medium.jpg")
+        elif media_link:
+            media_url = str(media_link.get("href"))
+        canonical_url = str(canonical_link.get("href")) if canonical_link else ""
+
+        nasa_id = str(meta.get("nasa_id") or item.get("item_id") or "")
+        title = (str(meta.get("title") or "").strip()) or ""
+        # Preserve the real creator; never manufacture an agency credit. An empty or
+        # unknown creator is left as-is so nasa_eligible() rejects it as ambiguous.
+        creator = (
+            str(meta.get("creator") or meta.get("secondary_creator") or meta.get("center") or "")
         )
-        if not media_link:
+
+        # Reject items whose metadata carries an explicit restrictive marker.
+        blob = json.dumps({**meta, **item}, ensure_ascii=False).lower()
+        if any(marker in blob for marker in (
+            "not for editorial use", "editorial use only",
+            "human image release", "model release required",
+            "trademark",
+        )):
             continue
-        title = metadata.get("title", "") or item.get("title", "")
+
         items.append({
-            "title": str(title),
-            "provider_url": f"https://images-api.nasa.gov/item/{item.get('item_id', '')}",
-            "download_url": str(media_link.get("href")),
-            "creator": metadata.get("creator", "NASA") or "NASA",
+            "title": title,
+            "nasa_id": nasa_id,
+            "provider_url": canonical_url or f"https://images-api.nasa.gov/item/{nasa_id}",
+            "canonical_url": canonical_url,
+            "download_url": media_url,
+            "creator": creator,
+            "retrieved_metadata": meta,
+            "license_basis": (
+                "Public domain — 17 U.S.C. § 105: works prepared by a U.S. "
+                "government agency are not subject to copyright."
+            ),
+            "usage_terms_url": NASA_MEDIA_USAGE_TERMS_URL,
         })
     return items
 
@@ -267,6 +526,11 @@ def acquire_asset(
         checksum_sha256=checksum_fn(destination),
         properties=MediaProperties(mime_type=_mime(download_url)),
         candidate_scene_ids=[scene_id],
+        nasa_id=str(chosen.get("nasa_id") or ""),
+        canonical_url=str(chosen.get("canonical_url") or ""),
+        retrieved_metadata=dict(chosen.get("retrieved_metadata") or {}),
+        license_basis=str(chosen.get("license_basis") or ""),
+        usage_terms_url=str(chosen.get("usage_terms_url") or ""),
     )
 
 
@@ -294,27 +558,35 @@ def gate_assets(records: Sequence[RightsRecord]) -> list[RightsRecord]:
     """Run the fail-closed rights gate. Returns approved records only.
 
     Raises ``AssetError`` if any record is not approved so a render cannot proceed
-    with unapproved media.
+    with unapproved media. NASA eligibility via :func:`nasa_eligible` is authoritative
+    and applied to every record regardless of prior review status, so a pre-approved
+    record cannot bypass it. Non-NASA providers still clear on a concrete accepted license.
     """
     approved: list[RightsRecord] = []
     for record in records:
-        status = record.review_status
-        if status == "pending_review":
-            # Auto-classify by license; anything ambiguous is rejected here.
-            status_record = approve_asset(record)
-            if status_record.review_status != "approved":
-                raise AssetError(
-                    sanitize_diagnostic(
-                        f"asset {record.asset_id} blocked: {status_record.rejection_reason}"
-                    )
-                )
-            approved.append(status_record)
-        elif status == "approved":
-            approved.append(record)
-        else:  # rejected
+        if record.review_status == "rejected":
             raise AssetError(
                 sanitize_diagnostic(f"asset {record.asset_id} was rejected: {record.rejection_reason}")
             )
+
+        if record.provider == "nasa":
+            ok, reason = nasa_eligible(record)
+            if not ok:
+                raise AssetError(
+                    sanitize_diagnostic(f"asset {record.asset_id} blocked: {reason}")
+                )
+            approved.append(replace(record, review_status="approved", rejection_reason=None))
+            continue
+
+        # Non-NASA providers (e.g. Wikimedia): concrete accepted license required.
+        status_record = approve_asset(record)
+        if status_record.review_status != "approved":
+            raise AssetError(
+                sanitize_diagnostic(
+                    f"asset {record.asset_id} blocked: {status_record.rejection_reason}"
+                )
+            )
+        approved.append(status_record)
     return approved
 
 
@@ -508,6 +780,11 @@ def load_rights_manifest(path: Path) -> list[RightsRecord]:
             candidate_scene_ids=list(raw.get("candidate_scene_ids", [])),
             review_status=raw.get("review_status", "pending_review"),
             rejection_reason=raw.get("rejection_reason"),
+            nasa_id=raw.get("nasa_id", ""),
+            canonical_url=raw.get("canonical_url", ""),
+            license_basis=raw.get("license_basis", ""),
+            usage_terms_url=raw.get("usage_terms_url", ""),
+            retrieved_metadata=dict(raw.get("retrieved_metadata") or {}),
         ))
     return records
 

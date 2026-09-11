@@ -25,7 +25,10 @@ are computed by shared :mod:`media_metrics` helpers that read the real files.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import os
 import re
 import shutil
 import subprocess
@@ -41,6 +44,7 @@ from ai_video_factory.edit_schema import (
     frames_to_seconds,
     seconds_to_frames,
 )
+from ai_video_factory.narration import mix_scenes_to_track
 from ai_video_factory.research_pipeline import ResearchResult
 from ai_video_factory.sanitization import sanitize_diagnostic
 
@@ -72,7 +76,8 @@ class MediaMetricsError(RuntimeError):
 
 def _run(argv: Sequence[str], timeout: int = 120) -> subprocess.CompletedProcess:
     proc = subprocess.run(
-        list(argv), shell=False, timeout=timeout, capture_output=True, text=True, check=False
+        list(argv), shell=False, timeout=timeout, capture_output=True, text=True,
+        check=False,
     )
     if proc.returncode != 0:
         raise ProductionError(f"command failed ({argv[:3]}): {proc.stderr.strip()[-500:] or 'exit '+str(proc.returncode)}")
@@ -389,6 +394,237 @@ class OfflineRenderEngine(RenderEngine):
             shutil.rmtree(segments_dir, ignore_errors=True)
 
 
+# ========== Real production renderer (Remotion + Kokoro) ==========
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
+
+
+def _verified_browser(path: Path) -> Path | None:
+    """Return ``path`` if it names an existing, executable browser binary."""
+    resolved = Path(path).expanduser().resolve()
+    if resolved.is_file() and os.access(resolved, os.X_OK):
+        return resolved
+    return None
+
+
+def _remotion_browser_executable() -> Path:
+    """Locate a verified local browser for headless Remotion rendering.
+
+    Fail-closed: honors ``REMOTION_CHROME_EXECUTABLE`` first, then common system
+    browsers; raises :class:`RuntimeError` when none is usable.
+    """
+    configured = os.environ.get("REMOTION_CHROME_EXECUTABLE")
+    if configured:
+        candidate = _verified_browser(Path(configured))
+        if candidate is not None:
+            return candidate
+        raise RuntimeError(
+            "REMOTION_CHROME_EXECUTABLE does not name an existing browser executable"
+        )
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        located = shutil.which(name)
+        if located is not None:
+            candidate = _verified_browser(Path(located))
+            if candidate is not None:
+                return candidate
+    raise RuntimeError(
+        "no verified local browser executable; set REMOTION_CHROME_EXECUTABLE or install Chrome/Chromium"
+    )
+
+
+def _run_ffmpeg(argv: Sequence[str], *, timeout: int = 300) -> None:
+    """Run ffmpeg, raising :class:`ProductionError` on any failure."""
+    try:
+        completed = subprocess.run(
+            ["ffmpeg", *argv], shell=False, timeout=timeout, capture_output=True, text=True, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ProductionError(f"ffmpeg could not run: {sanitize_diagnostic(str(error))}") from error
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or f"exit code {completed.returncode}").strip()
+        raise ProductionError(f"ffmpeg failed: {sanitize_diagnostic(detail)}")
+
+
+def _media_kind(path: Path) -> str:
+    """Classify a staged asset as ``image`` or ``clip`` by extension, else ffprobe."""
+    ext = Path(path).suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in VIDEO_EXTENSIONS:
+        return "clip"
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path),
+        ],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    return "clip" if "video" in (probe.stdout or "").strip() else "image"
+
+
+class RemotionKokoroRenderEngine(RenderEngine):
+    """Real production renderer: Kokoro narration + headless Remotion master.
+
+    :meth:`synthesize_narration` writes a real 48 kHz stereo WAV via the local
+    Kokoro ONNX model (falling back to piper/espeak when Kokoro is unavailable).
+    :meth:`render_master` wires approved assets into each scene, renders a muted
+    MP4 with headless Remotion, then concatenates the per-scene narration tracks
+    in scene order and muxes them onto the video.
+
+    The renderer is fail-closed: a missing/empty asset, an unavailable browser,
+    or a non-zero render exit all raise before any master is written. Assets are
+    staged under ``public_dir/assets/<run>/`` and referenced by path relative to
+    the Remotion public root (Remotion's ``staticFile`` serves them).
+    """
+
+    def __init__(
+        self,
+        *,
+        remotion_root: Path | None = None,
+        public_dir: Path | None = None,
+        browser_executable: Path | None = None,
+        npm_executable: str = "npm",
+    ) -> None:
+        root = Path(remotion_root) if remotion_root is not None else self._default_remotion_root()
+        self._root = root
+        self._public_dir = Path(public_dir) if public_dir is not None else (root / "public")
+        self._browser_executable = browser_executable
+        self._npm = npm_executable
+
+    @staticmethod
+    def _default_remotion_root() -> Path:
+        here = Path(__file__).resolve().parent
+        for parent in (here, *here.parents):
+            if (parent / "remotion" / "package.json").is_file():
+                return parent / "remotion"
+        raise RuntimeError("remotion project root not found")
+
+    def synthesize_narration(self, text: str, voice: str | None = None) -> Path:
+        from ai_video_factory.narration import synthesize_to_wav
+        output = tempfile.mkstemp(prefix="narr-", suffix=".wav")[1]
+        return synthesize_to_wav(text, Path(output), engine="kokoro", voice=voice or "af_heart")
+
+    def render_master(
+        self,
+        edit: EditDocument,
+        *,
+        narration_segments: Sequence[tuple[Path, float]],
+        assets_by_scene_id: dict[str, Path],
+        destination: Path,
+    ) -> Path:
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        workdir = tempfile.mkdtemp(prefix="avf-render-")
+        try:
+            # 1. Wire approved assets into the edit (fail-closed on bad artifacts).
+            self._wire_assets(edit, assets_by_scene_id)
+
+            # 2. Write props for Remotion (paths are relative to the remotion root).
+            props_path = Path(workdir) / f"props-{destination.stem}.json"
+            props_path.write_text(edit.model_dump_json(indent=2), encoding="utf-8")
+
+            # 3. Render a muted master (no audio); narration is muxed in step 4.
+            browser = self._browser_executable or _remotion_browser_executable()
+            muted = Path(workdir) / "muted.mp4"
+            self._run_remotion(props_path, muted, browser)
+            if not muted.is_file() or muted.stat().st_size == 0:
+                raise ProductionError("Remotion render produced no master file")
+
+            # 4. Mix per-scene narration at their absolute start offsets (seconds) and
+            #    mux onto video. Offsets place each segment after the intro bookend /
+            #    between scenes instead of concatenating everything from 0:00. Absolute
+            #    offsets come from each scene's from_frame, so audio stays in sync with
+            #    the visuals even when a prior narration run exceeds its slot.
+            if not narration_segments:
+                raise ProductionError("no narration segments to render")
+            narration = Path(workdir) / "narration.wav"
+            mix_scenes_to_track(narration_segments, narration)
+            total_seconds = sum(scene.duration_frames for scene in edit.scenes) / float(edit.fps)
+            self._mux_audio(muted, narration, destination, total_seconds=total_seconds)
+
+            if not destination.is_file() or destination.stat().st_size == 0:
+                raise ProductionError("rendered master is empty")
+            return destination
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def _wire_assets(self, edit: EditDocument, assets_by_scene_id: dict[str, Path]) -> list[Path]:
+        """Stage approved assets under the public root and set scene.image/clip.
+
+        Returns the staged asset paths. Raises :class:`ProductionError` if any
+        referenced asset is missing or empty so a candidate never packages with a
+        broken media reference.
+        """
+        run_id = hashlib.sha1(
+            str(sorted(assets_by_scene_id.items())).encode("utf-8")
+        ).hexdigest()[:12]
+        run_dir = self._public_dir / "assets" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        served: list[Path] = []
+        for scene in edit.scenes:
+            source = assets_by_scene_id.get(scene.id)
+            if source is None:
+                continue
+            staged = self._stage_asset(source, run_dir)
+            rel = staged.relative_to(self._public_dir).as_posix()
+            if _media_kind(staged) == "image":
+                scene.image = rel
+            else:
+                scene.clip = rel
+            served.append(staged)
+        return served
+
+    def _stage_asset(self, source: Path, run_dir: Path) -> Path:
+        asset_path = Path(source)
+        if not asset_path.is_file():
+            raise ProductionError(f"approved asset is missing: {asset_path}")
+        if asset_path.stat().st_size == 0:
+            raise ProductionError(f"approved asset is empty: {asset_path}")
+        dest = run_dir / asset_path.name
+        shutil.copy2(asset_path, dest)
+        if not dest.is_file() or dest.stat().st_size == 0:
+            raise ProductionError(f"failed to stage approved asset: {dest}")
+        return dest
+
+
+    def _mux_audio(self, video: Path, audio: Path, destination: Path, *, total_seconds: float) -> None:
+        # Pad narration to the exact video length so the whole master carries
+        # audio (trailing silence if narration is short; -shortest trims any excess).
+        pad_len = max(1, int(math.ceil(total_seconds)))
+        _run_ffmpeg((
+            "-y",
+            "-i", str(video),
+            "-i", str(audio),
+            "-filter_complex", f"[1:a]apad=pad_len={pad_len}[narr]",
+            "-map", "0:v:0",
+            "-map", "[narr]",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            str(destination),
+        ))
+
+    def _run_remotion(self, props_path: Path, output: Path, browser: Path) -> None:
+        argv = (
+            self._npm, "run", "render", "--",
+            "--props", os.path.relpath(props_path, self._root),
+            os.path.relpath(output, self._root),
+            "--browser-executable", str(browser),
+        )
+        try:
+            completed = subprocess.run(
+                list(argv), cwd=self._root, shell=False, timeout=600,
+                capture_output=True, text=True, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ProductionError(f"Remotion render could not run: {sanitize_diagnostic(str(error))}") from error
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or f"exit code {completed.returncode}").strip()
+            raise ProductionError(f"Remotion render failed: {sanitize_diagnostic(detail)}")
+
+
 def _write_tone_wav(path: Path, *, seconds: float, hertz: int = 440) -> None:
     import array
     import wave
@@ -591,18 +827,56 @@ def build_edit_document(plan: list[dict], *, fps: int = 30) -> EditDocument:
     outro = EditScene(id="scene-outro", from_frame=0, duration_frames=seconds_to_frames(4.0, fps),
                       title="Outro", caption="End", kind="outro")
     doc.scenes = [intro, *doc.scenes, outro]
-    # Recompute layout so bookends occupy real timeline space.
+    # Lay out every scene uniformly on an integer frame cursor so the intro and
+    # outro occupy real timeline space and no two scenes overlap. Whole frames are
+    # used directly (not seconds_to_frames on a running float) so from_frame stays
+    # exact -- that is what the renderer keys off for the non-overlap invariant.
     cursor = 0
     for scene in doc.scenes:
-        if scene is intro:
-            continue
-        scene.from_frame = seconds_to_frames(cursor, fps)
-        cursor += frames_to_seconds(scene.duration_frames, fps)
-    doc.duration_frames = seconds_to_frames(cursor, fps)
+        scene.from_frame = cursor
+        cursor += scene.duration_frames
+    doc.duration_frames = cursor
     return doc
 
 
 # ========== Asset acquisition (fail-closed rights) ==========
+
+
+def make_production_asset_transport(
+    *, timeout_seconds: float = 60.0, user_agent: str = "ai-video-factory/1.0"
+) -> Callable[[str], bytes]:
+    """Real HTTPS transport for NASA Image & Video Library asset acquisition.
+
+    Returns raw bytes for both the search endpoint (parsed by :func:`search_nasa`)
+    and per-asset media downloads. Follows redirects, enforces a wall-clock timeout,
+    and fails closed on any non-2xx or network error so an unacquirable asset never
+    reaches rendering. The URL is passed to urllib verbatim; ``search_nasa`` builds
+    the public ``https://images-api.nasa.gov/...`` endpoint, so only public HTTPS
+    locations are ever fetched (no loopback/private hosts, no plain HTTP).
+    """
+    from ai_video_factory.assets import TransportError
+
+    def _transport(url: str) -> bytes:
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                status = getattr(response, "status", 200)
+                if status != 200:
+                    raise TransportError(f"HTTP {status} for {url}")
+                return response.read()
+        except urllib.error.HTTPError as error:
+            raise TransportError(
+                f"asset fetch failed for {url}: HTTP {error.code}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise TransportError(
+                f"asset fetch failed for {url}: {error.reason}"
+            ) from error
+
+    return _transport
 
 
 def acquire_assets(
@@ -684,10 +958,23 @@ def build_candidate(
     enforce_runtime(durations)
 
     approved_assets, assets_by_scene_id = acquire_assets(research, plan, transport=asset_transport, workdir=workdir)
+    # Persist the rights manifest so the upload package carries per-asset NASA usage
+    # terms regardless of status; gate_assets already returned only approved records.
+    from ai_video_factory.assets import write_rights_manifest as _write_rights_manifest
+
+    rights_manifest_path = _write_rights_manifest(approved_assets, workdir / "rights_manifest.json")
 
     edit = build_edit_document(plan, fps=fps)
 
-    narration_segments = [(s["narration_wav"], 0.0) for s in plan]
+    # Map each plan scene's narration WAV to its edit scene's start offset so the
+    # real engine places audio at the correct timeline position (after the intro
+    # bookend, between scenes) instead of hard-coding every segment to 0:00. Normal
+    # scenes keep plan order; the intro/outro carry no narration and are skipped.
+    normal_scenes = [s for s in edit.scenes if s.kind == "normal"]
+    narration_segments = [
+        (plan_scene["narration_wav"], normal_scene.from_frame / fps)
+        for plan_scene, normal_scene in zip(plan, normal_scenes)
+    ]
     master_path = workdir / "master.mp4"
     engine.render_master(
         edit, narration_segments=narration_segments, assets_by_scene_id=assets_by_scene_id, destination=master_path,
@@ -719,6 +1006,6 @@ def build_candidate(
         approved_assets=approved_assets,
         assets_by_scene_id=assets_by_scene_id,
         captions=captions,
-        rights_manifest_path=None,
+        rights_manifest_path=rights_manifest_path,
         research_brief_path=brief_path,
     )

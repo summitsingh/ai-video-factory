@@ -36,6 +36,7 @@ from ai_video_factory.production import (
 )
 from ai_video_factory.research_pipeline import (
     Claim,
+    Extraction,
     ResearchResult,
     SourceContent,
     SourceRecord,
@@ -144,16 +145,31 @@ def test_deterministic_extractor_used_in_production(tmp_path: Path) -> None:
     """The production path extracts with the injected extractor, never LM Studio."""
     calls: list[str] = []
 
-    def injected(topic: str, sources: list[SourceContent], **_: object) -> list[tuple[str, str]]:
+    def injected(topic: str, sources: list[SourceContent], **_: object) -> list[Extraction]:
         calls.append(topic)
-        # One distinct, source-backed claim per persisted source (not a repeat).
-        return [
-            (f"Local AI adoption grew {42 + i} percent in 2024 per {s.url}", "confirmed fact")
-            for i, s in enumerate(sources)
-        ]
+        # Read distinct grounded sentences straight from each source's persisted content so
+        # every claim carries a verbatim quote that substantiates it. The shared corpus is
+        # identical across URLs, so the same facts corroborate into verified facts.
+        targets = (
+            "The analysis noted 42 percent growth in 2024.",
+            "Study number 1 recorded a distinct finding of 11 units that year.",
+            "Study number 2 recorded a distinct finding of 12 units that year.",
+        )
+        claims: list[Extraction] = []
+        for src in sources:
+            for sentence in targets:
+                if sentence in src.content:
+                    claims.append(Extraction(
+                        claim=sentence.rstrip("."),
+                        quote=sentence,
+                        classification="confirmed fact",
+                    ))
+        return claims
 
     result = run_daily_job(tmp_path, config=_config(production_extractor=injected), engine=OfflineRenderEngine())  # type: ignore[arg-type]
-    assert calls == ["Local AI Trends"]
+    # Extraction runs once per persisted source; this candidate carries three sources,
+    # so the injected extractor's topic is recorded once per source call.
+    assert calls == ["Local AI Trends"] * 3
     assert result.status == "blocked_on_approval"
 
 
@@ -163,11 +179,22 @@ def test_deterministic_extractor_used_in_production(tmp_path: Path) -> None:
 def test_llm_availability_does_not_change_outcome(tmp_path: Path) -> None:
     """With an injected extractor, LM Studio presence is irrelevant to the outcome."""
 
-    def injected(topic: str, sources: list[SourceContent], **_: object) -> list[tuple[str, str]]:
-        return [
-            (f"Verified finding {i} about local AI in 2024", "confirmed fact")
-            for i in range(3)
-        ]
+    def injected(topic: str, sources: list[SourceContent], **_: object) -> list[Extraction]:
+        targets = (
+            "The analysis noted 42 percent growth in 2024.",
+            "Study number 1 recorded a distinct finding of 11 units that year.",
+            "Study number 2 recorded a distinct finding of 12 units that year.",
+        )
+        claims: list[Extraction] = []
+        for src in sources:
+            for sentence in targets:
+                if sentence in src.content:
+                    claims.append(Extraction(
+                        claim=sentence.rstrip("."),
+                        quote=sentence,
+                        classification="confirmed fact",
+                    ))
+        return claims
 
     result = run_daily_job(tmp_path, config=_config(production_extractor=injected), engine=OfflineRenderEngine())  # type: ignore[arg-type]
     assert result.status == "blocked_on_approval"
@@ -235,6 +262,74 @@ def test_inadequate_material_blocks_long_form(tmp_path: Path) -> None:
         build_candidate(research, engine=OfflineRenderEngine(), min_words=2200, workdir=tmp_path)
     assert "insufficient" in str(excinfo.value).lower()
 
+class _FastManifestEngine(OfflineRenderEngine):
+    """Writes a tiny valid master via one ffmpeg call so the rights-manifest path
+    can be tested without rendering a full ~15-minute candidate."""
+
+    def render_master(self, edit, *, narration_segments, assets_by_scene_id, destination):  # pragma: no cover
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        seg_dir = Path(tempfile.mkdtemp(prefix="avf-fast-"))
+        clip = seg_dir / "clip.mp4"
+        # One short, valid MP4 (video + audio) that ffprobe/QC can measure.
+        subprocess.run(
+            ("ffmpeg", "-y", "-f", "lavfi", "-i",
+             f"testsrc=size=320x240:rate=15:duration=3",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(clip)),
+            check=True, capture_output=True,
+        )
+        destination.write_bytes(clip.read_bytes())
+        return destination
+
+
+def test_build_candidate_writes_rights_manifest(tmp_path: Path) -> None:
+    """build_candidate persists rights_manifest.json and attaches its path so the
+    upload package carries per-asset usage terms regardless of approval status.
+
+    Uses a fast fake engine (tiny valid master) to isolate the manifest-write from
+    the full ~15-minute render; the research fixture has three verified facts plus
+    enough distinct source sentences to clear MIN_VERIFIED_FACTS and the word floor.
+    """
+    def rich_source(url: str, n_sentences: int = 120, *, src_idx: int = 0) -> tuple[SourceRecord, SourceContent]:
+        lines = [f"Report on {url} chapter {src_idx}. The analysis noted 42 percent growth in 2024."]
+        for i in range(1, n_sentences):
+            lines.append(f"Analysis chapter {i} for source {src_idx} documented evidence number {i * 3 % 997} about water beyond Earth across the solar system that year.")
+        record = SourceRecord(url=url, provider="reliable", quality="reliable", title="t")
+        content_obj = SourceContent(
+            url=url, title="t", quality="reliable",
+            content="\n".join(lines), content_hash="",
+        )
+        return record, content_obj
+
+    records: list[SourceRecord] = []
+    contents: dict[str, SourceContent] = {}
+    for i in range(3):  # three sources -> three verified facts (>= MIN_VERIFIED_FACTS)
+        url = f"https://example.com/src{i}"
+        record, content_obj = rich_source(url, src_idx=i)
+        records.append(record)
+        contents[url] = content_obj
+    facts = [
+        Claim(claim_id=f"claim-{i + 1}", text=f"Verified finding {i} about the topic that year 2024",
+              source_ids=[records[i].url], provisional_classification="confirmed fact")
+        for i in range(3)
+    ]
+    research = ResearchResult(
+        topic="Local AI Trends", sources=records, claims=list(facts),
+        verified_facts=list(facts), source_contents=contents, research_brief="",
+    )
+
+    candidate = build_candidate(research, engine=_FastManifestEngine(), min_words=2200, workdir=tmp_path)
+
+    assert candidate.rights_manifest_path is not None, "rights manifest path must be attached"
+    manifest = Path(candidate.rights_manifest_path)
+    assert manifest.is_file(), "rights_manifest.json must be written into the candidate workdir"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "assets" in payload and "approved_count" in payload
 
 # ========== 6. reruns reuse valid stages ==========
 
@@ -302,12 +397,31 @@ def test_source_fetch_and_extractor_are_deterministic() -> None:
     content rather than derived from topic heuristics alone. The injected extractor
     records its identity via the ``identity`` callback that ``run_research`` supplies.
     """
-    def injected(topic: str, sources: list[SourceContent], *, identity=None, **_: object) -> list[tuple[str, str]]:
+    def injected(topic: str, sources: list[SourceContent], *, identity=None, **_: object) -> list[Extraction]:
         if identity is not None:
-            identity("test-extractor", "1.0", "schema-1")
-        return [(f"Fact about {topic} grounded in content", "confirmed fact") for _ in range(3)]
+            identity("test-extractor", "1.0", "schema-1", prompt_version="prompt-1")
+        targets = (
+            "The analysis noted 42 percent growth in 2024.",
+            "Study number 1 recorded a distinct finding of 11 units that year.",
+            "Study number 2 recorded a distinct finding of 12 units that year.",
+        )
+        claims: list[Extraction] = []
+        for src in sources:
+            for sentence in targets:
+                if sentence in src.content:
+                    claims.append(Extraction(
+                        claim=sentence.rstrip("."),
+                        quote=sentence,
+                        classification="confirmed fact",
+                    ))
+        return claims
 
-    fetcher = lambda url: f"Rich grounded content about {url}: 42 percent growth in 2024."
+    fetcher = lambda url: "\n".join([
+        "The analysis noted 42 percent growth in 2024.",
+        "Study number 1 recorded a distinct finding of 11 units that year.",
+        "Study number 2 recorded a distinct finding of 12 units that year.",
+        f"Report specific to {url} with additional grounded material for testing.",
+    ])
     urls = ["https://example.com/a", "https://example.com/b", "https://example.com/c"]
 
     r1 = run_research("Local AI Trends", urls, production_extractor=injected, content_fetcher=fetcher)
