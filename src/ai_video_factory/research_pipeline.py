@@ -581,6 +581,11 @@ class SourceDrop:
     elapsed_seconds: float
     detail: str
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise for provenance artifacts/state (consistent with other records)."""
+        return asdict(self)
+
+
 @dataclass
 class ResearchResult:
     topic: str

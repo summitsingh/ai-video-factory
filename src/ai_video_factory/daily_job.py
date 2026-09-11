@@ -106,6 +106,13 @@ class JobConfig:
     # real authoritative content instead of the topic string alone. Required for a
     # grounded live pilot; empty otherwise (trend-driven discovery).
     research_source_urls: list[str] = field(default_factory=list)
+    # URLs of sources that MAY be skipped (rather than fail the whole research run) if
+    # they exhaust their bounded per-attempt deadline budget during fetch/extraction.
+    # Empty by default so production stays fail-closed; only an EXPLICITLY configured URL
+    # (e.g. a known-slow NASA asset like Mars) is permitted to drop. Every other source
+    # still fails closed on deadline exhaustion. Recorded per-source in the result's
+    # dropped_sources provenance.
+    droppable_urls: frozenset[str] = field(default_factory=frozenset)
     # When True, skip all network activity (offline research + no asset fetch).
     dry_run: bool = False
     # Research extractor selection. In production this is the explicit, schema-
@@ -429,6 +436,7 @@ def _build_research_packages(
             extractor=RULE_BASED_EXTRACTOR if dry_run else None,
             production_extractor=production_extractor,
             content_fetcher=content_fetcher,
+            droppable_urls=config.droppable_urls,
         )
         out_dir = runs_dir / f"research-{candidate.topic_id}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -456,6 +464,7 @@ def _build_research_packages(
                 "extraction_schema_version": result.extraction_schema_version,
                 "source_content_hashes": result.source_content_hashes,
                 "output_digest": result.output_digest,
+                "dropped_sources": [d.to_dict() for d in result.dropped_sources],
             },
             expected_artifacts={"brief": paths["research_brief"]},
         )

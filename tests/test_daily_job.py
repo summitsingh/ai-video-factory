@@ -42,7 +42,7 @@ from ai_video_factory.research_pipeline import (
     SourceRecord,
     run_research,
 )
-from ai_video_factory.trend import TrendCandidate
+from ai_video_factory.trend import TrendCandidate, SourceSignal
 
 
 # ========== Fixtures: canned provider payloads (no network) ==========
@@ -431,3 +431,79 @@ def test_source_fetch_and_extractor_are_deterministic() -> None:
     assert r1.output_digest == r2.output_digest
     assert set(r1.source_content_hashes) == set(urls)
     assert r1.extractor_name is not None
+
+
+def test_droppable_urls_skips_deadline_source_not_fail_closed(tmp_path: Path) -> None:
+    """config.droppable_urls threads into run_research: a source flagged there is skipped
+    (recorded in dropped_sources) when it exhausts its deadline budget, while an unflagged
+    source still fails the research run closed. This is how the live pilot drops a known
+    slow NASA asset (Mars) instead of aborting the whole research stage."""
+    from ai_video_factory.daily_job import _build_research_packages
+    from ai_video_factory.run_store import RunStore
+    from ai_video_factory.research_pipeline import _SourceDeadlineExhausted
+
+    slow_url = "https://images-api.nasa.gov/item/nasa-mars-slow"
+    good_url = "https://images-api.nasa.gov/item/europa-good"
+
+    def fetcher(url: str) -> str:
+        if url == slow_url:
+            raise _SourceDeadlineExhausted("fetch timed out")
+        return _content_fetcher(url)
+
+    def injected(topic: str, sources: list[SourceContent], **_: object) -> list[Extraction]:
+        # One grounded claim per healthy source; the quote is a substring of the fetched
+        # content so the central grounding gate accepts it.
+        return [
+            Extraction(
+                claim="The analysis noted 42 percent growth in 2024",
+                quote="The analysis noted 42 percent growth in 2024.",
+                classification="confirmed fact",
+            )
+            for _ in sources
+        ]
+
+    def shortlist_for() -> list[TrendCandidate]:
+        return [
+            TrendCandidate(
+                topic_id="override",
+                title="Water Beyond Earth",
+                summary="Fixed topic for pilot",
+                first_seen_at=None,
+                observed_at=None,
+                cluster_key="water beyond earth",
+                sources=[
+                    SourceSignal(provider="nasa", url=slow_url, published_at=None),
+                    SourceSignal(provider="nasa", url=good_url, published_at=None),
+                ],
+                signals={},
+            )
+        ]
+
+    runs = tmp_path / "runs" / "daily"
+
+    # NOT flagged first: deadline exhaustion on the slow source fails the run closed.
+    store_fail = RunStore(tmp_path / "state_fail", artifact_root=tmp_path / "runs")
+    cfg_fail = _config(
+        dry_run=False,
+        content_fetcher=fetcher,
+        production_extractor=injected,
+        droppable_urls=frozenset(),
+    )
+    with pytest.raises(_SourceDeadlineExhausted):
+        _build_research_packages(store_fail, runs, shortlist_for(), False, cfg_fail)
+
+    # Flagged slow source -> dropped + recorded; healthy source retained and grounded.
+    store_drop = RunStore(tmp_path / "state_drop", artifact_root=tmp_path / "runs")
+    cfg_drop = _config(
+        dry_run=False,
+        content_fetcher=fetcher,
+        production_extractor=injected,
+        droppable_urls=frozenset({slow_url}),
+    )
+    results, _dirs = _build_research_packages(store_drop, runs, shortlist_for(), False, cfg_drop)
+    assert len(results) == 1
+    dropped = {d.url for d in results[0].dropped_sources}
+    assert slow_url in dropped
+    assert good_url not in dropped
+    # The healthy source still produced a grounded claim.
+    assert any(good_url in c.source_ids for c in results[0].claims)
