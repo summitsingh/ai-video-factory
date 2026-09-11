@@ -5,10 +5,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ai_video_factory.research_pipeline import (
     Claim,
     Contradiction,
+    Extraction,
     ResearchResult,
+    SourceDrop,
+    _SourceDeadlineExhausted,
     classify_source_quality,
     collect_sources,
     detect_contradictions,
@@ -117,3 +122,144 @@ def test_run_research_flags_sensitive_topic(tmp_path: Path) -> None:
     assert result.flag_reasons
     # Sensitive topics must not silently promote unverified claims.
     assert "Human Review Required" in result.research_brief
+
+
+def test_run_research_drops_fetch_deadline_source(tmp_path: Path) -> None:
+    """A source that exhausts its fetch deadline is skipped (not failed closed),
+    recorded in dropped_sources, and excluded from provenance/hashes/brief."""
+    mars = "https://images-api.nasa.gov/item/nasa-456"
+    europa = "https://images-api.nasa.gov/item/europa-ocean"
+
+    def fetcher(url: str) -> bytes:
+        if url == mars:
+            raise _SourceDeadlineExhausted("fetch timed out")
+        return b"Europa has a subsurface ocean of liquid water."
+
+    def extractor(topic: str, src: list, identity=None):
+        for s in src:
+            yield Extraction(
+                claim="Europa harbors a subsurface ocean.",
+                quote="Europa has a subsurface ocean of liquid water.",
+                classification="confirmed fact",
+            )
+
+    result = run_research(
+        "Water in the outer solar system",
+        [mars, europa],
+        content_fetcher=fetcher,
+        production_extractor=extractor,  # type: ignore[arg-type]
+        droppable_urls=frozenset({mars}),
+    )
+    assert len(result.dropped_sources) == 1
+    drop = result.dropped_sources[0]
+    assert isinstance(drop, SourceDrop)
+    assert drop.url == mars and drop.stage == "fetch"
+    # Europa retained; Mars absent from provenance.
+    assert [s.url for s in result.sources] == [europa]
+    assert europa in result.source_content_hashes
+    assert mars not in result.source_content_hashes
+    # The dropped URL is recorded as a skip but never credited to any claim.
+    for line in result.research_brief.splitlines():
+        if line.startswith("- claim-"):
+            assert mars not in line
+    assert "Skipped Sources" in result.research_brief
+    # Only the retained source produced a claim.
+    assert len(result.claims) == 1
+
+
+def test_run_research_fails_closed_on_non_droppable_deadline(tmp_path: Path) -> None:
+    """A non-droppable source that exhausts its deadline fails the whole run."""
+    europa = "https://images-api.nasa.gov/item/europa-ocean"
+
+    def fetcher(url: str) -> bytes:
+        raise _SourceDeadlineExhausted("fetch timed out")
+
+    def extractor(topic: str, src: list, identity=None):
+        yield Extraction("x", "x", "confirmed fact")
+
+    with pytest.raises(_SourceDeadlineExhausted):
+        run_research(
+            "Water in the outer solar system",
+            [europa],
+            content_fetcher=fetcher,
+            production_extractor=extractor,  # type: ignore[arg-type]
+        )
+
+
+def test_run_research_drops_extraction_deadline_source(tmp_path: Path) -> None:
+    """A source that exhausts its extraction deadline is skipped and recorded,
+    while retained sources still yield claims."""
+    mars = "https://images-api.nasa.gov/item/nasa-456"
+    europa = "https://images-api.nasa.gov/item/europa-ocean"
+
+    def fetcher(url: str) -> bytes:
+        return b"Europa has a subsurface ocean of liquid water beneath its icy crust."
+
+    def extractor(topic: str, src: list, identity=None):
+        for s in src:
+            if s.url == mars:
+                raise _SourceDeadlineExhausted("extraction timed out")
+            yield Extraction(
+                claim="Europa harbors a subsurface ocean.",
+                quote="Europa has a subsurface ocean",
+                classification="confirmed fact",
+            )
+
+    result = run_research(
+        "Water in the outer solar system",
+        [mars, europa],
+        content_fetcher=fetcher,
+        production_extractor=extractor,  # type: ignore[arg-type]
+        droppable_urls=frozenset({mars}),
+    )
+    assert len(result.dropped_sources) == 1
+    assert result.dropped_sources[0].stage == "extraction"
+    assert [s.url for s in result.sources] == [europa]
+    assert mars not in result.source_content_hashes
+    assert europa in result.source_content_hashes
+    assert len(result.claims) == 1
+
+
+def test_run_research_drop_is_auditable_in_digest_and_flag(tmp_path: Path) -> None:
+    """A dropped source must surface in the provenance digest and review flag even
+    when the retained claims/hashes are otherwise identical to a run with no drop."""
+    mars = "https://images-api.nasa.gov/item/nasa-456"
+    europa = "https://images-api.nasa.gov/item/europa-ocean"
+    content = b"Europa has a subsurface ocean of liquid water beneath its icy crust."
+
+    def extractor(topic: str, src: list, identity=None):
+        for s in src:
+            yield Extraction(
+                claim="Europa harbors a subsurface ocean.",
+                quote="Europa has a subsurface ocean",
+                classification="confirmed fact",
+            )
+
+    # Baseline: only Europa fetched and retained; nothing dropped.
+    def ok_fetcher(url: str) -> bytes:
+        return content
+
+    base = run_research(
+        "Water in the outer solar system", [europa],
+        content_fetcher=ok_fetcher, production_extractor=extractor,  # type: ignore[arg-type]
+    )
+    assert base.dropped_sources == []
+    assert base.flagged_for_review is False
+
+    # Same retained evidence (Europa only), but Mars was dropped at fetch.
+    def drop_mars_fetcher(url: str) -> bytes:
+        if url == mars:
+            raise _SourceDeadlineExhausted("fetch timed out")
+        return content
+
+    dropped = run_research(
+        "Water in the outer solar system", [mars, europa],
+        content_fetcher=drop_mars_fetcher, production_extractor=extractor,  # type: ignore[arg-type]
+        droppable_urls=frozenset({mars}),
+    )
+    assert [s.url for s in dropped.sources] == [europa]
+    assert dropped.flagged_for_review is True
+    # Identical retained claims/hashes but a drop -> digest must differ (auditable).
+    assert base.source_content_hashes == dropped.source_content_hashes
+    assert [c.claim_id for c in base.claims] == [c.claim_id for c in dropped.claims]
+    assert base.output_digest != dropped.output_digest

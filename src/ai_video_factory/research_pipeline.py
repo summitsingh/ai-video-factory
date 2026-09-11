@@ -22,6 +22,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import signal
+import threading
+import time
+from urllib.error import HTTPError as _HTTPError
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -200,6 +204,10 @@ def fetch_source_content(
 
     try:
         raw = transport(url)
+    except _SourceDeadlineExhausted:
+        # Budget exhaustion is a skip signal for the bounded per-source loop; let the
+        # caller decide whether to drop or fail closed. Do NOT convert to ResearchError.
+        raise
     except Exception as exc:  # noqa: BLE001 - surface any fetch failure verbatim
         raise ResearchError(f"failed to fetch source content for {url}: {exc}") from exc
 
@@ -302,11 +310,104 @@ def _is_blocked_host(hostname: str) -> bool:
     return False
 
 
+class _DeadlineHit(Exception):
+    """Internal signal raised by SIGALRM when a single attempt exceeds its wall-clock
+    budget. Deliberately NOT a :class:`ResearchError` so the bounded-retry helper can
+    treat it as a transient (retryable) failure rather than a fail-closed schema error."""
+    pass
+
+
+class _SourceDeadlineExhausted(ResearchError):
+    """Raised when one source exhausts its bounded per-attempt deadline budget on a
+    transient failure (timeout/connection/5xx) during fetch or model POST.
+
+    Distinct from other :class:`ResearchError` values so the native per-source loop can
+    tell "this source is over budget, skip it" apart from content/schema failures that
+    must fail closed. Subclasses :class:`ResearchError` so broad ``except ResearchError``
+    handlers keep working while callers may catch this specifically to drop only flagged
+    sources and continue the same run."""
+    pass
+
+
+def _enforce_deadline(fn: Callable[[], Any], *, deadline_seconds: float) -> Any:
+    """Run ``fn()`` under a hard wall-clock cap using SIGALRM in the main thread.
+
+    ``urlopen(timeout=...)`` is a per-operation socket timeout, not a wall-clock cap:
+    connect + read operations can cumulatively exceed it (observed in diagnostics), so
+    it cannot alone guarantee a fixed per-attempt budget. SIGALRM interrupts the blocking
+    syscall -- PEP 475 lets the handler's exception escape rather than retrying EINTR --
+    so total wall time stays bounded with no worker threads and no overlap between
+    attempts. The prior signal handler and any pre-existing one-shot timer are restored
+    on exit so an enclosing deadline is never clobbered. Fails closed (never runs
+    unbounded) where SIGALRM is unavailable or off the main thread."""
+    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        raise ResearchError(
+            f"cannot enforce {deadline_seconds}s deadline without SIGALRM on the main "
+            "thread; refusing to run unbounded"
+        )
+
+    def _on_deadline(_signum: int, _frame: Any) -> None:
+        raise _DeadlineHit(f"operation exceeded {deadline_seconds}s wall-clock deadline")
+
+    if deadline_seconds <= 0:
+        raise ResearchError(
+            f"deadline must be positive, got {deadline_seconds}s; refusing to run unbounded"
+        )
+    old_handler = signal.signal(signal.SIGALRM, _on_deadline)
+    old_timer = signal.getitimer(signal.ITIMER_REAL)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, deadline_seconds)
+        return fn()
+    finally:
+        # Cancel our own timer, restore the prior handler, then restore any enclosing
+        # one-shot timer we superseded so its remaining interval/period is preserved.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+        signal.setitimer(signal.ITIMER_REAL, *old_timer)
+
+
+def _run_transient_bounded(
+    fn: Callable[[], Any],
+    *,
+    deadline_seconds: float,
+    max_attempts: int,
+) -> Any:
+    """Run ``fn()`` up to ``max_attempts`` times, each capped by a SIGALRM wall-clock
+    deadline. Retry ONLY transient failures (timeout/connection/5xx); fail immediately
+    on schema/grounding :class:`ResearchError` or HTTP 4xx so they never consume the
+    transient retry budget. After exhausting attempts, raise
+    :class:`_SourceDeadlineExhausted` to mark the source as over-budget."""
+    max_attempts = max(1, int(max_attempts))
+    last_transient: Exception | None = None
+    start = time.monotonic()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _enforce_deadline(fn, deadline_seconds=deadline_seconds)
+        except ResearchError:
+            # Non-transient (4xx, redirect error, insufficient content, malformed
+            # schema/grounding output): fail closed immediately without consuming retries.
+            raise
+        except (TimeoutError, OSError, _DeadlineHit) as exc:
+            last_transient = exc
+            if attempt >= max_attempts:
+                err = _SourceDeadlineExhausted(
+                    f"source exceeded {deadline_seconds}s per-attempt budget after "
+                    f"{max_attempts} attempt(s): {type(exc).__name__}: {exc}"
+                )
+                # Rich diagnostics so the native per-source loop can record a structured
+                # SourceDrop (stage/limit/attempts/elapsed/detail) instead of a bare URL.
+                err.limit_seconds = deadline_seconds
+                err.attempts = max_attempts
+                err.elapsed_seconds = round(time.monotonic() - start, 3)
+                err.detail = f"{type(exc).__name__}: {exc}"
+                raise err from exc
+    assert last_transient is not None  # pragma: no cover - loop always returns/raises
 def make_secure_http_transport(
     *,
     max_redirects: int = _MAX_REDIRECTS,
     max_bytes: int = _MAX_FETCH_BYTES,
     timeout_seconds: float = _FETCH_TIMEOUT_SECONDS,
+    max_attempts: int = 1,
 ) -> Callable[[str], str]:
     """Build a hardened HTTP(S) transport for source fetching.
 
@@ -316,18 +417,84 @@ def make_secure_http_transport(
     * loopback / private / link-local / reserved hosts are refused;
     * redirects are followed manually up to ``max_redirects`` hops (no unbounded
       redirect chains, no automatic library following);
-    * response bodies are capped at ``max_bytes`` and the request times out after
-      ``timeout_seconds``;
+    * response bodies are capped at ``max_bytes`` and each attempt is bounded by a hard
+      SIGALRM wall-clock deadline (not merely the per-operation socket timeout, which can
+      cumulatively exceed it) of ``timeout_seconds``;
     * only text-like content types are accepted (binary media is rejected);
     * no credentials are forwarded: any userinfo in the URL is stripped and no
       Authorization/Cookie headers are added.
 
-    Raises :class:`ResearchError` on any violation so callers fail closed rather
-    than fetching from an unsafe or disallowed location.
+    Each attempt is retried up to ``max_attempts`` times for transient failures only
+    (timeout/connection/HTTP 5xx). HTTP 4xx, redirect errors, oversized bodies, disallowed
+    content types, and insufficient content fail closed immediately without consuming the
+    retry budget. After exhausting attempts on a transient failure, raises
+    :class:`_SourceDeadlineExhausted` so the native per-source loop can skip only flagged
+    sources and continue the same run rather than aborting all research.
+
+    Raises :class:`ResearchError` on any non-transient violation so callers fail closed
+    rather than fetching from an unsafe or disallowed location.
     """
     import urllib.error
     import urllib.parse
     import urllib.request
+
+    headers = {
+        "Accept": ", ".join(_FETCH_CONTENT_TYPE_ALLOWLIST),
+        # Browser-compatible UA so authoritative sites that require one (e.g. JPL) accept the request; the tool identity is retained for transparency. This does not forward credentials or weaken any invariant below.
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 ai-video-factory/1.0",
+    }
+
+    def _do_request(request_url: str) -> tuple[bytes, str]:
+        """Perform one GET; return (body, ctype). ``urlopen(timeout=...)`` bounds each
+        individual socket operation; the total per-attempt wall-clock cap is enforced once
+        by :func:`_run_transient_bounded` around the whole redirect chain + body read."""
+        response = urllib.request.urlopen(
+            urllib.request.Request(request_url, method="GET", headers=headers),
+            timeout=timeout_seconds,
+        )
+        try:
+            raw = response.read(max_bytes + 1)
+            ctype = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        finally:
+            response.close()
+        return raw, ctype
+
+    def _fetch_once(request_url: str) -> str:
+        """One attempt across all redirect hops. Returns the decoded body. Raises
+        :class:`ResearchError` on 4xx / redirect error / oversized / disallowed-type (fail
+        closed); re-raises raw ``HTTPError`` for HTTP 5xx so the bounded caller treats it
+        as a transient and retries once."""
+        raw = b""
+        content_type = ""
+        for _hop in range(max_redirects + 1):
+            try:
+                raw, content_type = _do_request(request_url)
+            except urllib.error.HTTPError as exc:  # includes 3xx when not auto-followed
+                if exc.code in (301, 302, 303, 307, 308) and exc.headers is not None:
+                    location = exc.headers.get("Location")
+                    if not location:
+                        raise ResearchError(
+                            "source redirected with no Location header"
+                        ) from exc
+                    request_url = urllib.parse.urljoin(exc.geturl(), location)
+                    continue
+                if 500 <= exc.code < 600:
+                    raise  # transient server error -> bounded caller retries once (HTTPError is OSError)
+                raise ResearchError(f"source fetch failed: HTTP {exc.code}") from exc
+            break
+        if len(raw) > max_bytes:
+            raise ResearchError(
+                f"source exceeded size limit of {max_bytes} bytes; refusing to extract"
+            )
+        if content_type not in _FETCH_CONTENT_TYPE_ALLOWLIST:
+            raise ResearchError(
+                f"source returned disallowed content type {content_type!r}; "
+                "only text-like sources are extracted"
+            )
+        try:
+            return raw.decode("utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001 - surface decode failure verbatim
+            raise ResearchError(f"source could not be decoded as UTF-8: {exc}") from exc
 
     def _transport(url: str) -> str:
         scheme = ""
@@ -354,45 +521,16 @@ def make_secure_http_transport(
         netloc = (safe_url.netloc or "").split("@", 1)[-1]
         request_url = safe_url._replace(netloc=netloc).geturl()
 
-        headers = {
-            "Accept": ", ".join(_FETCH_CONTENT_TYPE_ALLOWLIST),
-            "User-Agent": "ai-video-factory/1.0",
-        }
-        raw = b""
-        content_type = ""
-        for _hop in range(max_redirects + 1):
-            request = urllib.request.Request(request_url, method="GET", headers=headers)
-            try:
-                with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-                    raw = response.read(max_bytes + 1)
-                    content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            except urllib.error.HTTPError as exc:  # includes 3xx when not auto-followed
-                if exc.code in (301, 302, 303, 307, 308) and exc.headers is not None:
-                    location = exc.headers.get("Location")
-                    if not location:
-                        raise ResearchError(
-                            f"source {url!r} redirected with no Location header"
-                        ) from exc
-                    # Resolve relative redirects against the response URL.
-                    request_url = urllib.parse.urljoin(exc.geturl(), location)
-                    continue
-                raise ResearchError(f"source fetch failed for {url!r}: HTTP {exc.code}") from exc
-
-            break
-
-        if len(raw) > max_bytes:
-            raise ResearchError(
-                f"source {url!r} exceeded size limit of {max_bytes} bytes; refusing to extract"
-            )
-        if content_type not in _FETCH_CONTENT_TYPE_ALLOWLIST:
-            raise ResearchError(
-                f"source {url!r} returned disallowed content type {content_type!r}; "
-                "only text-like sources are extracted"
-            )
-        try:
-            return raw.decode("utf-8", errors="replace")
-        except Exception as exc:  # noqa: BLE001 - surface decode failure verbatim
-            raise ResearchError(f"source {url!r} could not be decoded as UTF-8: {exc}") from exc
+        # Bounded transient retry: each attempt is capped by a hard SIGALRM wall-clock
+        # deadline. Transient failures (timeout/connection/5xx) retry up to max_attempts;
+        # 4xx / redirect errors / oversized / disallowed-type fail closed immediately. After
+        # exhausting attempts, raise _SourceDeadlineExhausted so the native per-source loop
+        # can skip only flagged sources and continue the same run.
+        return _run_transient_bounded(
+            lambda: _fetch_once(request_url),
+            deadline_seconds=timeout_seconds,
+            max_attempts=max_attempts,
+        )
 
     return _transport
 
@@ -429,6 +567,21 @@ class Contradiction:
 
 
 @dataclass
+class SourceDrop:
+    """Structured diagnostic for a source skipped because it exhausted its bounded
+    per-attempt wall-clock deadline budget during fetch or extraction.
+
+    Retained on :attr:`ResearchResult.dropped_sources` so provenance never falsely credits
+    the dropped source with supporting the film and the operator keeps why/where it was
+    dropped (stage, attempt limit, elapsed time, final failure detail)."""
+    url: str
+    stage: Literal["fetch", "extraction"]
+    limit_seconds: float
+    attempts: int
+    elapsed_seconds: float
+    detail: str
+
+@dataclass
 class ResearchResult:
     topic: str
     sources: list[SourceRecord] = field(default_factory=list)
@@ -456,6 +609,12 @@ class ResearchResult:
     # the production path so narration can be grounded in real material rather than
     # invented filler. Absent on the legacy topic+URLs path used by dry-run/tests.
     source_contents: dict[str, SourceContent] = field(default_factory=dict)
+    # Structured diagnostics for sources skipped because they exhausted their bounded
+    # per-attempt deadline budget during fetch or extraction. Recorded so provenance never
+    # falsely credits a dropped source (e.g. Mars) with supporting the film, and so the
+    # operator retains why/where each drop happened; downstream asset planning uses the
+    # retained sources only. Empty when nothing was dropped.
+    dropped_sources: list[SourceDrop] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -681,6 +840,8 @@ def make_production_extractor(
     extractor_version: str = "1.0",
     prompt_version: str = PROMPT_VERSION,
     extraction_schema_version: str = EXTRACTION_SCHEMA_VERSION,
+    timeout_seconds: float = 180,
+    max_attempts: int = _EXTRACTION_RETRIES,
 ) -> ProductionExtractor:
     """Build a schema-constrained production claim extractor.
 
@@ -813,27 +974,30 @@ def make_production_extractor(
                 )
             return extractions
 
-        # The local general-purpose model emits non-deterministic output at temperature=0
-        # for the same prompt+content (verified empirically): a rich source that conforms
-        # on one call may emit preamble/empty/junk on another. Retry a bounded number of
-        # times so transient variance does not abort research, while still failing closed
-        # after every attempt is non-conforming. Transport errors (endpoint unavailable)
-        # are NOT retried here -- they must surface immediately as fail-closed.
         accepted: list[Extraction] | None = None
         last_error: Exception | None = None
-        for _attempt in range(_EXTRACTION_RETRIES):
-            with urllib.request.urlopen(request, timeout=180) as response:
-                result = json.loads(response.read().decode("utf-8"))
+        for _attempt in range(max_attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+            except _HTTPError as exc:
+                # 5xx is transient (server overload) -> retry; 4xx fails closed immediately.
+                if 500 <= exc.code < 600:
+                    last_error = exc
+                    continue
+                raise ResearchError(f"model POST failed: HTTP {exc.code}") from exc
             content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
             try:
                 accepted = _parse(content)
                 break
             except ResearchError as exc:
+                # Non-conforming model output is transient (temperature=0 variance); retry.
                 last_error = exc
 
         if accepted is None:
-            assert last_error is not None  # loop ran at least once
-            raise last_error
+            raise last_error if last_error is not None else ResearchError(
+                "production extractor returned no claims with verbatim evidence"
+            )
 
         if identity is not None:
             identity(
@@ -1218,6 +1382,8 @@ def extract_from_source_content(
     *,
     extractor: ProductionExtractor | None = None,
     identity: Callable[[str, str, str, str | None, str | None], None] | None = None,
+    droppable_urls: frozenset[str] = frozenset(),
+    drops: list[SourceDrop] | None = None,
 ) -> tuple[list[Claim], dict[str, str]]:
     """Extract claims grounded in persisted source content.
 
@@ -1244,57 +1410,81 @@ def extract_from_source_content(
     # its verbatim evidence quote was already validated as a substring of that source.
     records: list[EvidenceRecord] = []
     rec_counter = 0
+    # Sources that survived BOTH fetch and extraction; provenance, hashes, and the brief
+    # are built from these only, so a dropped source never falsely appears to support the
+    # film.
+    retained: list[SourceContent] = []
+    dropped_seen: set[str] = set()
     for sc in sources:
-        chunk = _clean_excerpt(sc.content, topic)
-        single = SourceContent(
-            url=sc.url, title=sc.title, quality=sc.quality,
-            content=chunk.text, content_hash=sc.content_hash,
-        )
-        # Central grounding gate: applies to EVERY extractor (not just the LM Studio
-        # one), so an injected/custom extractor cannot bypass the verbatim-evidence
-        # requirement. Each claim must carry a valid label and a quote that actually
-        # appears in this source's selected chunk; anything else fails closed.
-        for ext in extractor(topic, [single], identity=identity):
-            if ext.classification not in _VALID_CLASSIFICATIONS:
-                raise ResearchError(
-                    f"extractor produced invalid classification {ext.classification!r}; "
-                    "refusing to promote non-conforming output as verified facts"
-                )
-            norm_claim = _collapse_ws(ext.claim)
-            norm_quote = _collapse_ws(ext.quote)
-            if not norm_claim or not norm_quote:
-                raise ResearchError(
-                    "extractor produced a claim without claim text or evidence quote; "
-                    "refusing to promote non-conforming output"
-                )
-            # Strengthened central grounding gate (applies to EVERY extractor, not
-            # just the LM Studio one): the quote must occur wholly within at least ONE
-            # selected raw slice, so a fabricated quote spanning the join of two
-            # reordered/non-contiguous sentences cannot pass. Each raw slice is normalized
-            # with _normalize_with_offsets (removing script/style bodies + tags, collapsing
-            # whitespace) exactly as the excerpt was built, so markup never causes a false
-            # rejection and script junk can't supply a matching quote. The empty-quote check
-            # above still rejects whitespace-only quotes (which would match every slice).
-            slices = [
-                _normalize_with_offsets(sc.content[s:e])[0]
-                for s, e in chunk.source_ranges
-            ]
-            if not any(norm_quote in sl for sl in slices):
-                raise ResearchError(
-                    f"extractor produced a quote not present wholly within source "
-                    f"{sc.url!r} chunk slice; claim is not grounded and is rejected "
-                    f"({norm_quote[:60]!r})"
-                )
-            rec_counter += 1
-            records.append(EvidenceRecord(
-                id=f"rec-{rec_counter:03d}",
-                url=sc.url,
-                label=ext.classification,
-                claim=ext.claim,
-                evidence_quote=ext.quote,
-                chunk_id=chunk.id,
-                chunk_ranges=list(chunk.source_ranges),
-            ))
+        try:
+            chunk = _clean_excerpt(sc.content, topic)
+            single = SourceContent(
+                url=sc.url, title=sc.title, quality=sc.quality,
+                content=chunk.text, content_hash=sc.content_hash,
+            )
+            # Central grounding gate: applies to EVERY extractor (not just the LM Studio
+            # one), so an injected/custom extractor cannot bypass the verbatim-evidence
+            # requirement. Each claim must carry a valid label and a quote that actually
+            # appears in this source's selected chunk; anything else fails closed.
+            for ext in extractor(topic, [single], identity=identity):
+                if ext.classification not in _VALID_CLASSIFICATIONS:
+                    raise ResearchError(
+                        f"extractor produced invalid classification {ext.classification!r}; "
+                        "refusing to promote non-conforming output as verified facts"
+                    )
+                norm_claim = _collapse_ws(ext.claim)
+                norm_quote = _collapse_ws(ext.quote)
+                if not norm_claim or not norm_quote:
+                    raise ResearchError(
+                        "extractor produced a claim without claim text or evidence quote; "
+                        "refusing to promote non-conforming output"
+                    )
+                # Strengthened central grounding gate (applies to EVERY extractor, not
+                # just the LM Studio one): the quote must occur wholly within at least ONE
+                # selected raw slice, so a fabricated quote spanning the join of two
+                # reordered/non-contiguous sentences cannot pass. Each raw slice is normalized
+                # with _normalize_with_offsets (removing script/style bodies + tags, collapsing
+                # whitespace) exactly as the excerpt was built, so markup never causes a false
+                # rejection and script junk can't supply a matching quote. The empty-quote check
+                # above still rejects whitespace-only quotes (which would match every slice).
+                slices = [
+                    _normalize_with_offsets(sc.content[s:e])[0]
+                    for s, e in chunk.source_ranges
+                ]
+                if not any(norm_quote in sl for sl in slices):
+                    raise ResearchError(
+                        f"extractor produced a quote not present wholly within source "
+                        f"{sc.url!r} chunk slice; claim is not grounded and is rejected "
+                        f"({norm_quote[:60]!r})"
+                    )
+                rec_counter += 1
+                records.append(EvidenceRecord(
+                    id=f"rec-{rec_counter:03d}",
+                    url=sc.url,
+                    label=ext.classification,
+                    claim=ext.claim,
+                    evidence_quote=ext.quote,
+                    chunk_id=chunk.id,
+                    chunk_ranges=list(chunk.source_ranges),
+                ))
+            retained.append(sc)
+        except _SourceDeadlineExhausted as exc:
+            # Extraction-stage deadline exhaustion: skip ONLY flagged sources and continue
+            # the same run. Other ResearchError (malformed schema / ungrounded quote) still
+            # fails closed immediately -- it is not a transient budget failure.
+            if sc.url not in droppable_urls or sc.url in dropped_seen:
+                raise
+            dropped_seen.add(sc.url)
+            if drops is not None:
+                drops.append(SourceDrop(
+                    url=sc.url,
+                    stage="extraction",
+                    limit_seconds=getattr(exc, "limit_seconds", 0.0),
+                    attempts=getattr(exc, "attempts", 1),
+                    elapsed_seconds=getattr(exc, "elapsed_seconds", 0.0),
+                    detail=getattr(exc, "detail", str(exc)),
+                ))
+            continue
 
     if not records:
         raise ResearchError(
@@ -1303,7 +1493,7 @@ def extract_from_source_content(
         )
 
     claims = _build_claims_from_records(records)
-    content_hashes = {s.url: s.content_hash for s in sources}
+    content_hashes = {s.url: s.content_hash for s in retained}
     return claims, content_hashes
 
 # ========== Corroboration + contradiction detection ==========
@@ -1393,6 +1583,7 @@ def run_research(
     content_fetcher: Callable[[str], str | bytes] | None = None,
     source_contents: list[SourceContent] | None = None,
     observed_at: str | None = None,
+    droppable_urls: frozenset[str] = frozenset(),
 ) -> ResearchResult:
     """Run the full research pipeline for one topic.
 
@@ -1410,12 +1601,22 @@ def run_research(
 
     The returned result carries the extractor identity, per-source content
     hashes, and an output digest — all part of the research-stage fingerprint.
+
+    ``droppable_urls`` lists sources that may be skipped (rather than fail the run)
+    when they exhaust their bounded per-attempt deadline budget during fetch or
+    extraction; such sources are recorded in ``result.dropped_sources`` and excluded
+    from provenance, hashes, content, and the brief. Every other source still fails
+    closed on deadline exhaustion.
     """
     observed_at = observed_at or datetime.now(UTC).isoformat()
     sources = collect_sources(source_urls)
 
     identity_holder: dict[str, str | None] = {"name": None, "version": None, "schema": None, "prompt_version": None, "model_id": None, "endpoint_url": None}
     contents: list[SourceContent] = []
+    # Structured diagnostics for sources skipped due to exhausting their bounded
+    # per-attempt deadline budget during fetch or extraction. Retained on the result so
+    # provenance never falsely credits a dropped source and the operator keeps why/where.
+    drops: list[SourceDrop] = []
 
     # Production path: extract against persisted source content.
     if production_extractor is not None or source_contents is not None or content_fetcher is not None:
@@ -1425,15 +1626,32 @@ def run_research(
         contents = list(source_contents) if source_contents is not None else []
         if not contents:
             for rec in sources:
-                contents.append(
-                    fetch_source_content(rec.url, rec.title or "", rec.quality, transport=content_fetcher)
-                )
+                try:
+                    contents.append(
+                        fetch_source_content(rec.url, rec.title or "", rec.quality, transport=content_fetcher)
+                    )
+                except _SourceDeadlineExhausted as exc:
+                    # Fetch-stage deadline exhaustion: skip ONLY flagged sources (e.g. Mars)
+                    # and continue the same run; other sources fail closed.
+                    if rec.url not in droppable_urls:
+                        raise
+                    drops.append(SourceDrop(
+                        url=rec.url,
+                        stage="fetch",
+                        limit_seconds=getattr(exc, "limit_seconds", 0.0),
+                        attempts=getattr(exc, "attempts", 1),
+                        elapsed_seconds=getattr(exc, "elapsed_seconds", 0.0),
+                        detail=getattr(exc, "detail", str(exc)),
+                    ))
+                    continue
 
         claims, content_hashes = extract_from_source_content(
             topic,
             contents,
             extractor=production_extractor or make_production_extractor(),
             identity=lambda name, ver, ps, prompt_version=None, model_id=None, endpoint_url=None: identity_holder.update({"name": name, "version": ver, "schema": ps, "prompt_version": prompt_version, "model_id": model_id, "endpoint_url": endpoint_url}),
+            droppable_urls=droppable_urls,
+            drops=drops,
         )
     else:
         # Legacy path (tests / dry-run inject RULE_BASED_EXTRACTOR via extractor=).
@@ -1450,17 +1668,52 @@ def run_research(
     # evidence, or an underlying source invalidates prior runs.
     claims_data = sorted((c.to_dict() for c in claims), key=lambda c: c["claim_id"])
     digest_inputs = json.dumps(claims_data, sort_keys=True)
+    # Dropped sources are part of the provenance fingerprint too: two runs with identical
+    # retained claims/hashes but materially different source failures must not collide.
+    drops_digest = json.dumps(
+        sorted(
+            (
+                {
+                    "url": d.url,
+                    "stage": d.stage,
+                    "attempts": d.attempts,
+                    "limit_seconds": d.limit_seconds,
+                    "elapsed_seconds": d.elapsed_seconds,
+                    "detail": d.detail,
+                }
+                for d in drops
+            ),
+            key=lambda x: (x["url"], x["stage"]),
+        ),
+        sort_keys=True,
+    )
     output_digest = hashlib.sha256(
-        f"{topic}|{digest_inputs}|{json.dumps(content_hashes, sort_keys=True)}".encode("utf-8")
+        f"{topic}|{digest_inputs}|{drops_digest}|{json.dumps(content_hashes, sort_keys=True)}".encode("utf-8")
     ).hexdigest()
 
-    # Persisted source content keyed by URL (production path only).
-    contents_by_url: dict[str, SourceContent] = {c.url: c for c in contents} if contents else {}
+    # Sources actually retained after bounded per-source deadline handling (fetch +
+    # extraction). Provenance, hashes, the brief, and downstream asset planning use these
+    # only -- a dropped source must never appear to support the film.
+    dropped_url_set = {d.url for d in drops}
+    retained_sources = [s for s in sources if s.url not in dropped_url_set]
+
+    # Persisted source content keyed by URL (production path only), excluding any dropped
+    # source so the fingerprint and narration material cover retained sources only.
+    contents_by_url: dict[str, SourceContent] = {
+        c.url: c for c in contents if c.url not in dropped_url_set
+    } if contents else {}
 
     brief_lines = [f"# Research Brief: {topic}", "", f"Generated: {observed_at}", ""]
     brief_lines.append("## Sources")
-    for source in sources:
+    for source in retained_sources:
         brief_lines.append(f"- [{source.quality}] {source.url}")
+    if dropped_url_set:
+        brief_lines += ["", "## Skipped Sources (over per-attempt deadline)", ""]
+        for d in drops:
+            brief_lines.append(
+                f"- [{d.stage}] {d.url}: exceeded {d.limit_seconds}s after {d.attempts} attempt(s) "
+                f"({d.elapsed_seconds}s); detail: {d.detail}"
+            )
     brief_lines += ["", "## Extracted Claims", ""]
     for claim in claims:
         flag = "" if claim.provisional_classification == "confirmed fact" else f" ({claim.provisional_classification})"
@@ -1480,12 +1733,12 @@ def run_research(
 
     return ResearchResult(
         topic=topic,
-        sources=sources,
+        sources=retained_sources,
         claims=claims,
         contradictions=contradictions,
         verified_facts=verified,
         research_brief="\n".join(brief_lines) + "\n",
-        flagged_for_review=requires_human_review(reasons),
+        flagged_for_review=requires_human_review(reasons) or bool(drops),
         flag_reasons=list(reasons),
         extractor_name=identity_holder["name"],
         extractor_version=identity_holder["version"],
@@ -1496,6 +1749,7 @@ def run_research(
         source_content_hashes=content_hashes,
         output_digest=output_digest,
         source_contents=contents_by_url,
+        dropped_sources=drops,
     )
 
 
