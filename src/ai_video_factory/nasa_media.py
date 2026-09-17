@@ -18,7 +18,7 @@ _NASA_ASSETS = "https://images-assets.nasa.gov"
 _USER_AGENT = "AI-Video-Factory/0.1 (local documentary draft; contact: local)"
 _HTTP_TIMEOUT = 60
 
-# Words that carry no search value — stripped from titles before querying NASA.
+# Words that carry no search value - stripped from titles before querying NASA.
 _STOP_WORDS = frozenset({
     "the", "a", "an", "of", "and", "or", "in", "on", "for", "with", "into",
     "from", "by", "at", "is", "are", "was", "were", "how", "that", "this",
@@ -30,13 +30,15 @@ _STOP_WORDS = frozenset({
 _SUFFIXES = ("'s", "'re", "'ve", "'ll", "'d")
 
 
-def _extract_query(title: str) -> str:
+def _extract_query(title: str, stop_words: frozenset[str] | None = None) -> str:
     """Turn a verbose scene title into a NASA-searchable query.
 
     Strips stop words and possessive suffixes, then joins the remaining
     meaningful tokens. Falls back to the raw title if nothing survives so we
-    never send an empty query.
+    never send an empty query. ``stop_words`` defaults to the module-level
+    list; callers pass a theme's list for per-topic theming.
     """
+    stop = _STOP_WORDS if stop_words is None else frozenset(stop_words)
     tokens = []
     for token in title.replace(",", " ").split():
         # Drop trailing apostrophe contractions: "Nebula's" -> "Nebula".
@@ -48,28 +50,29 @@ def _extract_query(title: str) -> str:
         if not token:
             continue
         low = token.lower()
-        if low in _STOP_WORDS:
+        if low in stop:
             continue
         tokens.append(token)
     return " ".join(tokens) or title.strip()
 
 
-def _query_variants(title: str) -> list[str]:
+def _query_variants(title: str, stop_words: frozenset[str] | None = None) -> list[str]:
     """Return candidate NASA queries for a scene, best first.
 
     The primary query is the extracted keyword phrase. If that returns no
-    media we progressively simplify — dropping leading adjectives down to the
-    last two meaningful tokens — so poetic titles like "Horsehead's Hidden
+    media we progressively simplify - dropping leading adjectives down to the
+    last two meaningful tokens - so poetic titles like "Horsehead's Hidden
     Structure" still surface something (e.g. "Horsehead"). Single generic words
     are never tried on their own: they pull unrelated hits ("Core" -> rocket
     stages). If nothing multi-word matches, the scene keeps its title-card look
     rather than showing off-topic media.
     """
-    primary = _extract_query(title)
+    stop = _STOP_WORDS if stop_words is None else frozenset(stop_words)
+    primary = _extract_query(title, stop)
     variants: list[str] = [primary]
-    words = [w for w in primary.split() if w.lower() not in _STOP_WORDS]
+    words = [w for w in primary.split() if w.lower() not in stop]
     # Build a ladder of trailing multi-word candidates, longest first. For a
-    # 4-word title this yields the full phrase, then the last 3, 2 tokens —
+    # 4-word title this yields the full phrase, then the last 3, 2 tokens -
     # always at least two words so we never fall back to a lone generic noun.
     for tail in range(len(words), 1, -1):
         candidate = " ".join(words[-tail:])
@@ -185,6 +188,7 @@ def populate_assets_from_nasa(
     *,
     max_images: int = 2,
     max_clips: int = 1,
+    stop_words: frozenset[str] | None = None,
 ) -> dict[str, int]:
     """Download NASA public-domain assets into per-scene folders.
 
@@ -217,9 +221,9 @@ def populate_assets_from_nasa(
         try:
             # Try progressively simpler queries until a variant returns media,
             # so poetic titles still surface something from the NASA catalog.
-            query = _extract_query(title)
+            query = _extract_query(title, stop_words)
             assets: list[StockAsset] = []
-            for candidate in _query_variants(title):
+            for candidate in _query_variants(title, stop_words):
                 assets = fetch_nasa_for_scene(
                     [candidate], scene_dir,
                     max_images=max_images, max_clips=max_clips,

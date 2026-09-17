@@ -20,7 +20,7 @@ from ai_video_factory.run_store import RunStore
 Clock = Callable[[], float]
 
 _STAGE = "lm-studio-capability"
-_MODEL_IDENTIFIER = "avf-tiel-coder-executor"
+_MODEL_IDENTIFIER = "avf-qwen36-executor"
 _HTTP_TIMEOUT_SECONDS = 60.0
 _CHECK_NAMES = (
     "ordinary_generation",

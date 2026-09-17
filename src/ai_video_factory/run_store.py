@@ -30,13 +30,29 @@ def fingerprint_inputs(inputs: dict[str, Any]) -> str:
 
 
 class RunStore:
-    def __init__(self, root: Path, *, artifact_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        artifact_root: Path | None = None,
+        default_ttl_seconds: int = 12 * 3600,
+    ) -> None:
         self.root = Path(root)
         self.artifact_root = Path(artifact_root or root).resolve()
+        self.default_ttl_seconds = default_ttl_seconds
 
-    def start(self, stage: str, inputs: dict[str, Any]) -> RunManifest:
+    def start(
+        self,
+        stage: str,
+        inputs: dict[str, Any],
+        *,
+        ttl_seconds: int | None = None,
+    ) -> RunManifest:
         self._validate_stage(stage)
         fingerprint = fingerprint_inputs(inputs)
+        # Reap crashed runs first so a stale `running` manifest never blocks
+        # or collides with the fresh run we are about to start.
+        self.reap_stale_runs(stage)
         completed = self._newest_completed(stage, fingerprint)
         if completed is not None:
             resumed = replace(completed, resumed=True, updated_at=_timestamp())
@@ -58,6 +74,9 @@ class RunStore:
             artifacts={},
             artifact_integrity={},
             error=None,
+            started_at=now,
+            last_heartbeat_at=now,
+            ttl_seconds=ttl_seconds if ttl_seconds is not None else self.default_ttl_seconds,
         )
         self._write_manifest(manifest)
         self._append_event(manifest, "run_started", {"status": manifest.status})
@@ -99,6 +118,88 @@ class RunStore:
     def event(self, run_id: str, event: str, fields: dict[str, Any]) -> None:
         manifest = self._load_run(run_id)
         self._append_event(manifest, event, fields)
+
+    def heartbeat(self, run_id: str) -> RunManifest:
+        """Refresh a running run's liveness timestamp.
+
+        Long stages (multi-hour renders) should call this periodically so a
+        crashed process is distinguishable from a slow one. Raises if the run
+        is not currently running.
+        """
+        manifest = self._load_run(run_id)
+        if manifest.status is not StageStatus.running:
+            raise ValueError("only running runs can heartbeat")
+        now = _timestamp()
+        refreshed = replace(
+            manifest, last_heartbeat_at=now, updated_at=now
+        )
+        self._write_manifest(refreshed)
+        self._append_event(refreshed, "run_heartbeat", {})
+        return refreshed
+
+    def reap_stale_runs(self, stage: str | None = None) -> list[str]:
+        """Mark `running` manifests older than their TTL as superseded.
+
+        Returns the reaped run ids. Manifests that predate liveness fields
+        fall back to their created_at timestamp, then the manifest file's
+        mtime, so legacy zombie runs are reaped too.
+        """
+        reaped: list[str] = []
+        if stage is not None:
+            self._validate_stage(stage)
+            stage_names = [stage]
+        else:
+            stage_names = [
+                entry.name
+                for entry in self.root.iterdir()
+                if entry.is_dir()
+            ]
+        for stage_name in stage_names:
+            try:
+                self._validate_stage(stage_name)
+            except ValueError:
+                continue
+            stage_directory = self.root / stage_name
+            if not stage_directory.is_dir():
+                continue
+            for path in self._manifest_paths_for_stage(stage_directory):
+                manifest = self._read_manifest(path)
+                if manifest.status is not StageStatus.running:
+                    continue
+                if not self._is_stale(manifest, path):
+                    continue
+                superseded = replace(
+                    manifest,
+                    status=StageStatus.superseded,
+                    updated_at=_timestamp(),
+                    error="superseded: run exceeded its TTL without a heartbeat",
+                )
+                self._write_manifest(superseded)
+                self._append_event(
+                    superseded, "run_superseded", {"reason": "ttl_expired"}
+                )
+                reaped.append(manifest.run_id)
+        return reaped
+
+    def _is_stale(self, manifest: RunManifest, manifest_path: Path) -> bool:
+        """True when a running manifest has outlived its TTL."""
+        ttl = manifest.ttl_seconds or self.default_ttl_seconds
+        reference = (
+            manifest.last_heartbeat_at
+            or manifest.started_at
+            or manifest.created_at
+            or manifest.updated_at
+        )
+        reference_dt = _parse_timestamp(reference)
+        if reference_dt is None:
+            try:
+                reference_dt = datetime.fromtimestamp(
+                    manifest_path.stat().st_mtime, tz=UTC
+                )
+            except OSError:
+                return False
+        elapsed = (datetime.now(UTC) - reference_dt).total_seconds()
+        return elapsed > ttl
 
     def _append_event(
         self, manifest: RunManifest, event: str, fields: dict[str, Any]
@@ -332,6 +433,19 @@ class RunStore:
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    """Parse an ISO timestamp, normalizing naive values to UTC."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _sha256(path: Path) -> str:

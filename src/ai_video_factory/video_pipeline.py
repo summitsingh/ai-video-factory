@@ -9,14 +9,20 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
+from uuid import uuid4
+
+import fcntl
 
 from ai_video_factory.edit_schema import EditDocument, EditScene, load_edit, save_edit
 from ai_video_factory.lm_studio import LmStudioError
@@ -34,10 +40,11 @@ from ai_video_factory.qc import evaluate_qc, write_qc_reports
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
-from ai_video_factory.subtitle_export import write_subtitles
+from ai_video_factory.subtitle_export import subtitle_provenance, write_subtitles
 from ai_video_factory.nasa_media import populate_assets_from_nasa
+from ai_video_factory.theme import SPACE_THEME, ThemeConfig
 from ai_video_factory.thumbnail import build_thumbnails, validate_thumbnails
-from ai_video_factory.script_generator import ScriptOutput, generate_script
+from ai_video_factory.script_generator import ScriptGenerationError, ScriptOutput, generate_script
 
 
 # ========== Types and Models ==========
@@ -105,6 +112,36 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def slugify_topic(topic: str) -> str:
+    """Turn a topic into a safe filesystem slug.
+
+    Lowercases, replaces runs of non-alphanumeric characters with a single
+    hyphen, truncates to 60 characters, and falls back to "untitled" for
+    empty input so topics can never traverse or break paths.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", (topic or "").lower()).strip("-")
+    slug = slug[:60].rstrip("-")
+    return slug or "untitled"
+
+
+@contextmanager
+def remotion_public_lock(data_root: Path) -> Iterator[None]:
+    """Cross-process exclusive lock for the shared remotion/public staging dir.
+
+    Held from asset staging through the end of the chunked render so two
+    concurrent pipeline runs can never clobber each other's scene media.
+    The lock file lives under data/ (gitignored) and is created on demand.
+    """
+    lock_path = Path(data_root) / ".avf-public.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _pipeline_inputs(
     project_root: Path,
     fixture: Path,
@@ -162,7 +199,7 @@ def _renderer_file_digests(
         try:
             name = path.resolve().relative_to(project_root).as_posix()
         except ValueError:
-            name = "python:ai_video_factory/pipeline.py"
+            name = "python:ai_video_factory/video_pipeline.py"
         records[name] = {"sha256": _sha256(path), "size_bytes": path.stat().st_size}
     return dict(sorted(records.items()))
 
@@ -433,13 +470,41 @@ def _finish_chunk(edit: EditDocument, scenes: list[EditScene]) -> EditDocument:
     )
 
 
-def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None = None) -> None:
+# ffprobe binary name for this platform; kept as a module constant so the
+# sibling-derivation logic stays unit-testable on any OS.
+_FFPROBE_EXE = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+
+
+def _resolve_ffprobe(ffmpeg_bin: str) -> str:
+    """Derive an ffprobe executable from the resolved ffmpeg path.
+
+    The old logic reused the ffmpeg binary itself as the probe command,
+    which rejects ffprobe flags and silently disabled every xfade. We look
+    for ffprobe next to ffmpeg first, then on PATH, and only as a last
+    resort return the bare "ffprobe" name so the failure surfaces as a
+    proper PipelineCommandError.
+    """
+    name = _FFPROBE_EXE
+    if ffmpeg_bin and ffmpeg_bin != "ffmpeg":
+        candidate = Path(ffmpeg_bin).parent / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    located = shutil.which("ffprobe")
+    if located:
+        return located
+    return "ffprobe"
+
+
+def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None = None) -> bool:
     """Concatenate rendered chunk MP4s.
 
     Prefers an xfade-based re-encode so transitions between chunks are smooth
     cross-dissolves instead of hard cuts. Falls back to stream-copy concat if
     the xfade path fails (e.g. codec incompatibility), preserving the original
     behavior in that case.
+
+    Returns True when the xfade path degraded to hard-cut concat so the
+    caller can record it in run metadata instead of failing silently.
     """
     destination = Path(destination).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -451,8 +516,16 @@ def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None
 
     try:
         _concat_with_xfade(chunks, destination, ffmpeg_bin, xfadeseconds)
+        return False
     except PipelineCommandError as error:
-        # Fall back to stream-copy concat on any xfade failure.
+        # Fall back to stream-copy concat on any xfade failure, but say so
+        # loudly: a degraded transition must be visible, not silent.
+        print(
+            "WARNING: xfade chunk concat failed "
+            f"({sanitize_diagnostic(error)}); falling back to hard-cut "
+            "stream-copy concat",
+            file=sys.stderr,
+        )
         filelist = destination.parent / "chunks.txt"
         filelist.write_text(
             "".join(f"file '{Path(c).resolve()}'\n" for c in chunks), encoding="utf-8"
@@ -475,6 +548,7 @@ def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None
             name="FFmpeg chunk concat (fallback)",
             timeout=600,
         )
+        return True
 
 
 def _concat_with_xfade(
@@ -490,7 +564,7 @@ def _concat_with_xfade(
     # Probe durations to compute correct xfade offsets.
     import subprocess
 
-    probe_bin = "ffprobe" if ffmpeg_bin == "ffmpeg" else ffmpeg_bin
+    probe_bin = _resolve_ffprobe(ffmpeg_bin)
     durations = []
     for chunk in chunks:
         probe = subprocess.run(
@@ -593,8 +667,15 @@ def _render_chunked(
     browser: Path,
     npm: Path,
     ffmpeg: Path,
-) -> None:
-    """Render long compositions chunk by chunk, then concatenate."""
+    on_chunk: Callable[[int, int], None] | None = None,
+) -> bool:
+    """Render long compositions chunk by chunk, then concatenate.
+
+    Returns True when the chunk concat degraded from xfade cross-dissolves
+    to hard cuts, so the caller can record it in run metadata. ``on_chunk``
+    is called with (index, total) after each chunk renders so the caller can
+    heartbeat long renders.
+    """
     edit = load_edit(edit_path)
     chunks = _chunk_edit(edit, _CHUNK_MAX_FRAMES)
     if len(chunks) == 1:
@@ -602,7 +683,7 @@ def _render_chunked(
             project_root, edit_path, output,
             browser=browser, npm=npm, timeout=_RENDER_TIMEOUT_SECONDS,
         )
-        return
+        return False
     chunk_dir = run_directory / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[Path] = []
@@ -615,7 +696,9 @@ def _render_chunked(
             browser=browser, npm=npm, timeout=_RENDER_TIMEOUT_SECONDS,
         )
         rendered.append(chunk_out)
-    _concat_chunks(rendered, output, ffmpeg=ffmpeg)
+        if on_chunk is not None:
+            on_chunk(i + 1, len(chunks))
+    return _concat_chunks(rendered, output, ffmpeg=ffmpeg)
 
 
 def _render_with_remotion(
@@ -766,42 +849,55 @@ def _mux_narration_audio(
 
     filter_parts: list[str] = []
 
-    # Step 0: mix a low-level room-tone bed under the narration so there are no
-    # dead-silence gaps between segments (#2). When absent, narration passes
-    # straight through to [voice_music].
-    if narr_idx is not None and tone_idx is not None:
-        filter_parts.append(
-            f"[{tone_idx}:a]volume=0.15[tone_base];"
-            f"[{narr_idx}:a][tone_base]"
-            "amix=inputs=2:normalize=1,aresample=48000[voice_music]"
-        )
-
-    # Step 1: duck the music under narration, then mix them -> [voice_music].
-    elif narr_idx is not None and music_idx is not None:
-        # Duck the music using narration as the sidechain trigger. When
-        # narration is loud, compress (lower) the music; when quiet, music
-        # returns to its base volume. Then mix ducked music over narration.
-        filter_parts.append(
-            f"[{music_idx}:a]volume=0.25[music_base];"
-            f"[music_base][{narr_idx}:a]"
-            "sidechaincompress=threshold=0.03:ratio=15:attack=20:release=250,"
-            "acompressor=threshold=0.02:ratio=4[music_ducked];"
-            "[music_ducked]apad=pad_len=60000[music_padded]"
-        )
-        filter_parts.append(
-            f"[{narr_idx}:a][music_padded]"
-            "amix=inputs=2:normalize=1,aresample=48000[voice_music]"
-        )
-    elif narr_idx is not None:
-        # Narration only (no music): pad to video length.
-        filter_parts.append(
-            f"[{narr_idx}:a]apad=pad_len=60000,aresample=48000[voice_music]"
-        )
-    elif music_idx is not None:
-        # Music only (no narration): lower volume, pad to video length.
-        filter_parts.append(
-            f"[{music_idx}:a]volume=0.25,apad=pad_len=60000,aresample=48000[voice_music]"
-        )
+    # Step 0/1: build the voice bed. Narration is the sidechain trigger that
+    # ducks the music; the room-tone bed sits underneath everything at a low
+    # level so there are no dead-silence gaps. All three are mixed together
+    # into [voice_music] (previously the tone branch swallowed the music).
+    if narr_idx is not None:
+        voice_inputs: list[str] = [f"[{narr_idx}:a]"]
+        if music_idx is not None:
+            # Duck the music using narration as the sidechain trigger. When
+            # narration is loud, compress (lower) the music; when quiet, music
+            # returns to its base volume.
+            filter_parts.append(
+                f"[{music_idx}:a]volume=0.25[music_base];"
+                f"[music_base][{narr_idx}:a]"
+                "sidechaincompress=threshold=0.03:ratio=15:attack=20:release=250,"
+                "acompressor=threshold=0.02:ratio=4[music_ducked]"
+            )
+            voice_inputs.append("[music_ducked]")
+        if tone_idx is not None:
+            filter_parts.append(f"[{tone_idx}:a]volume=0.15[tone_base]")
+            voice_inputs.append("[tone_base]")
+        if len(voice_inputs) == 1:
+            filter_parts.append(
+                f"{voice_inputs[0]}aresample=48000,apad=pad_len=60000[voice_music]"
+            )
+        else:
+            filter_parts.append(
+                "".join(voice_inputs)
+                + f"amix=inputs={len(voice_inputs)}:normalize=1,"
+                "aresample=48000,apad=pad_len=60000[voice_music]"
+            )
+    elif music_idx is not None or tone_idx is not None:
+        # No narration: mix the available beds together at low volume.
+        bed_inputs: list[str] = []
+        if music_idx is not None:
+            filter_parts.append(f"[{music_idx}:a]volume=0.25[music_base]")
+            bed_inputs.append("[music_base]")
+        if tone_idx is not None:
+            filter_parts.append(f"[{tone_idx}:a]volume=0.15[tone_base]")
+            bed_inputs.append("[tone_base]")
+        if len(bed_inputs) == 1:
+            filter_parts.append(
+                f"{bed_inputs[0]}aresample=48000,apad=pad_len=60000[voice_music]"
+            )
+        else:
+            filter_parts.append(
+                "".join(bed_inputs)
+                + f"amix=inputs={len(bed_inputs)}:normalize=1,"
+                "aresample=48000,apad=pad_len=60000[voice_music]"
+            )
     else:
         # Neither track available: fall back to silent audio.
         _mux_silent_audio(source, destination, ffmpeg=ffmpeg)
@@ -837,7 +933,8 @@ def _mux_narration_audio(
 
 
 def _synthesize_narration_track(
-    edit: EditDocument, workdir: Path, *, ffmpeg: Path | None = None
+    edit: EditDocument, workdir: Path, *, ffmpeg: Path | None = None,
+    tts_metadata: dict[str, Any] | None = None,
 ) -> Path | None:
     """Synthesize per-scene narration and mix into one padded track.
 
@@ -848,6 +945,10 @@ def _synthesize_narration_track(
     its audio is trimmed ~0.4s early so it begins before the visual frame,
     letting the next scene's narration bleed ahead of the previous shot for a
     smooth documentary edit rather than hard cuts.
+
+    When ``tts_metadata`` is given, it is populated with the effective
+    ``tts_engine``/``tts_voice`` actually used (which may differ from the
+    requested voice when the TTS chain falls through to espeak).
     """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -857,10 +958,7 @@ def _synthesize_narration_track(
         if not scene.narration or not scene.narration.strip():
             continue
         raw_wav = workdir / f"scene-{i}.raw.wav"
-        if scene.voice:
-            synthesize_to_wav(scene.narration, raw_wav, voice=scene.voice)
-        else:
-            synthesize_to_wav(scene.narration, raw_wav)
+        synthesize_to_wav(scene.narration, raw_wav, metadata=tts_metadata)
         # Deterministic per-scene WPM variation (±12 wpm around 170) so pace
         # shifts sentence-to-sentence without being distracting.
         speed_wpm = 170 + ((i * 37 + len(scene.narration)) % 25) - 12
@@ -1072,6 +1170,8 @@ def run_video_pipeline(
     render: RenderStage | None = None,
     validate: ValidateStage | None = None,
     script_path: Path | None = None,
+    theme: ThemeConfig | None = None,
+    trend_source: str = "all",
 ) -> PipelineResult:
     """Run the complete video production pipeline.
 
@@ -1091,35 +1191,55 @@ def run_video_pipeline(
         validate: Optional custom validate stage function
         script_path: Optional pre-made script JSON (worker output) used in
             place of LM Studio generation. Still copied to the job script path.
+        theme: Optional per-topic theming (outro caption, thumbnail power
+            words, NASA stop words). Defaults to the built-in "space" theme,
+            preserving the original behavior.
+        trend_source: Which trend providers research may query: "reddit",
+            "gnews", or "all" (default). Passed to research_trending_topics.
     """
     state_store: RunStore | None = None
     run_id: str | None = None
     artifacts: dict[str, str] = {}
+    theme = theme or SPACE_THEME
     metadata: dict[str, Any] = {
         "topic": job.topic,
         "created_at": job.created_at,
+        "theme": theme.name,
     }
 
     try:
         root = Path(project_root).resolve()
         data_root = Path(data_root).resolve()
 
-        # Setup paths
-        project_data = data_root / "projects" / "generated"
+        # Setup paths. The topic slug namespaces one project directory; every
+        # run gets its own job directory beneath it so no two runs share
+        # mutable files (research/script/edit JSONs live in the job dir, not
+        # a shared project dir).
+        slug = slugify_topic(job.topic)
+        project_data = data_root / "projects" / slug
+        job_run_id = uuid4().hex
+        job_dir = project_data / "runs" / job_run_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        metadata["topic_slug"] = slug
+        metadata["job_run_id"] = job_run_id
         artifact_root = project_data / "runs"
         state_store = RunStore(project_data / "state", artifact_root=artifact_root)
 
         # Step 1: Research trending topic (skip if script provided)
         metadata["research_status"] = "in_progress"
-        job.research_path = project_data / f"{job.topic.replace(' ', '_')}_research.json"
+        job.research_path = job_dir / "research.json"
         if script_path is None:
-            research_result = research_trending_topics(max_topics=1, min_engagement=100)
+            research_result = research_trending_topics(
+                max_topics=1, min_engagement=100, trend_source=trend_source
+            )
             if not research_result.topics:
                 raise PipelineCommandError("No trending topics found for research")
             save_research_result(research_result, job.research_path)
             trending_topic = research_result.topics[0]
             metadata["selected_topic"] = trending_topic.title
             metadata["source_url"] = trending_topic.url
+            metadata["trend_source"] = trend_source
+            metadata["research_synthetic"] = research_result.synthetic
             artifacts["research"] = str(job.research_path)
         else:
             # When script provided, just create minimal research stub
@@ -1136,7 +1256,7 @@ def run_video_pipeline(
 
         # Step 2: Generate script with LM Studio (or load a worker-made script)
         metadata["script_status"] = "in_progress"
-        job.script_path = project_data / f"{job.topic.replace(' ', '_')}_script.json"
+        job.script_path = job_dir / "script.json"
         if script_path is not None:
             worker_data = json.loads(Path(script_path).read_text(encoding="utf-8"))
             script = ScriptOutput(
@@ -1152,13 +1272,50 @@ def run_video_pipeline(
             metadata["script_origin"] = "worker"
             artifacts["script"] = str(job.script_path)
         else:
-            script = generate_script(
-                topic_title=trending_topic.title,
-                topic_description=trending_topic.description,
-                source_url=trending_topic.url,
-                output_path=job.script_path,
-                use_local_model=True,
-            )
+            script_inputs = {
+                "topic": trending_topic.title,
+                "description": trending_topic.description,
+                "source_url": trending_topic.url,
+                "allow_fallback": False,
+            }
+            script_run = state_store.start("video-script", script_inputs)
+            if script_run.resumed:
+                resumed_data = json.loads(
+                    Path(script_run.artifacts["script"]).read_text(encoding="utf-8")
+                )
+                script = ScriptOutput(
+                    title=resumed_data["title"],
+                    narration=resumed_data.get("narration", ""),
+                    scenes=resumed_data.get("scenes", []),
+                    sources=resumed_data.get("sources", []),
+                    captions=resumed_data.get("captions", []),
+                    generated_at=resumed_data.get("generated_at", job.created_at),
+                )
+                job.script_path.write_text(
+                    json.dumps(resumed_data, indent=2), encoding="utf-8"
+                )
+            else:
+                try:
+                    state_store.heartbeat(script_run.run_id)
+                    script = generate_script(
+                        topic_title=trending_topic.title,
+                        topic_description=trending_topic.description,
+                        source_url=trending_topic.url,
+                        output_path=job.script_path,
+                        use_local_model=True,
+                    )
+                    state_store.heartbeat(script_run.run_id)
+                except Exception as error:
+                    # Record the failure in the run manifest, then fail loud:
+                    # a bad model response must never silently become a
+                    # generic placeholder video.
+                    state_store.fail(script_run.run_id, error)
+                    raise
+                script_run = state_store.complete(
+                    script_run.run_id,
+                    {"script": str(job.script_path), "origin": "local_model"},
+                    expected_artifacts={"script": job.script_path},
+                )
             metadata["script_origin"] = "local_model"
             artifacts["script"] = str(job.script_path)
         job.title = script.title
@@ -1166,7 +1323,7 @@ def run_video_pipeline(
 
         # Step 3: Create storyboard/edit document
         metadata["edit_status"] = "in_progress"
-        job.edit_path = project_data / f"{job.topic.replace(' ', '_')}_edit.json"
+        job.edit_path = job_dir / "edit.json"
 
         # Create edit document from script
         fps = 30
@@ -1219,8 +1376,6 @@ def run_video_pipeline(
                 narration=scene_data.get("narration"),
                 subtitle=subtitle_text or None,
                 pip=pip_enabled,
-                voice=scene_data.get("voice") or None,
-                transition=scene_data.get("transition") or None,
             )
             scenes.append(scene)
             cursor += span
@@ -1231,7 +1386,7 @@ def run_video_pipeline(
             from_frame=cursor,
             duration_frames=OUTRO_FRAMES,
             title=job.title or f"Trending: {job.topic}",
-            caption="The Eyes That See Everything",
+            caption=theme.outro_caption,
             kind="outro",
         )
         scenes.append(outro_scene)
@@ -1264,9 +1419,11 @@ def run_video_pipeline(
         # uploaded or published here.
         assets_dir_used: Path | None = job.assets_dir
         if assets_dir_used is None:
-            internal_assets = project_data / "nasa_assets"
+            internal_assets = job_dir / "nasa_assets"
             try:
-                nasa_summary = populate_assets_from_nasa(edit_doc, internal_assets)
+                nasa_summary = populate_assets_from_nasa(
+                    edit_doc, internal_assets, stop_words=theme.nasa_stop_words
+                )
                 metadata["nasa_assets"] = nasa_summary
                 # Assign to job.assets_dir so the render phase copies these
                 # assets into Remotion's public directory (see below).
@@ -1289,10 +1446,22 @@ def run_video_pipeline(
         # output so they can be attached to a publish step later; nothing is
         # uploaded here.
         try:
+            # Captions come from each scene's narration text, split into
+            # sentence-level cues distributed across the scene duration so
+            # they track the spoken audio. Scenes without narration fall back
+            # to a single title cue (flagged in metadata).
+            narration_overrides = {
+                scene.id: narration
+                for scene in edit_doc.scenes
+                if scene.narration
+                for narration in [scene.narration.strip()]
+                if narration
+            }
             subtitle_artifacts = write_subtitles(
                 edit_doc,
                 Path(job.output_path),
                 base_name="subtitles",
+                narration_overrides=narration_overrides or None,
             )
             artifacts["srt"] = str(subtitle_artifacts["srt"])
             artifacts["webvtt"] = str(subtitle_artifacts["webvtt"])
@@ -1303,6 +1472,10 @@ def run_video_pipeline(
                 subtitle_artifacts["chapters_json"]
             )
             metadata["subtitle_status"] = "complete"
+            provenance = subtitle_provenance(
+                edit_doc, narration_overrides or None
+            )
+            metadata["captions_from_titles"] = provenance["captions_from_titles"]
         except Exception as error:  # noqa: BLE001 - subtitles are best-effort
             metadata["subtitle_status"] = f"failed: {sanitize_diagnostic(error)}"
 
@@ -1342,33 +1515,57 @@ def run_video_pipeline(
             state_store.event(render_run.run_id, "render_started", {"topic": job.topic})
             run_directory.mkdir(parents=True, exist_ok=True)
             run_master = run_directory / "master.mp4"
-            
-            # Copy assets to Remotion public directory for rendering
-            if job.assets_dir is not None:
-                remotion_public = root / "remotion" / "public"
-                cache_assets_for_remotion(Path(job.assets_dir), remotion_public)
+
+            # The lock is released after the chunked render finishes; the
+            # narration/mux/polish steps below only touch this run's own
+            # run directory, so they run without the lock.
+            xfade_degraded = False
+            with remotion_public_lock(data_root):
+                # Copy assets to Remotion public directory for rendering
+                if job.assets_dir is not None:
+                    remotion_public = root / "remotion" / "public"
+                    cache_assets_for_remotion(Path(job.assets_dir), remotion_public)
+
+                if render is None:
+                    xfade_degraded = _render_chunked(
+                        root,
+                        job.edit_path,
+                        temporary_path,
+                        run_directory,
+                        browser=_required_tool(tools, "browser"),
+                        npm=_required_tool(tools, "npm"),
+                        ffmpeg=_required_tool(tools, "ffmpeg"),
+                        on_chunk=lambda done, total: state_store.heartbeat(
+                            render_run.run_id
+                        ),
+                    )
+                else:
+                    render(job.edit_path, run_master)
+            # True when chunk concat fell back from xfade cross-dissolves to
+            # hard cuts; False for single-chunk and custom renders.
+            metadata["xfade_degraded"] = xfade_degraded
 
             if render is None:
-                _render_chunked(
-                    root,
-                    job.edit_path,
-                    temporary_path,
-                    run_directory,
-                    browser=_required_tool(tools, "browser"),
-                    npm=_required_tool(tools, "npm"),
-                    ffmpeg=_required_tool(tools, "ffmpeg"),
-                )
                 edit_doc_render = load_edit(job.edit_path)
+                tts_info: dict[str, Any] = {}
+                state_store.heartbeat(render_run.run_id)
                 narration_track = _synthesize_narration_track(
                     edit_doc_render,
                     run_directory / "narration",
                     ffmpeg=_required_tool(tools, "ffmpeg"),
+                    tts_metadata=tts_info,
                 )
+                state_store.heartbeat(render_run.run_id)
                 if narration_track is not None:
                     metadata["narration_status"] = "complete"
                     metadata["narration_segments"] = len([
                         s for s in edit_doc_render.scenes if (s.narration or "").strip()
                     ])
+                    # Effective TTS engine/voice actually used (may differ
+                    # from the requested Kokoro voice when the chain falls
+                    # through to espeak, which cannot use Kokoro voice names).
+                    metadata["tts_engine"] = tts_info.get("tts_engine", "unknown")
+                    metadata["tts_voice"] = tts_info.get("tts_voice", "unknown")
                 else:
                     metadata["narration_status"] = "silent_fallback"
                 # Generate a subtle ambient music bed and duck it under narration.
@@ -1418,8 +1615,6 @@ def run_video_pipeline(
                 shutil.move(str(polished_path), str(run_master))
                 metadata["polish_status"] = "complete"
                 temporary_path.unlink(missing_ok=True)
-            else:
-                render(job.edit_path, run_master)
 
             render_run = state_store.complete(
                 render_run.run_id,
@@ -1436,7 +1631,7 @@ def run_video_pipeline(
 
         # Step 4.6: Generate YouTube thumbnails from the finished master. These
         # are written next to the output so they can be attached to a publish
-        # step later; nothing is uploaded here. Best-effort — a thumbnail
+        # step later; nothing is uploaded here. Best-effort - a thumbnail
         # failure must not fail an otherwise-passing render.
         try:
             thumb_artifacts = build_thumbnails(
@@ -1444,6 +1639,7 @@ def run_video_pipeline(
                 job.master_path,
                 output_dir / "thumbnails",
                 count=3,
+                power_words=theme.thumbnail_power_words,
             )
             artifacts["thumbnail_1"] = str(thumb_artifacts["thumbnail_1"])
             artifacts["thumbnail_2"] = str(thumb_artifacts["thumbnail_2"])
@@ -1508,7 +1704,8 @@ def run_video_pipeline(
         )
 
     except Exception as error:
-        metadata["error"] = str(error)
+        metadata["error"] = sanitize_diagnostic(error)
+        metadata["error_type"] = type(error).__name__
         job.error = sanitize_diagnostic(error)
         if state_store is not None and run_id is not None:
             try:
@@ -1521,7 +1718,7 @@ def run_video_pipeline(
             status="fail",
             run_id=run_id,
             resumed=False,
-            retryable=isinstance(error, (PipelineCommandError, LmStudioError, MediaProbeError, NarrationError)),
+            retryable=isinstance(error, (PipelineCommandError, LmStudioError, MediaProbeError, NarrationError, ScriptGenerationError)),
             artifacts=artifacts,
             error=job.error,
             metadata=metadata,

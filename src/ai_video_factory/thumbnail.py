@@ -74,10 +74,12 @@ def _truncate_text(text: str, max_chars: int = 6) -> str:
     return (truncated + "…").upper() if len(collapsed) > max_chars else collapsed.upper()
 
 
-def _generate_hook(doc: EditDocument, title: str) -> str:
+def _generate_hook(
+    doc: EditDocument, title: str, power_words: set[str] | None = None
+) -> str:
     """Build a short, punchy hook for the thumbnail.
 
-    Repeating the full documentary title on a thumbnail is amateur — viewers
+    Repeating the full documentary title on a thumbnail is amateur - viewers
     read it in the video page anyway. Instead we distill the headline into a
     high-impact phrase (e.g. "THE GOLDEN EYE", "BEYOND EARTH") that teases the
     topic without spoiling it, maximizing curiosity and click-through.
@@ -86,6 +88,9 @@ def _generate_hook(doc: EditDocument, title: str) -> str:
     punchy ("The Oldest Galaxy", "Signatures of Life"), since those are already
     written to be intriguing; only fall back to keyword extraction for a long
     or empty document title.
+
+    ``power_words`` defaults to the original space-documentary set; pass a
+    theme's list for per-topic theming.
     """
     # Prefer a compelling, concise scene title as the hook.
     best_scene = None
@@ -103,11 +108,15 @@ def _generate_hook(doc: EditDocument, title: str) -> str:
         return best_scene.upper()
 
     # Fallback: distill the document title into power-word hooks.
-    power_words = {
-        "eyes", "golden eye", "golden", "deepest", "oldest", "invisible",
-        "beyond", "frontier", "origins", "cosmic", "universe", "life",
-        "secrets", "hidden", "first light", "telescope", "jwst", "webb",
-    }
+    power_words = (
+        set(power_words)
+        if power_words is not None
+        else {
+            "eyes", "golden eye", "golden", "deepest", "oldest", "invisible",
+            "beyond", "frontier", "origins", "cosmic", "universe", "life",
+            "secrets", "hidden", "first light", "telescope", "jwst", "webb",
+        }
+    )
 
     words = re.split(r"[^a-zA-Z]+", title.lower())
     chosen = [w for w in words if w in power_words and len(w) >= 3]
@@ -419,12 +428,14 @@ def build_thumbnails(
     *,
     count: int = 3,
     target_size: tuple[int, int] = (1280, 720),
+    power_words: set[str] | list[str] | None = None,
 ) -> dict[str, Path]:
     """Generate ``count`` thumbnail variants from ``master``.
 
     Returns a mapping of variant name to written path. The primary title is the
     document title (falling back to the first scene's title). Output is normalized
-    to ``target_size`` (default YouTube 16:9, 1280x720).
+    to ``target_size`` (default YouTube 16:9, 1280x720). ``power_words``
+    overrides the default hook vocabulary for per-topic theming.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -439,7 +450,7 @@ def build_thumbnails(
 
     # Distill the headline into a short, punchy hook rather than repeating the
     # full documentary title on the thumbnail.
-    hook = _generate_hook(doc, title)
+    hook = _generate_hook(doc, title, power_words)
 
     # Extract the base frame once; fall back to a mid-point grab.
     frame_path = output_dir / ".thumb_base.png"

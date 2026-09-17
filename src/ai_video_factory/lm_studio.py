@@ -37,7 +37,7 @@ _READ_ONLY_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("lms", "ps", "--json"),
 )
 _ESTIMATE_COMMAND = (
-    "lms", "load", "tiel-coder-35b-a3b-mtp", "--gpu", "max",
+    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
     "--context-length", "65536", "--no-speculative-draft-mtp",
     "--estimate-only", "-y",
 )
@@ -45,11 +45,11 @@ _SERVER_START_COMMAND = (
     "lms", "server", "start", "--port", "1234", "--bind", "127.0.0.1",
 )
 _MODEL_START_COMMAND = (
-    "lms", "load", "tiel-coder-35b-a3b-mtp", "--gpu", "max",
+    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
     "--context-length", "65536", "--parallel", "1", "--ttl", "3600",
-    "--no-speculative-draft-mtp", "--identifier", "avf-tiel-coder-executor", "-y",
+    "--no-speculative-draft-mtp", "--identifier", "avf-qwen36-executor", "-y",
 )
-_MODEL_STOP_COMMAND = ("lms", "unload", "avf-tiel-coder-executor")
+_MODEL_STOP_COMMAND = ("lms", "unload", "avf-qwen36-executor")
 _APPROVED_COMMANDS = _READ_ONLY_COMMANDS + (
     _ESTIMATE_COMMAND,
     _SERVER_START_COMMAND,

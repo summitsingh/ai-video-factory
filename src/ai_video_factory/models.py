@@ -10,6 +10,7 @@ class StageStatus(StrEnum):
     running = "running"
     completed = "completed"
     failed = "failed"
+    superseded = "superseded"
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,11 @@ class RunManifest:
     artifacts: dict[str, Any]
     artifact_integrity: dict[str, ArtifactIntegrity]
     error: str | None
+    # Liveness tracking for long renders. Older manifests predate these
+    # fields and fall back to created_at / file mtime when read.
+    started_at: str | None = None
+    last_heartbeat_at: str | None = None
+    ttl_seconds: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -57,4 +63,7 @@ class RunManifest:
                 for key, record in data.get("artifact_integrity", {}).items()
             },
             error=data["error"],
+            started_at=data.get("started_at"),
+            last_heartbeat_at=data.get("last_heartbeat_at"),
+            ttl_seconds=data.get("ttl_seconds"),
         )

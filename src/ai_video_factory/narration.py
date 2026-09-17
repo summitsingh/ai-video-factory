@@ -50,6 +50,12 @@ _KOKORO_VOICES = (
 # the `voice` argument to synthesize_to_wav() or per-scene in the edit doc.
 _KOKORO_DEFAULT_VOICE = "af_heart"
 
+# Default voice for the espeak-ng fallback. Kokoro voice names (af_heart,
+# bf_emma, am_adam, ...) are not valid espeak voices, so the espeak path must
+# never receive one; see _espeak_voice().
+_ESPEAK_DEFAULT_VOICE = "en-us"
+_KOKORO_VOICE_PATTERN = re.compile(r"^[ab][fm]_[a-z0-9]+$")
+
 # Module-level cache so we don't reload the ~325 MB ONNX model once per scene.
 _kokoro_model_cache: dict[str, object] = {}
 
@@ -73,6 +79,19 @@ def clean_for_speech(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _espeak_voice(requested: str | None) -> str:
+    """Resolve a safe espeak-ng voice name.
+
+    The pipeline default voice is a Kokoro voice name, which espeak-ng
+    rejects. Fall back to the espeak default whenever the requested voice
+    looks like a Kokoro voice name or is empty.
+    """
+    candidate = (requested or "").strip()
+    if not candidate or _KOKORO_VOICE_PATTERN.fullmatch(candidate):
+        return _ESPEAK_DEFAULT_VOICE
+    return candidate
+
+
 def synthesize_to_wav(
     text: str,
     output: Path,
@@ -83,12 +102,17 @@ def synthesize_to_wav(
     pitch: int = 50,
     espeak: str = "espeak-ng",
     timeout: int = 300,
+    metadata: dict[str, Any] | None = None,
 ) -> Path:
     """Synthesize speakable text to a WAV file with a local engine.
 
     Default engine is 'kokoro' (neural ONNX TTS, broadcast-quality English for
     long-form narration). 'piper' and 'espeak' remain available as fallbacks;
     the pipeline falls back to espeak only when neither Kokoro nor Piper can run.
+
+    When ``metadata`` is given, it is populated with the effective
+    ``tts_engine`` and ``tts_voice`` actually used (which may differ from the
+    requested ones when engines fall through).
     """
     speakable = clean_for_speech(text)
     if not speakable:
@@ -96,15 +120,24 @@ def synthesize_to_wav(
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     if engine == "kokoro" and _KOKORO_MODEL.is_file() and _KOKORO_VOICES.is_file():
-        return _synthesize_kokoro(
-            speakable, output, voice=voice or _KOKORO_DEFAULT_VOICE, timeout=timeout
+        effective_engine, effective_voice = "kokoro", voice or _KOKORO_DEFAULT_VOICE
+        result = _synthesize_kokoro(
+            speakable, output, voice=effective_voice, timeout=timeout
         )
-    if engine == "piper" and _PIPER_VENV_BIN.is_file() and _PIPER_MODEL.is_file():
-        return _synthesize_piper(speakable, output, timeout=timeout)
-    return _synthesize_espeak(
-        speakable, output, voice=voice, speed_wpm=speed_wpm, pitch=pitch,
-        espeak=espeak, timeout=timeout,
-    )
+    elif engine == "piper" and _PIPER_VENV_BIN.is_file() and _PIPER_MODEL.is_file():
+        effective_engine, effective_voice = "piper", "en_US-lessac-high"
+        result = _synthesize_piper(speakable, output, timeout=timeout)
+    else:
+        effective_engine = "espeak"
+        effective_voice = _espeak_voice(voice)
+        result = _synthesize_espeak(
+            speakable, output, voice=effective_voice, speed_wpm=speed_wpm,
+            pitch=pitch, espeak=espeak, timeout=timeout,
+        )
+    if metadata is not None:
+        metadata["tts_engine"] = effective_engine
+        metadata["tts_voice"] = effective_voice
+    return result
 
 
 def _synthesize_kokoro(
@@ -438,7 +471,7 @@ def apply_voice_variation(
 
     # Pitch: rubberband shifts register without changing tempo (already applied
     # by atempo above). The pitch parameter is a frequency ratio, so convert the
-    # requested semitone offset to a ratio via 2^(semitones/12) — e.g. +1 st ->
+    # requested semitone offset to a ratio via 2^(semitones/12) - e.g. +1 st ->
     # ~1.0595, -1 st -> ~0.9439. Only used when a non-zero shift is requested and
     # the filter exists in this ffmpeg build.
     if pitch_shift_semitones:

@@ -36,16 +36,83 @@ Output format:
 Only output valid JSON, no markdown formatting."""
 
 
+class ScriptGenerationError(RuntimeError):
+    """Raised when a video script cannot be produced or validated.
+
+    The pipeline treats this as a hard failure: the run is marked failed in
+    the run manifest and no generic fallback video is produced silently.
+    """
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    """Extract a JSON object from model output.
+
+    Strips markdown code fences (```json ... ``` or ``` ... ```), then
+    slices from the first ``{`` to the last ``}``. Raises
+    ``ScriptGenerationError`` when no valid JSON object is found.
+    """
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end <= start:
+        raise ScriptGenerationError("model output contained no JSON object")
+    try:
+        parsed = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError as error:
+        raise ScriptGenerationError(
+            f"model output was not valid JSON: {error}"
+        ) from error
+    if not isinstance(parsed, dict):
+        raise ScriptGenerationError("model output JSON was not an object")
+    return parsed
+
+
+def _validate_script_shape(result: dict[str, Any]) -> None:
+    """Validate the fields the edit-document builder needs.
+
+    Raises ``ScriptGenerationError`` on any violation so a malformed model
+    response fails the run instead of producing a broken video.
+    """
+    title = result.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise ScriptGenerationError("script is missing a non-empty 'title'")
+    scenes = result.get("scenes")
+    if not isinstance(scenes, list) or not scenes:
+        raise ScriptGenerationError("script 'scenes' must be a non-empty list")
+    for index, scene in enumerate(scenes):
+        if not isinstance(scene, dict):
+            raise ScriptGenerationError(f"scene {index} is not an object")
+        if not scene.get("title") and not scene.get("caption"):
+            raise ScriptGenerationError(
+                f"scene {index} has neither 'title' nor 'caption'"
+            )
+        narration = scene.get("narration")
+        if narration is not None and not isinstance(narration, str):
+            raise ScriptGenerationError(f"scene {index} 'narration' is not a string")
+
+
 def generate_script_with_lm_studio(
     topic_title: str,
     topic_description: str,
     source_url: str,
     api_url: str = "http://localhost:1234/v1/chat/completions",
-    model: str = "tiel-coder-35b-a3b-mtp",
+    model: str = "qwen3.6-35b-a3b-udt-mtp",
     max_tokens: int = 2048,
     temperature: float = 0.7,
+    allow_fallback: bool = False,
 ) -> dict[str, Any]:
-    """Generate a video script using LM Studio's local model."""
+    """Generate a video script using LM Studio's local model.
+
+    Raises ``ScriptGenerationError`` when the request fails or the response
+    cannot be parsed/validated, unless ``allow_fallback`` is True, in which
+    case a generic template script is returned. The default is fail-loud so
+    unattended runs never silently produce placeholder videos.
+    """
     
     user_prompt = f"""Generate a video script about the following trending topic:
 
@@ -88,10 +155,22 @@ Make it engaging, factual, and visually descriptive."""
         with urllib.request.urlopen(req, timeout=120) as response:
             result = json.loads(response.read().decode('utf-8'))
             content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-            return json.loads(content)
-    except Exception as e:
-        # Fallback to local generation if API fails
-        return _generate_fallback_script(topic_title, topic_description, source_url)
+            parsed = _extract_json(content)
+            _validate_script_shape(parsed)
+            return parsed
+    except ScriptGenerationError:
+        if allow_fallback:
+            # Explicitly requested fallback: parse/validation failures also
+            # degrade to the generic template rather than failing loud.
+            return _generate_fallback_script(topic_title, topic_description, source_url)
+        raise
+    except Exception as error:
+        if allow_fallback:
+            # Explicitly requested fallback: produce a generic template.
+            return _generate_fallback_script(topic_title, topic_description, source_url)
+        raise ScriptGenerationError(
+            f"LM Studio script request failed: {error}"
+        ) from error
 
 
 def _generate_fallback_script(
@@ -154,27 +233,34 @@ def generate_script(
     source_url: str,
     output_path: Path | None = None,
     use_local_model: bool = True,
+    allow_fallback: bool = False,
 ) -> ScriptOutput:
     """Generate a video script about a trending topic.
-    
+
     Args:
         topic_title: The trending topic title
         topic_description: Description of the topic
         source_url: Source URL for the topic
         output_path: Optional path to save the script JSON
-        use_local_model: Whether to use LM Studio local model
-        
+        use_local_model: Whether to use LM Studio local model. Setting this
+            to False explicitly requests the non-model path and still
+            produces the generic template (this is an explicit choice, not
+            a silent failure).
+        allow_fallback: When True, a generic template script is returned if
+            the model request fails. Defaults to False (fail loud).
+
     Returns:
         ScriptOutput object with the generated script
+
+    Raises:
+        ScriptGenerationError: when the model request fails or its response
+            is invalid and ``allow_fallback`` is False.
     """
-    
+
     if use_local_model:
-        try:
-            result = generate_script_with_lm_studio(
-                topic_title, topic_description, source_url
-            )
-        except Exception:
-            result = _generate_fallback_script(topic_title, topic_description, source_url)
+        result = generate_script_with_lm_studio(
+            topic_title, topic_description, source_url, allow_fallback=allow_fallback
+        )
     else:
         result = _generate_fallback_script(topic_title, topic_description, source_url)
     

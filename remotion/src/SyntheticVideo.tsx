@@ -218,6 +218,51 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
   return null;
 };
 
+// Burned-in subtitle (#1): a legible caption anchored to the lower third that
+// fades in/out with the scene. Uses the explicit `subtitle` field when present,
+// falling back to the scene caption so every scene has one.
+const Subtitle = ({text}: {text: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const fadeIn = Math.min(15, text.length > 0 ? 15 : 0);
+  const enter = interpolate(frame, [0, fadeIn], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      <div
+        style={{
+          position: 'absolute',
+          bottom: height * 0.06,
+          left: width * 0.05,
+          right: width * 0.05,
+          textAlign: 'center',
+          opacity: enter,
+          transform: `translateY(${-8 * (1 - enter)}px)`,
+        }}
+      >
+        <div
+          style={{
+            display: 'inline-block',
+            backgroundColor: 'rgba(0, 0, 0, 0.72)',
+            borderRadius: 6,
+            padding: `${height * 0.01}px ${width * 0.03}px`,
+            color: '#f8fafc',
+            fontSize: Math.round(height * 0.03),
+            fontWeight: 500,
+            lineHeight: 1.35,
+            fontFamily: 'Arial, sans-serif',
+            textShadow: '0 1px 4px rgba(0,0,0,0.9)',
+          }}
+        >
+          {text}
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+
 // Picture-in-picture inset (#5): shows the scene's secondary asset (image when a
 // clip is primary, or vice versa) as a framed corner window with a subtle drop
 // shadow and entrance animation.
@@ -396,11 +441,8 @@ const SceneCard = ({
 }) => {
   const frame = useCurrentFrame();
   const {height} = useVideoConfig();
-  // Per-scene transition ramp: 'cut' is instant, 'fade' is a long soft ramp,
-  // 'dissolve' keeps the default. Unknown/absent values fall back to dissolve.
-  const ramp = TRANSITION_FADE[scene.transition ?? 'dissolve'];
-  const fadeIn = Math.min(ramp.in, scene.duration_frames);
-  const fadeOut = Math.min(ramp.out, scene.duration_frames);
+  const fadeIn = Math.min(15, scene.duration_frames);
+  const fadeOut = Math.min(8, scene.duration_frames);
 
   const enter = interpolate(frame, [0, fadeIn], [0, 1], {
     extrapolateLeft: 'clamp',
@@ -471,6 +513,14 @@ const SceneCard = ({
           viz, keyword labels, map graphic, title card and sources. All fade in
           briefly, hold ~2s, then clear so only the footage remains on screen. */}
       <AbsoluteFill style={{opacity: textOpacity, pointerEvents: 'none'}}>
+        {/* Lower third: animated topic bar */}
+        {scene.caption && <LowerThird text={scene.caption} />}
+        {/* Burned-in subtitle (#1): legible caption anchored to the lower area */}
+        {scene.subtitle ? (
+          <Subtitle text={scene.subtitle} />
+        ) : scene.caption ? (
+          <Subtitle text={scene.caption} />
+        ) : null}
         {/* Motion graphics: keyword-driven overlays (timeline/data/label) */}
         <MotionGraphics text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
         {/* Data visualization (#7): animated bars for detected statistics */}
@@ -836,15 +886,6 @@ const MotionGraphics = ({text}: {text: string}) => {
 
 const TRANSITION_FRAMES = 24; // ~0.8s cross-dissolve at 30fps
 
-// Per-transition entrance/exit ramps (frames) applied to a scene's own Sequence.
-// 'cut' is instant (hard cut), 'fade' is a longer black ramp, and 'dissolve'
-// keeps the soft default used for the cross-fade overlay below.
-const TRANSITION_FADE = {
-  dissolve: { in: 15, out: 8 },
-  fade: { in: 30, out: 30 },
-  cut: { in: 0, out: 0 },
-} as const;
-
 // Intro sequence: branded title card with animated reveal.
 const IntroSequence = ({title, subtitle}: {title: string; subtitle: string}) => {
   const frame = useCurrentFrame();
@@ -1015,6 +1056,46 @@ const OutroSequence = ({title, sources}: {title: string; sources?: string[]}) =>
   );
 };
 
+// Lower third: animated topic bar that slides in at the bottom of frame.
+const LowerThird = ({text}: {text: string}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const enter = interpolate(frame, [0, 18], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill
+      style={{
+        bottom: height * 0.14,
+        left: width * 0.06,
+        opacity: enter,
+        transform: `translateX(${-20 * (1 - enter)}px)`,
+      }}
+    >
+      <div
+        style={{
+          backgroundColor: 'rgba(34, 211, 238, 0.9)',
+          padding: `${height * 0.01}px ${width * 0.03}px`,
+          borderRadius: 6,
+          boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+        }}
+      >
+        <div
+          style={{
+            color: '#0a0a0a',
+            fontSize: Math.round(height * 0.03),
+            fontWeight: 700,
+            letterSpacing: '0.02em',
+          }}
+        >
+          {text}
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+
 export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
   return (
     <AbsoluteFill>
@@ -1040,11 +1121,8 @@ export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
         <ChapterMarkers scenes={scenes} />
       </Sequence>
       {/* Cross-dissolve transitions: fade the next scene in over the tail of
-          the current one. Only applied when the incoming scene's transition is
-          'dissolve'; 'cut' scenes hard-cut and 'fade' scenes use their own ramp. */}
-      {scenes.slice(0, -1)
-        .filter((scene) => scene.transition === 'dissolve')
-        .map((scene, index) => (
+          the current one. Only valid within a chunk (boundaries hard-cut). */}
+      {scenes.slice(0, -1).map((scene, index) => (
         <Sequence
           durationInFrames={TRANSITION_FRAMES}
           from={scene.from_frame + scene.duration_frames - TRANSITION_FRAMES}

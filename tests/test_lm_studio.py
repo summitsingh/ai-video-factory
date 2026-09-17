@@ -27,19 +27,19 @@ EXPECTED_READ_ONLY_COMMANDS = [
 ]
 
 EXPECTED_ESTIMATE_COMMAND = (
-    "lms", "load", "tiel-coder-35b-a3b-mtp", "--gpu", "max",
+    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
     "--context-length", "65536", "--no-speculative-draft-mtp",
     "--estimate-only", "-y",
 )
 EXPECTED_LOAD_COMMAND = (
-    "lms", "load", "tiel-coder-35b-a3b-mtp", "--gpu", "max",
+    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
     "--context-length", "65536", "--parallel", "1", "--ttl", "3600",
-    "--no-speculative-draft-mtp", "--identifier", "avf-tiel-coder-executor", "-y",
+    "--no-speculative-draft-mtp", "--identifier", "avf-qwen36-executor", "-y",
 )
 EXPECTED_SERVER_START_COMMAND = (
     "lms", "server", "start", "--port", "1234", "--bind", "127.0.0.1",
 )
-EXPECTED_UNLOAD_COMMAND = ("lms", "unload", "avf-tiel-coder-executor")
+EXPECTED_UNLOAD_COMMAND = ("lms", "unload", "avf-qwen36-executor")
 
 
 @pytest.fixture
@@ -54,8 +54,8 @@ def config(tmp_path: Path) -> InferenceConfig:
             "backend": "lm_studio",
             "base_url": "http://127.0.0.1:1234/v1",
             "lms_binary": "lms",
-            "model_key": "tiel-coder-35b-a3b-mtp",
-            "identifier": "avf-tiel-coder-executor",
+            "model_key": "qwen3.6-35b-a3b-udt-mtp",
+            "identifier": "avf-qwen36-executor",
             "context_length": 65_536,
             "gpu": "max",
             "parallel": 1,
@@ -798,13 +798,13 @@ def test_resolved_lms_is_canonical_absolute_executable(
 @pytest.mark.parametrize(
     "command",
     [
-        ("lms", "get", "tiel-coder-35b-a3b-mtp"),
+        ("lms", "get", "qwen3.6-35b-a3b-udt-mtp"),
         ("lms", "runtime", "select", "llama.cpp"),
         ("lms", "runtime", "update"),
         ("lms", "unload", "--all"),
         ("lms", "server", "stop"),
         (
-            "lms", "load", "tiel-coder-35b-a3b-mtp", "--gpu", "max",
+            "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
             "--context-length", "65536", "--estimate-only", "-y",
         ),
     ],

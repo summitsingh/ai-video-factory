@@ -18,8 +18,8 @@ def test_public_inference_models_accept_contract_values() -> None:
         allowed=True,
     )
     identity = ModelIdentity(
-        model_key="tiel-coder-35b-a3b-mtp",
-        identifier="avf-tiel-coder-executor",
+        model_key="qwen3.6-35b-a3b-udt-mtp",
+        identifier="avf-qwen36-executor",
         relative_path="qwen/Qwen3.6-35B-A3B-UDT-MTP.gguf",
         size_bytes=42_000_000_000,
     )
@@ -78,7 +78,7 @@ def test_result_forbids_unknown_fields_and_coercion() -> None:
         "command": "doctor",
         "status": "pass",
         "retryable": False,
-        "model_identifier": "avf-tiel-coder-executor",
+        "model_identifier": "avf-qwen36-executor",
         "checks": {},
         "metrics": {},
         "artifacts": {},
@@ -101,7 +101,7 @@ def test_result_rejects_boolean_schema_version() -> None:
             "command": "doctor",
             "status": "pass",
             "retryable": False,
-            "model_identifier": "avf-tiel-coder-executor",
+            "model_identifier": "avf-qwen36-executor",
             "checks": {},
             "metrics": {},
             "artifacts": {},
