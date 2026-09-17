@@ -26,6 +26,7 @@ from ai_video_factory.youtube import (
     run_auth_flow,
     token_path,
     upload_package,
+    set_video_privacy,
     QuotaGuard,
     UploadRequest,
     _default_data_dir,
@@ -37,6 +38,10 @@ inference_app = typer.Typer(no_args_is_help=True)
 app.add_typer(inference_app, name="inference")
 youtube_app = typer.Typer(no_args_is_help=True)
 app.add_typer(youtube_app, name="youtube")
+scheduler_app = typer.Typer(no_args_is_help=True)
+app.add_typer(scheduler_app, name="scheduler")
+review_app = typer.Typer(no_args_is_help=True)
+app.add_typer(review_app, name="review")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DATA_ROOT = _PROJECT_ROOT / "data"
@@ -165,6 +170,8 @@ def video_pipeline(
     trend_source: str = typer.Option("all", "--trend-source", help="Trend providers to query: reddit, gnews, or all"),
     theme: str = typer.Option("space", "--theme", help="Theming preset: space (default) or generic"),
     theme_json: str = typer.Option(None, "--theme-json", help="Path to a custom theme JSON file (overrides --theme)"),
+    longform: bool = typer.Option(False, "--longform", help="Generate a 20-30 minute documentary script (three-act structure) instead of a 90-second short"),
+    duration_minutes: float = typer.Option(25.0, "--duration-minutes", help="Target runtime in minutes for --longform (20-30)"),
     json_output: bool = typer.Option(False, "--json", help="Output result as JSON"),
 ) -> None:
     """Run a complete video production pipeline for a trending topic.
@@ -203,6 +210,8 @@ def video_pipeline(
             script_path=Path(script_file) if script_file else None,
             theme=theme_config,
             trend_source=trend_source,
+            longform=longform,
+            target_duration_minutes=duration_minutes,
         )
         
         if json_output:
@@ -397,6 +406,290 @@ def youtube_upload(
     except YouTubeError as error:
         typer.echo(f"YouTube upload failed: {error}", err=True)
         raise typer.Exit(code=2)
+
+
+# ---------------------------------------------------------------------------
+# Scheduler + review queue (automated channel publishing)
+# ---------------------------------------------------------------------------
+
+def _scheduler_dirs(data_dir: str | None) -> tuple[Path, Path]:
+    youtube_dir = _youtube_data_dir(data_dir)
+    project_root = Path(__file__).resolve().parents[2]
+    data_root = Path(data_dir).parent if data_dir else project_root / "data"
+    return youtube_dir, data_root
+
+
+def _load_scheduler_configs(channels_config: str | None) -> list:
+    from ai_video_factory.scheduler import load_channels_config
+
+    default = Path(__file__).resolve().parents[2] / "config" / "channels.toml"
+    return load_channels_config(Path(channels_config) if channels_config else default)
+
+
+def _research_for_channel(config) -> list[dict]:
+    from ai_video_factory.research import research_trending_topics
+
+    result = research_trending_topics(
+        max_topics=10, min_engagement=100, trend_source=config.trend_source
+    )
+    candidates = [
+        {"title": t.title, "description": t.description, "url": t.url}
+        for t in result.topics
+    ]
+    if config.research_queries:
+        queries = [q.lower() for q in config.research_queries]
+
+        def _score(candidate: dict) -> int:
+            text = (candidate["title"] + " " + candidate["description"]).lower()
+            return sum(1 for q in queries if q in text)
+
+        candidates.sort(key=_score, reverse=True)
+    return candidates
+
+
+def _pipeline_for_channel(config, data_root: Path):
+    def _run(topic_title: str, topic_description: str) -> dict:
+        from ai_video_factory.video_pipeline import VideoJob, run_video_pipeline
+
+        job = VideoJob(
+            topic=topic_title,
+            description=topic_description or topic_title,
+            source_url="https://example.com",
+            output_path=data_root / "projects" / "generated",
+            duration_seconds=int(config.target_duration_minutes * 60),
+        )
+        result = run_video_pipeline(
+            project_root=Path(__file__).resolve().parents[2],
+            data_root=data_root,
+            job=job,
+            theme=resolve_theme(config.theme),
+            trend_source=config.trend_source,
+            longform=True,
+            target_duration_minutes=config.target_duration_minutes,
+        )
+        return {
+            "status": result.status,
+            "run_id": result.run_id,
+            "artifacts": result.artifacts,
+            "error": result.error,
+        }
+
+    return _run
+
+
+def _upload_for_channel(config, youtube_dir: Path, data_root: Path, dry_run: bool):
+    def _upload(pipeline_result: dict) -> dict:
+        quota = QuotaGuard(youtube_dir)
+        request = request_from_run(
+            data_root,
+            str(pipeline_result["run_id"]),
+            privacy_status=config.privacy,
+            tags=list(config.tags),
+        )
+        request.category_id = config.category_id
+        request.language = config.language
+        if dry_run:
+            result = upload_package(request, service=None, quota=quota)
+        else:
+            credentials = load_credentials(youtube_dir)
+            service = build_service(credentials)
+            result = upload_package(request, service=service, quota=quota)
+        return {"video_id": result.video_id or "", "title": result.title}
+
+    return _upload
+
+
+@scheduler_app.command("run")
+def scheduler_run(
+    channels_config: str = typer.Option(None, "--channels-config", help="Path to channels TOML (default: config/channels.toml)"),
+    channel: str = typer.Option(None, "--channel", help="Only run this channel slug"),
+    force: bool = typer.Option(False, "--force", help="Run even if the channel is not due yet"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Pick topics and report; do not run the pipeline or upload"),
+    data_dir: str = typer.Option(None, "--data-dir", help="YouTube state directory (default: data/youtube)"),
+    json_output: bool = typer.Option(False, "--json", help="Output results as JSON"),
+) -> None:
+    """Run due channels: research, long-form render, unlisted upload, review queue."""
+    from ai_video_factory.scheduler import (
+        ReviewQueue,
+        SchedulerBusy,
+        TopicLedger,
+        is_channel_due,
+        run_channel,
+        scheduler_lock,
+    )
+
+    try:
+        youtube_dir, data_root = _scheduler_dirs(data_dir)
+        configs = _load_scheduler_configs(channels_config)
+        if channel:
+            configs = [c for c in configs if c.slug == channel]
+            if not configs:
+                raise typer.BadParameter(f"unknown channel slug: {channel}")
+        state_dir = youtube_dir / "state"
+        due = [c for c in configs if force or is_channel_due(c, state_dir)]
+        if dry_run:
+            ledger = TopicLedger(youtube_dir / "topics.jsonl")
+            plan = []
+            for config in due:
+                candidate = None
+                try:
+                    from ai_video_factory.scheduler import pick_topic
+
+                    candidate = pick_topic(config, ledger, _research_for_channel)
+                except Exception as error:
+                    plan.append({"channel": config.slug, "topic": None, "error": sanitize_diagnostic(error)})
+                    continue
+                plan.append(
+                    {
+                        "channel": config.slug,
+                        "topic": candidate["title"] if candidate else None,
+                        "target_duration_minutes": config.target_duration_minutes,
+                    }
+                )
+            typer.echo(json.dumps(plan, indent=2))
+            return
+
+        results = []
+        with scheduler_lock(youtube_dir):
+            ledger = TopicLedger(youtube_dir / "topics.jsonl")
+            review_queue = ReviewQueue(youtube_dir / "review.jsonl")
+            for config in due:
+                try:
+                    result = run_channel(
+                        config,
+                        data_dir=youtube_dir,
+                        ledger=ledger,
+                        review_queue=review_queue,
+                        research_fn=_research_for_channel,
+                        pipeline_fn=_pipeline_for_channel(config, data_root),
+                        upload_fn=_upload_for_channel(config, youtube_dir, data_root, dry_run=False),
+                    )
+                except (SchedulerBusy, Exception) as error:
+                    result = {"channel": config.slug, "status": "error", "error": sanitize_diagnostic(error)}
+                results.append(result)
+        if json_output:
+            typer.echo(json.dumps(results, indent=2))
+        else:
+            for result in results:
+                status = result.get("status")
+                extra = result.get("video_id") or result.get("reason") or result.get("error") or ""
+                typer.echo(f"{result.get('channel')}: {status} {extra}".rstrip())
+    except SchedulerBusy:
+        typer.echo("Another scheduler run is already in progress; exiting.", err=True)
+        raise typer.Exit(code=3)
+    except Exception as error:
+        typer.echo(sanitize_diagnostic(error), err=True)
+        raise typer.Exit(code=2)
+
+
+@scheduler_app.command("due")
+def scheduler_due(
+    channels_config: str = typer.Option(None, "--channels-config", help="Path to channels TOML"),
+    data_dir: str = typer.Option(None, "--data-dir", help="YouTube state directory (default: data/youtube)"),
+) -> None:
+    """List channels that are due for their daily run."""
+    from ai_video_factory.scheduler import is_channel_due
+
+    youtube_dir, _ = _scheduler_dirs(data_dir)
+    state_dir = youtube_dir / "state"
+    for config in _load_scheduler_configs(channels_config):
+        due = is_channel_due(config, state_dir)
+        typer.echo(f"{config.slug}: {'DUE' if due else 'not due'} (scheduled {config.schedule_time} {config.timezone})")
+
+
+@scheduler_app.command("status")
+def scheduler_status(
+    channels_config: str = typer.Option(None, "--channels-config", help="Path to channels TOML"),
+    data_dir: str = typer.Option(None, "--data-dir", help="YouTube state directory (default: data/youtube)"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Show per-channel monitoring: last run, due state, topics used, pending reviews."""
+    from ai_video_factory.scheduler import channel_status
+
+    youtube_dir, _ = _scheduler_dirs(data_dir)
+    rows = channel_status(_load_scheduler_configs(channels_config), youtube_dir)
+    if json_output:
+        typer.echo(json.dumps(rows, indent=2))
+        return
+    for row in rows:
+        typer.echo(
+            f"{row['channel']}: due={row['due']} last={row['last_run_date']} "
+            f"status={row['last_status']} topics={row['topics_used']} "
+            f"pending_review={row['pending_review']}"
+        )
+
+
+@review_app.command("list")
+def review_list(
+    status: str = typer.Option(None, "--status", help="Filter by status (default: pending_review)"),
+    data_dir: str = typer.Option(None, "--data-dir", help="YouTube state directory (default: data/youtube)"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """List videos awaiting human review."""
+    from ai_video_factory.scheduler import ReviewQueue
+
+    youtube_dir, _ = _scheduler_dirs(data_dir)
+    entries = ReviewQueue(youtube_dir / "review.jsonl").list(status=status or "pending_review")
+    if json_output:
+        typer.echo(json.dumps(entries, indent=2))
+        return
+    if not entries:
+        typer.echo("No videos awaiting review.")
+        return
+    for entry in entries:
+        typer.echo(f"{entry['video_id']} [{entry['status']}] {entry['channel']}: {entry['title']}")
+        typer.echo(f"  {entry['url']}")
+
+
+@review_app.command("approve")
+def review_approve(
+    video_id: str = typer.Argument(..., help="YouTube video id to approve"),
+    publish: bool = typer.Option(False, "--publish", help="Also set the video public on YouTube"),
+    data_dir: str = typer.Option(None, "--data-dir", help="YouTube state directory (default: data/youtube)"),
+) -> None:
+    """Approve a reviewed video. Add --publish to make it public on YouTube."""
+    from ai_video_factory.scheduler import ReviewQueue
+    from ai_video_factory.youtube import YouTubeError
+
+    try:
+        youtube_dir, _ = _scheduler_dirs(data_dir)
+        queue = ReviewQueue(youtube_dir / "review.jsonl")
+        if publish:
+            credentials = load_credentials(youtube_dir)
+            service = build_service(credentials)
+            quota = QuotaGuard(youtube_dir)
+            privacy = set_video_privacy(service, video_id, "public", quota)
+            entry = queue.set_status(video_id, "published")
+            typer.echo(f"Published {video_id} (privacy now {privacy}).")
+        else:
+            entry = queue.set_status(video_id, "approved")
+            typer.echo(f"Approved {video_id}; still unlisted until published.")
+        _ = entry
+    except YouTubeError as error:
+        typer.echo(f"Review approve failed: {error}", err=True)
+        raise typer.Exit(code=2)
+    except Exception as error:
+        typer.echo(sanitize_diagnostic(error), err=True)
+        raise typer.Exit(code=2)
+
+
+@review_app.command("reject")
+def review_reject(
+    video_id: str = typer.Argument(..., help="YouTube video id to reject"),
+    data_dir: str = typer.Option(None, "--data-dir", help="YouTube state directory (default: data/youtube)"),
+) -> None:
+    """Reject a reviewed video (keeps it unlisted; record the decision)."""
+    from ai_video_factory.scheduler import ReviewQueue, SchedulerError
+
+    try:
+        youtube_dir, _ = _scheduler_dirs(data_dir)
+        queue = ReviewQueue(youtube_dir / "review.jsonl")
+        queue.set_status(video_id, "rejected")
+        typer.echo(f"Rejected {video_id}.")
+    except SchedulerError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=2)
+
 
 
 if __name__ == "__main__":

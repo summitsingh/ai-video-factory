@@ -35,6 +35,14 @@ class EditScene(BaseModel):
         default=False,
         description="Show the scene's secondary asset as a picture-in-picture inset",
     )
+    act: str | None = Field(
+        default=None,
+        description="Beat label rendered as an act title card (first scene of a beat)",
+    )
+    lower_third: str | None = Field(
+        default=None,
+        description="Name/date/location rendered as a lower-third overlay",
+    )
 
 
 class EditDocument(BaseModel):

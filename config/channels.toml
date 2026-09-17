@@ -1,0 +1,36 @@
+# Channel definitions for the daily scheduler.
+# Each channel publishes one long-form documentary per day, unlisted, into the
+# review queue. Nothing goes public without `review approve`.
+#
+# Copy this file and adjust per deployment; point the scheduler at it with
+# --channels-config.
+
+[[channels]]
+name = "Deep Space Diaries"
+slug = "deep-space-diaries"
+topic_focus = "space exploration, astronomy, and planetary science documentaries"
+theme = "space"
+target_duration_minutes = 25.0
+schedule_time = "09:00"
+timezone = "America/Chicago"
+privacy = "unlisted"
+category_id = "28"
+tags = ["space documentary", "astronomy", "nasa", "universe"]
+language = "en"
+research_queries = ["space exploration", "astronomy discoveries", "nasa missions"]
+trend_source = "all"
+
+[[channels]]
+name = "Earth Untamed"
+slug = "earth-untamed"
+topic_focus = "earth science, oceans, geology, and climate documentaries"
+theme = "generic"
+target_duration_minutes = 22.0
+schedule_time = "09:30"
+timezone = "America/Chicago"
+privacy = "unlisted"
+category_id = "28"
+tags = ["earth science", "nature documentary", "oceans", "geology"]
+language = "en"
+research_queries = ["earth science", "ocean exploration", "geology discoveries"]
+trend_source = "all"

@@ -643,3 +643,53 @@ def test_cli_youtube_upload_public_needs_confirm(tmp_path):
     )
     assert result.exit_code == 2
     assert "explicit confirmation" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Privacy updates (review publish step)
+# ---------------------------------------------------------------------------
+
+
+class _StubUpdateService:
+    def __init__(self, response):
+        self._response = response
+        self.update_calls = []
+
+    def videos(self):
+        return self
+
+    def update(self, part=None, body=None):
+        self.update_calls.append({"part": part, "body": body})
+        return _StubExecute(self._response)
+
+
+def test_set_video_privacy_public(stub_google, tmp_path):
+    from ai_video_factory.youtube import set_video_privacy
+
+    service = _StubUpdateService({"status": {"privacyStatus": "public"}})
+    quota = QuotaGuard(tmp_path)
+    result = set_video_privacy(service, "vid1", "public", quota)
+    assert result == "public"
+    call = service.update_calls[0]
+    assert call["body"]["id"] == "vid1"
+    assert call["body"]["status"]["privacyStatus"] == "public"
+    assert quota.units_used_today() == QUOTA_COSTS["videos.update"]
+
+
+def test_set_video_privacy_rejects_bad_status(stub_google, tmp_path):
+    from ai_video_factory.youtube import set_video_privacy
+
+    service = _StubUpdateService({})
+    with pytest.raises(YouTubeError, match="unlisted, private, or public"):
+        set_video_privacy(service, "vid1", "everyone", QuotaGuard(tmp_path))
+    assert service.update_calls == []
+
+
+def test_set_video_privacy_quota_guarded(stub_google, tmp_path):
+    from ai_video_factory.youtube import set_video_privacy
+
+    service = _StubUpdateService({})
+    quota = QuotaGuard(tmp_path, daily_budget=10)
+    with pytest.raises(YouTubeQuotaError):
+        set_video_privacy(service, "vid1", "public", quota)
+    assert service.update_calls == []

@@ -36,6 +36,7 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 # YouTube Data API v3 quota costs (units) for the calls we make.
 QUOTA_COSTS = {
     "videos.insert": 1600,
+    "videos.update": 50,
     "thumbnails.set": 50,
     "captions.insert": 50,
 }
@@ -552,6 +553,36 @@ def upload_package(
         thumbnail_uploaded=thumbnail_uploaded,
         captions_uploaded=captions_uploaded,
     )
+
+
+def set_video_privacy(
+    service: Any,
+    video_id: str,
+    privacy_status: str,
+    quota: "QuotaGuard",
+) -> str:
+    """Change a video's privacy status via videos.update (costs 50 units)."""
+    if privacy_status not in ("unlisted", "private", "public"):
+        raise YouTubeError(f"privacy must be unlisted, private, or public")
+    if service is None:
+        raise YouTubeError("a YouTube service is required to change privacy")
+    _require_google_libs()
+    quota.check(QUOTA_COSTS["videos.update"], "privacy update")
+    try:
+        response = (
+            service.videos()
+            .update(
+                part="status,id",
+                body={"id": video_id, "status": {"privacyStatus": privacy_status}},
+            )
+            .execute()
+        )
+    except Exception as error:
+        raise YouTubeUploadError(
+            f"privacy update failed for video {video_id}: {sanitize_diagnostic(error)}"
+        ) from error
+    quota.charge(QUOTA_COSTS["videos.update"])
+    return str(response.get("status", {}).get("privacyStatus", privacy_status))
 
 
 def find_run_manifest(data_root: Path, run_id: str) -> tuple[RunManifest, Path]:

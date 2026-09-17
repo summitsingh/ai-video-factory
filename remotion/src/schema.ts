@@ -14,6 +14,8 @@ export type EditScene = {
   clip?: string;
   subtitle?: string;
   pip?: boolean;
+  act?: string;
+  lower_third?: string;
 };
 
 export type EditDocument = {
@@ -75,7 +77,7 @@ const parseScene = (value: unknown): EditScene => {
   }
   assertExactKeys(
     value,
-    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'kind', 'visual', 'narration', 'background', 'text_color', 'accent_color', 'image', 'clip', 'subtitle', 'pip'],
+    ['id', 'from_frame', 'duration_frames', 'title', 'caption', 'kind', 'visual', 'narration', 'background', 'text_color', 'accent_color', 'image', 'clip', 'subtitle', 'pip', 'act', 'lower_third'],
     'scene',
   );
 
@@ -97,6 +99,8 @@ const parseScene = (value: unknown): EditScene => {
     clip: typeof value.clip === 'string' ? value.clip : undefined,
     subtitle: typeof value.subtitle === 'string' ? value.subtitle : undefined,
     pip: value.pip === true,
+    act: typeof value.act === 'string' ? value.act : undefined,
+    lower_third: typeof value.lower_third === 'string' ? value.lower_third : undefined,
   };
 };
 

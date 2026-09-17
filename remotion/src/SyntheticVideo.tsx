@@ -476,17 +476,35 @@ const SceneCard = ({
     TEXT_OUT_FRAMES,
   );
 
-  // Intro / outro scenes render as dedicated branded sequences.
+  // Intro / outro scenes render as dedicated branded sequences. An act card
+  // overlays the sequence only when the scene carries one; otherwise the
+  // render is unchanged.
   if (scene.kind === 'intro') {
-    return (
+    const intro = (
       <IntroSequence
         title={scene.title}
         subtitle={scene.caption || ''}
       />
     );
+    return scene.act ? (
+      <AbsoluteFill>
+        {intro}
+        <ActCard act={scene.act} accentColor={scene.accent_color} />
+      </AbsoluteFill>
+    ) : (
+      intro
+    );
   }
   if (scene.kind === 'outro') {
-    return <OutroSequence title={scene.title} sources={sources} />;
+    const outro = <OutroSequence title={scene.title} sources={sources} />;
+    return scene.act ? (
+      <AbsoluteFill>
+        {outro}
+        <ActCard act={scene.act} accentColor={scene.accent_color} />
+      </AbsoluteFill>
+    ) : (
+      outro
+    );
   }
 
   return (
@@ -515,6 +533,13 @@ const SceneCard = ({
       <AbsoluteFill style={{opacity: textOpacity, pointerEvents: 'none'}}>
         {/* Lower third: animated topic bar */}
         {scene.caption && <LowerThird text={scene.caption} />}
+        {/* Cinematic lower third: explicit per-scene label (speaker, location) */}
+        {scene.lower_third && (
+          <CinematicLowerThird
+            text={scene.lower_third}
+            accentColor={scene.accent_color}
+          />
+        )}
         {/* Burned-in subtitle (#1): legible caption anchored to the lower area */}
         {scene.subtitle ? (
           <Subtitle text={scene.subtitle} />
@@ -616,6 +641,8 @@ const SceneCard = ({
           </div>
         )}
       </AbsoluteFill>
+      {/* Act title card: brief full-frame card at the very start of the scene */}
+      {scene.act && <ActCard act={scene.act} accentColor={scene.accent_color} />}
     </AbsoluteFill>
   );
 };
@@ -1092,6 +1119,125 @@ const LowerThird = ({text}: {text: string}) => {
           {text}
         </div>
       </div>
+    </AbsoluteFill>
+  );
+};
+
+// Cinematic lower third: explicit per-scene label (speaker name, location,
+// source tag) rendered in the lower-left third of the frame, above the
+// subtitle area. Small-caps label style with a cyan accent bar, matching the
+// existing overlay language. Rendered inside the transient-text group so it
+// shares the same fade in/out envelope as captions and title cards. The
+// left-aligned, low placement keeps it clear of the frame center.
+const CinematicLowerThird = ({
+  text,
+  accentColor,
+}: {
+  text: string;
+  accentColor?: string;
+}) => {
+  const frame = useCurrentFrame();
+  const {width, height} = useVideoConfig();
+  const enter = interpolate(frame, [0, 18], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  return (
+    <AbsoluteFill style={{pointerEvents: 'none'}}>
+      <div
+        style={{
+          position: 'absolute',
+          bottom: height * 0.26,
+          left: width * 0.06,
+          maxWidth: width * 0.4,
+          opacity: enter,
+          transform: `translateX(${-16 * (1 - enter)}px)`,
+        }}
+      >
+        <div
+          style={{
+            backgroundColor: 'rgba(10, 18, 40, 0.82)',
+            borderLeft: `4px solid ${accentColor ?? '#22d3ee'}`,
+            borderRadius: '0 6px 6px 0',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+            padding: `${height * 0.008}px ${width * 0.02}px`,
+          }}
+        >
+          <div
+            style={{
+              color: '#f1f5f9',
+              fontFamily: 'Arial, sans-serif',
+              fontSize: Math.round(height * 0.024),
+              fontWeight: 600,
+              letterSpacing: '0.22em',
+              lineHeight: 1.4,
+              textTransform: 'uppercase',
+            }}
+          >
+            {text}
+          </div>
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+
+// Act title card timing (frames at 30fps): brief card at the very start of
+// the scene, ~2.8s total, then gone so the scene plays unobstructed.
+const ACT_CARD_IN_FRAMES = 12;
+const ACT_CARD_HOLD_FRAMES = 48;
+const ACT_CARD_OUT_FRAMES = 24;
+
+// Act title card: a brief full-frame centered card marking a new act
+// (e.g. "ACT II"). Fades in over ~12 frames, holds ~48, fades out over ~24
+// over a dark scrim. Deterministic: timing and layout depend only on the
+// frame counter, no randomness.
+const ActCard = ({act, accentColor}: {act: string; accentColor?: string}) => {
+  const frame = useCurrentFrame();
+  const {height} = useVideoConfig();
+  const opacity = opacityEnvelope(
+    frame,
+    ACT_CARD_IN_FRAMES,
+    ACT_CARD_HOLD_FRAMES,
+    ACT_CARD_OUT_FRAMES,
+  );
+  if (opacity === 0) return null;
+  return (
+    <AbsoluteFill
+      style={{
+        alignItems: 'center',
+        backgroundColor: 'rgba(2, 6, 18, 0.78)',
+        display: 'flex',
+        flexDirection: 'column',
+        fontFamily: 'Arial, sans-serif',
+        justifyContent: 'center',
+        opacity,
+        pointerEvents: 'none',
+        textAlign: 'center',
+      }}
+    >
+      <div
+        style={{
+          color: '#f8fafc',
+          fontSize: Math.max(40, Math.round(height * 0.085)),
+          fontWeight: 800,
+          letterSpacing: '0.12em',
+          lineHeight: 1.1,
+          maxWidth: '80%',
+          textShadow: '0 2px 16px rgba(0,0,0,0.8)',
+          textTransform: 'uppercase',
+        }}
+      >
+        {act}
+      </div>
+      <div
+        style={{
+          backgroundColor: accentColor ?? '#22d3ee',
+          height: Math.max(5, Math.round(height * 0.008)),
+          marginTop: Math.round(height * 0.03),
+          width: '12%',
+        }}
+      />
     </AbsoluteFill>
   );
 };

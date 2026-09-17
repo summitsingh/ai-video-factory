@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fractions import Fraction
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping
 
 from pydantic import BaseModel
 
@@ -128,3 +128,74 @@ def write_qc_reports(report: QcReport, output_dir: Path) -> tuple[Path, Path]:
     )
     markdown_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return json_path, markdown_path
+
+
+def evaluate_content_qc(
+    edit: EditDocument,
+    *,
+    target_minutes: float | None = None,
+    artifacts: Mapping[str, str] | None = None,
+    longform: bool = False,
+) -> QcReport:
+    """Content-level checks for long-form readiness.
+
+    Verifies the edit actually delivers the promised runtime (within 5%),
+    has enough scenes to sustain visual pacing, keeps narration on nearly
+    every scene, carries the act structure for long-form, and produced the
+    caption/chapter/thumbnail artifacts publishing needs.
+    """
+    actual_minutes = edit.duration_frames / edit.fps / 60 if edit.fps else 0.0
+    checks: list[QcCheck] = []
+    if target_minutes is not None and target_minutes > 0:
+        within = abs(actual_minutes - target_minutes) / target_minutes <= 0.05
+        checks.append(
+            _check(
+                "target-duration",
+                within,
+                f"target {target_minutes:.1f} min; edit is {actual_minutes:.1f} min",
+            )
+        )
+    min_scenes = 10 if longform else 3
+    checks.append(
+        _check(
+            "scene-count",
+            len(edit.scenes) >= min_scenes,
+            f"{len(edit.scenes)} scenes (minimum {min_scenes})",
+        )
+    )
+    narrated = sum(1 for s in edit.scenes if s.narration and s.narration.strip())
+    coverage = narrated / len(edit.scenes) if edit.scenes else 0.0
+    checks.append(
+        _check(
+            "narration-coverage",
+            coverage >= 0.9,
+            f"{narrated}/{len(edit.scenes)} scenes carry narration",
+        )
+    )
+    if longform:
+        acts = {s.act for s in edit.scenes if s.act}
+        checks.append(
+            _check(
+                "act-structure",
+                len(acts) >= 5,
+                f"{len(acts)} distinct act cards present",
+            )
+        )
+    present = artifacts or {}
+    for key, label in (
+        ("srt", "captions"),
+        ("chapters_json", "chapters"),
+        ("thumbnail_1", "thumbnail"),
+    ):
+        found = bool(present.get(key))
+        checks.append(
+            _check(
+                f"artifact-{key}",
+                found,
+                f"{label} {'present' if found else 'missing'}",
+            )
+        )
+    status: Literal["pass", "fail"] = (
+        "pass" if all(check.passed for check in checks) else "fail"
+    )
+    return QcReport(status=status, checks=checks)

@@ -36,7 +36,7 @@ from ai_video_factory.narration import (
     synthesize_to_wav,
     trim_audio_start,
 )
-from ai_video_factory.qc import evaluate_qc, write_qc_reports
+from ai_video_factory.qc import QcReport, evaluate_content_qc, evaluate_qc, write_qc_reports
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
@@ -45,6 +45,14 @@ from ai_video_factory.nasa_media import populate_assets_from_nasa
 from ai_video_factory.theme import SPACE_THEME, ThemeConfig
 from ai_video_factory.thumbnail import build_thumbnails, validate_thumbnails
 from ai_video_factory.script_generator import ScriptGenerationError, ScriptOutput, generate_script
+from ai_video_factory.longform import (
+    DEFAULT_LONGFORM_MINUTES,
+    LongformError,
+    LongformScript,
+    generate_longform_script,
+    longform_script_from_dict,
+    longform_to_edit_document,
+)
 
 
 # ========== Types and Models ==========
@@ -1122,6 +1130,7 @@ def _validate_master(
     fixture: Path,
     *,
     tools: Mapping[str, Mapping[str, Any]] | None = None,
+    content_qc: QcReport | None = None,
 ) -> dict[str, str]:
     media = (
         probe_media(master_path, _media_runner(tools))
@@ -1129,6 +1138,10 @@ def _validate_master(
         else probe_media(master_path)
     )
     report = evaluate_qc(media, load_edit(fixture))
+    if content_qc is not None:
+        report.checks.extend(content_qc.checks)
+        if content_qc.status == "fail":
+            report.status = "fail"
     json_path, markdown_path = write_qc_reports(report, master_path.parent)
     return {
         "status": report.status,
@@ -1172,6 +1185,8 @@ def run_video_pipeline(
     script_path: Path | None = None,
     theme: ThemeConfig | None = None,
     trend_source: str = "all",
+    longform: bool = False,
+    target_duration_minutes: float = DEFAULT_LONGFORM_MINUTES,
 ) -> PipelineResult:
     """Run the complete video production pipeline.
 
@@ -1196,6 +1211,11 @@ def run_video_pipeline(
             preserving the original behavior.
         trend_source: Which trend providers research may query: "reddit",
             "gnews", or "all" (default). Passed to research_trending_topics.
+        longform: When True, generate a long-form documentary script
+            (three-act structure with cold open, ~20-30 minutes of narration)
+            instead of the default 90-second short script.
+        target_duration_minutes: Target narration length for longform mode.
+            Must be between 20 and 30. Ignored when longform is False.
     """
     state_store: RunStore | None = None
     run_id: str | None = None
@@ -1257,6 +1277,7 @@ def run_video_pipeline(
         # Step 2: Generate script with LM Studio (or load a worker-made script)
         metadata["script_status"] = "in_progress"
         job.script_path = job_dir / "script.json"
+        longform_script: LongformScript | None = None
         if script_path is not None:
             worker_data = json.loads(Path(script_path).read_text(encoding="utf-8"))
             script = ScriptOutput(
@@ -1270,6 +1291,87 @@ def run_video_pipeline(
                 json.dumps(worker_data, indent=2), encoding="utf-8"
             )
             metadata["script_origin"] = "worker"
+            artifacts["script"] = str(job.script_path)
+        elif longform:
+            # Long-form documentary path: beats are generated one at a time
+            # against a shared series bible, then assembled. Downstream
+            # stages key off job.duration_seconds, so pin it to the target
+            # runtime up front (refined from the edit doc in Step 3).
+            job.duration_seconds = int(target_duration_minutes * 60)
+            metadata["target_duration_minutes"] = target_duration_minutes
+            script_inputs = {
+                "topic": trending_topic.title,
+                "description": trending_topic.description,
+                "source_url": trending_topic.url,
+                "allow_fallback": False,
+                "mode": "longform",
+                "target_duration_minutes": target_duration_minutes,
+            }
+            script_run = state_store.start("video-script", script_inputs)
+            if script_run.resumed:
+                resumed_data = json.loads(
+                    Path(script_run.artifacts["script"]).read_text(encoding="utf-8")
+                )
+                longform_script = longform_script_from_dict(resumed_data)
+                job.script_path.write_text(
+                    longform_script.to_json(), encoding="utf-8"
+                )
+            else:
+                try:
+                    state_store.heartbeat(script_run.run_id)
+                    research_brief = (
+                        job.research_path.read_text(encoding="utf-8")
+                        if job.research_path.is_file()
+                        else None
+                    )
+                    longform_script = generate_longform_script(
+                        topic=trending_topic.title,
+                        description=trending_topic.description,
+                        source_url=trending_topic.url,
+                        target_minutes=target_duration_minutes,
+                        research_brief=research_brief,
+                        title=job.title or None,
+                        sources=[trending_topic.url],
+                        output_path=job.script_path,
+                    )
+                    state_store.heartbeat(script_run.run_id)
+                except Exception as error:
+                    # Same fail-loud contract as the short path: a bad beat
+                    # aborts the run instead of producing a thin video.
+                    state_store.fail(script_run.run_id, error)
+                    raise
+                script_run = state_store.complete(
+                    script_run.run_id,
+                    {"script": str(job.script_path), "origin": "local_model_longform"},
+                    expected_artifacts={"script": job.script_path},
+                )
+            script = ScriptOutput(
+                title=longform_script.title,
+                narration="\n\n".join(
+                    scene.narration
+                    for beat in longform_script.beats
+                    for scene in beat.scenes
+                ),
+                scenes=[
+                    {
+                        "title": scene.title,
+                        "caption": scene.narration,
+                        "narration": scene.narration,
+                        "visual": scene.visual_direction,
+                        "lower_third": scene.lower_third,
+                    }
+                    for beat in longform_script.beats
+                    for scene in beat.scenes
+                ],
+                sources=longform_script.sources,
+                captions=[],
+                generated_at=longform_script.generated_at,
+            )
+            metadata["script_origin"] = "local_model_longform"
+            metadata["script_words"] = longform_script.total_words
+            metadata["script_estimated_minutes"] = round(
+                longform_script.estimated_minutes, 2
+            )
             artifacts["script"] = str(job.script_path)
         else:
             script_inputs = {
@@ -1325,93 +1427,105 @@ def run_video_pipeline(
         metadata["edit_status"] = "in_progress"
         job.edit_path = job_dir / "edit.json"
 
-        # Create edit document from script
         fps = 30
-        duration_seconds = job.duration_seconds
-        total_frames = duration_seconds * fps
-
-        # Reserve fixed durations for branded intro/outro sequences. These are
-        # dedicated scenes so they render once (chunk-safe) and concatenate in
-        # order with the normal content.
-        INTRO_FRAMES = 150   # 5s branded title card
-        OUTRO_FRAMES = 180   # 6s credits sequence
-
-        # Distribute remaining frames across normal scenes so no blank tail
-        # remains when the script returns fewer/shorter scenes.
-        content_frames = total_frames - INTRO_FRAMES - OUTRO_FRAMES
-        scene_count = max(len(script.scenes), 1)
-        base_frames, remainder = divmod(content_frames, scene_count)
-
-        scenes: list[EditScene] = []
-        cursor = 0
-
-        # Intro sequence first.
-        intro_scene = EditScene(
-            id="intro",
-            from_frame=cursor,
-            duration_frames=INTRO_FRAMES,
-            title=job.title or f"Trending: {job.topic}",
-            caption=job.description or job.topic,
-            kind="intro",
-        )
-        scenes.append(intro_scene)
-        cursor += INTRO_FRAMES
-
-        # Normal content scenes.
-        for i, scene_data in enumerate(script.scenes):
-            span = base_frames + (1 if i < remainder else 0)
-            subtitle_text = scene_data.get("subtitle") or scene_data.get("caption", "")
-            # Enable picture-in-picture when the scene has both a clip and an
-            # image so the secondary asset can show as an inset.
-            pip_enabled = bool(scene_data.get("pip")) or (
-                bool(scene_data.get("clip")) and bool(scene_data.get("image"))
+        if longform_script is not None:
+            # Long-form path: scene timing derives from narration word
+            # counts so the timeline matches the spoken track; beats
+            # carry act cards and lower thirds for the cinematic render.
+            edit_doc = longform_to_edit_document(
+                longform_script, fps=fps, created_at=job.created_at
             )
-            scene = EditScene(
-                id=f"scene-{i}",
+            job.duration_seconds = edit_doc.duration_frames // fps
+            metadata["edit_words"] = longform_script.total_words
+            save_edit(edit_doc, job.edit_path)
+        else:
+            # Create edit document from script
+            fps = 30
+            duration_seconds = job.duration_seconds
+            total_frames = duration_seconds * fps
+
+            # Reserve fixed durations for branded intro/outro sequences. These are
+            # dedicated scenes so they render once (chunk-safe) and concatenate in
+            # order with the normal content.
+            INTRO_FRAMES = 150   # 5s branded title card
+            OUTRO_FRAMES = 180   # 6s credits sequence
+
+            # Distribute remaining frames across normal scenes so no blank tail
+            # remains when the script returns fewer/shorter scenes.
+            content_frames = total_frames - INTRO_FRAMES - OUTRO_FRAMES
+            scene_count = max(len(script.scenes), 1)
+            base_frames, remainder = divmod(content_frames, scene_count)
+
+            scenes: list[EditScene] = []
+            cursor = 0
+
+            # Intro sequence first.
+            intro_scene = EditScene(
+                id="intro",
                 from_frame=cursor,
-                duration_frames=span,
-                title=scene_data.get("title", f"Scene {i+1}"),
-                caption=scene_data.get("caption", ""),
-                visual=scene_data.get("visual"),
-                narration=scene_data.get("narration"),
-                subtitle=subtitle_text or None,
-                pip=pip_enabled,
+                duration_frames=INTRO_FRAMES,
+                title=job.title or f"Trending: {job.topic}",
+                caption=job.description or job.topic,
+                kind="intro",
             )
-            scenes.append(scene)
-            cursor += span
+            scenes.append(intro_scene)
+            cursor += INTRO_FRAMES
 
-        # Outro sequence last.
-        outro_scene = EditScene(
-            id="outro",
-            from_frame=cursor,
-            duration_frames=OUTRO_FRAMES,
-            title=job.title or f"Trending: {job.topic}",
-            caption=theme.outro_caption,
-            kind="outro",
-        )
-        scenes.append(outro_scene)
-
-        edit_doc = EditDocument(
-            schema_version=1,
-            width=1280,
-            height=720,
-            fps=fps,
-            duration_frames=total_frames,
-            scenes=scenes if scenes else [
-                EditScene(
-                    id="scene-0",
-                    from_frame=0,
-                    duration_frames=total_frames,
-                    title=job.title or f"Trending: {job.topic}",
-                    caption=job.description or job.topic,
+            # Normal content scenes.
+            for i, scene_data in enumerate(script.scenes):
+                span = base_frames + (1 if i < remainder else 0)
+                subtitle_text = scene_data.get("subtitle") or scene_data.get("caption", "")
+                # Enable picture-in-picture when the scene has both a clip and an
+                # image so the secondary asset can show as an inset.
+                pip_enabled = bool(scene_data.get("pip")) or (
+                    bool(scene_data.get("clip")) and bool(scene_data.get("image"))
                 )
-            ],
-            title=job.title,
-            description=job.description,
-            sources=script.sources,
-            created_at=job.created_at,
-        )
-        save_edit(edit_doc, job.edit_path)
+                scene = EditScene(
+                    id=f"scene-{i}",
+                    from_frame=cursor,
+                    duration_frames=span,
+                    title=scene_data.get("title", f"Scene {i+1}"),
+                    caption=scene_data.get("caption", ""),
+                    visual=scene_data.get("visual"),
+                    narration=scene_data.get("narration"),
+                    subtitle=subtitle_text or None,
+                    pip=pip_enabled,
+                )
+                scenes.append(scene)
+                cursor += span
+
+            # Outro sequence last.
+            outro_scene = EditScene(
+                id="outro",
+                from_frame=cursor,
+                duration_frames=OUTRO_FRAMES,
+                title=job.title or f"Trending: {job.topic}",
+                caption=theme.outro_caption,
+                kind="outro",
+            )
+            scenes.append(outro_scene)
+
+            edit_doc = EditDocument(
+                schema_version=1,
+                width=1280,
+                height=720,
+                fps=fps,
+                duration_frames=total_frames,
+                scenes=scenes if scenes else [
+                    EditScene(
+                        id="scene-0",
+                        from_frame=0,
+                        duration_frames=total_frames,
+                        title=job.title or f"Trending: {job.topic}",
+                        caption=job.description or job.topic,
+                    )
+                ],
+                title=job.title,
+                description=job.description,
+                sources=script.sources,
+                created_at=job.created_at,
+            )
+            save_edit(edit_doc, job.edit_path)
         # Resolve the assets directory used to attach per-scene media. If the
         # caller did not supply one (--assets-dir), populate an internal
         # directory from NASA's public-domain library so scenes get real footage
@@ -1672,7 +1786,19 @@ def run_video_pipeline(
             job.qc_report_path = Path(result["report"]) if result.get("report") else None
         else:
             state_store.event(qc_run.run_id, "qc_started", {"master": str(job.master_path)})
-            result = _validate_master(job.master_path, job.edit_path, tools=tools)
+            content_qc: QcReport | None = None
+            if longform:
+                # Long-form runs must actually deliver the promised runtime
+                # with the act structure and publishing artifacts intact.
+                content_qc = evaluate_content_qc(
+                    edit_doc,
+                    target_minutes=target_duration_minutes,
+                    artifacts=artifacts,
+                    longform=True,
+                )
+            result = _validate_master(
+                job.master_path, job.edit_path, tools=tools, content_qc=content_qc
+            )
             status = _status(result)
             artifacts["qc_report"] = result.get("report", "")
             artifacts["qc_report_markdown"] = result.get("report_markdown", "")
