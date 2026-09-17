@@ -1,0 +1,51 @@
+{
+  "artifact_integrity": {
+    "brief": {
+      "path": "daily/research-override/research_brief.md",
+      "sha256": "bcd729ed2ddbabe6d1919663d6ef54b718646cfd7e0028cd2fa1aabbe7c58919",
+      "size_bytes": 2710
+    }
+  },
+  "artifacts": {
+    "brief": "/home/summit/ai-video-factory/runs/daily/research-override/research_brief.md",
+    "dir": "/home/summit/ai-video-factory/runs/daily/research-override",
+    "dropped_sources": [],
+    "extraction_schema_version": "2026-09-07",
+    "extractor_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+    "extractor_model_id": "tiel-coder-35b-a3b-mtp",
+    "extractor_name": "lm-studio-production",
+    "extractor_version": "1.0",
+    "output_digest": "5469440ca8092847bbf74a0180ce8379d1f9552275e7fdaf5c64cf01cf619880",
+    "prompt_version": "2026-09-07",
+    "source_content_hashes": {
+      "https://images-api.nasa.gov/search?q=Enceladus+plume": "6834f275b39bd0af4bcbe5f0195441123a261830b8428acd6d84926d24cc7636",
+      "https://images-api.nasa.gov/search?q=Mars+ancient+riverbed": "943f5bb75a93d6f84ba261ed1d8f8d70a8cac1f977fe9e0cf89f03d689c531c5",
+      "https://images-api.nasa.gov/search?q=Mars+water+ice+polar": "14d82d8bd86a92031492adf5a3997355e16e624e88cef8cb70fc22900948257e"
+    },
+    "source_urls": [
+      "https://images-api.nasa.gov/search?q=Mars+ancient+riverbed",
+      "https://images-api.nasa.gov/search?q=Enceladus+plume",
+      "https://images-api.nasa.gov/search?q=Mars+water+ice+polar"
+    ],
+    "topic": "Water Beyond Earth: Where It Is and Why It Means We're Looking",
+    "verified_count": 0
+  },
+  "created_at": "2026-09-14T21:51:28.759985+00:00",
+  "error": null,
+  "input_fingerprint": "c71f37ca5cd0296e6fba270c97145f8850aa213d10fbff5118d8e69cbbbd229e",
+  "inputs": {
+    "dry_run": false,
+    "sources": [
+      "https://images-api.nasa.gov/search?q=Mars+ancient+riverbed",
+      "https://images-api.nasa.gov/search?q=Enceladus+plume",
+      "https://images-api.nasa.gov/search?q=Mars+water+ice+polar"
+    ],
+    "topic": "Water Beyond Earth: Where It Is and Why It Means We're Looking"
+  },
+  "resumed": true,
+  "run_id": "cea2e2ecd9cc42ffbb4938451fabdbc1",
+  "schema_version": 1,
+  "stage": "research",
+  "status": "completed",
+  "updated_at": "2026-09-15T06:21:32.268386+00:00"
+}

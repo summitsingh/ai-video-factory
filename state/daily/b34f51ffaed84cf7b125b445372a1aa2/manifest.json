@@ -1,0 +1,25 @@
+{
+  "artifact_integrity": {},
+  "artifacts": {},
+  "created_at": "2026-09-11T21:38:24.965639+00:00",
+  "error": "no verified facts available to build a candidate",
+  "input_fingerprint": "c12f9b29a15292782cb076ae4a1c3569912347142394a6f425b1dd67f529d80b",
+  "inputs": {
+    "dry_run": true,
+    "max_candidates": 5,
+    "min_words": 2200,
+    "providers": [
+      "hacker_news",
+      "reddit"
+    ],
+    "research_shortlist": 2,
+    "research_source_urls": [],
+    "topic_override": "Local AI Trends"
+  },
+  "resumed": false,
+  "run_id": "b34f51ffaed84cf7b125b445372a1aa2",
+  "schema_version": 1,
+  "stage": "daily",
+  "status": "failed",
+  "updated_at": "2026-09-11T21:38:24.967108+00:00"
+}
