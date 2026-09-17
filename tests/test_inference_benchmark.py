@@ -63,7 +63,7 @@ class BenchmarkBackend:
         config: InferenceConfig,
         http: RecordingHttpTransport,
         *,
-        loaded_identifier: str | None = "avf-qwen36-executor",
+        loaded_identifier: str | None = "avf-tiel-coder-executor",
         snapshot_error: BaseException | None = None,
     ) -> None:
         self.config = config
@@ -114,7 +114,7 @@ class FakeClock:
 def _response(
     content: str | None,
     *,
-    model: str = "avf-qwen36-executor",
+    model: str = "avf-tiel-coder-executor",
     tool_calls: list[dict[str, object]] | None = None,
     usage: dict[str, object] | None = None,
     reasoning_content: str = "REASONING_MUST_NOT_PERSIST",
@@ -162,8 +162,8 @@ def benchmark_fixture(
     *,
     http: RecordingHttpTransport | None = None,
     response_text: str = "LOCAL_OK",
-    loaded_identifier: str | None = "avf-qwen36-executor",
-    configured_identifier: str = "avf-qwen36-executor",
+    loaded_identifier: str | None = "avf-tiel-coder-executor",
+    configured_identifier: str = "avf-tiel-coder-executor",
     snapshot_error: BaseException | None = None,
 ) -> tuple[InferenceService, RunStore, Path, RecordingHttpTransport]:
     data_root = tmp_path / "data"
@@ -176,7 +176,7 @@ def benchmark_fixture(
             "backend": "lm_studio",
             "base_url": "http://127.0.0.1:1234/v1",
             "lms_binary": "lms",
-            "model_key": "qwen3.6-35b-a3b-udt-mtp",
+            "model_key": "tiel-coder-35b-a3b-mtp",
             "identifier": configured_identifier,
             "context_length": 65_536,
             "gpu": "max",
@@ -294,7 +294,7 @@ def test_benchmark_sends_three_deterministic_requests_without_credentials(
     )
     assert all(call.body is not None for call in transport.calls)
     assert all(
-        call.body["model"] == "avf-qwen36-executor"
+        call.body["model"] == "avf-tiel-coder-executor"
         for call in transport.calls
         if call.body
     )
@@ -325,7 +325,7 @@ def test_benchmark_sends_three_deterministic_requests_without_credentials(
         ],
     ]
     assert transport.calls[0].body == {
-        "model": "avf-qwen36-executor",
+        "model": "avf-tiel-coder-executor",
         "messages": [{"role": "user", "content": "Reply exactly LOCAL_OK."}],
         "temperature": 0,
         "seed": 7,
@@ -452,7 +452,7 @@ def test_hermes_doctor_uses_real_unloaded_current_capability_report(tmp_path: Pa
         schema_version=1, hermes_binary="hermes", required_version="0.21.0",
         required_commit="b0ab2e16", profile="default", parent_provider="nous",
         parent_model="stepfun/step-3.7-flash:free",
-        delegation_base_url="http://127.0.0.1:1234/v1", delegation_model="avf-qwen36-executor",
+        delegation_base_url="http://127.0.0.1:1234/v1", delegation_model="avf-tiel-coder-executor",
         delegation_api_mode="chat_completions", local_api_key_placeholder="no-key-required",
         max_concurrent_children=1, max_iterations=50, vision_fixture="assets/vision/capability-probe.png",
         fallback_provider="nous", fallback_model="stepfun/step-3.7-flash:free",
@@ -462,7 +462,7 @@ def test_hermes_doctor_uses_real_unloaded_current_capability_report(tmp_path: Pa
         "commit": "b0ab2e16", "config_path": "/safe/config.yaml", "profile": "default",
         "config_valid": True, "parent_provider": "nous",
         "parent_model": "stepfun/step-3.7-flash:free", "parent_base_url": "https://nous.example/v1",
-        "delegation_model": "avf-qwen36-executor", "delegation_base_url": "http://127.0.0.1:1234/v1",
+        "delegation_model": "avf-tiel-coder-executor", "delegation_base_url": "http://127.0.0.1:1234/v1",
         "delegation_api_mode": "chat_completions", "delegation_max_iterations": 50,
         "delegation_max_concurrent_children": 1, "delegation_max_spawn_depth": 1,
         "delegation_orchestrator_enabled": False, "delegation_subagent_auto_approve": False,
@@ -703,7 +703,7 @@ def test_transport_failures_persist_only_sanitized_bounded_diagnostics(
     ("mutation", "failed_check"),
     [
         (lambda responses: responses.__setitem__(0, _response("NOT_OK")), "ordinary_generation"),
-        (lambda responses: responses.__setitem__(0, {"model": "avf-qwen36-executor", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}), "ordinary_generation"),
+        (lambda responses: responses.__setitem__(0, {"model": "avf-tiel-coder-executor", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}), "ordinary_generation"),
         (lambda responses: responses.__setitem__(1, _response("not-json")), "structured_output"),
         (lambda responses: responses.__setitem__(1, _response('{"status":"LOCAL_OK","extra":true}')), "structured_output"),
         (lambda responses: responses.__setitem__(2, _response(None, tool_calls=[])), "tool_calling"),

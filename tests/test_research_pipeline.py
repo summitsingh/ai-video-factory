@@ -11,7 +11,7 @@ from ai_video_factory.research_pipeline import (
     Claim,
     Contradiction,
     Extraction,
-    ResearchResult,
+    ResearchError,
     SourceDrop,
     _SourceDeadlineExhausted,
     classify_source_quality,
@@ -178,6 +178,69 @@ def test_run_research_fails_closed_on_non_droppable_deadline(tmp_path: Path) -> 
         yield Extraction("x", "x", "confirmed fact")
 
     with pytest.raises(_SourceDeadlineExhausted):
+        run_research(
+            "Water in the outer solar system",
+            [europa],
+            content_fetcher=fetcher,
+            production_extractor=extractor,  # type: ignore[arg-type]
+        )
+
+def test_run_research_drops_extraction_grounding_failure(tmp_path: Path) -> None:
+    """A droppable source whose extractor yields no verbatim-grounded claim drops
+    (not fails closed); retained sources still yield claims and the dropped URL is
+    excluded from provenance."""
+    mars = "https://images-api.nasa.gov/item/nasa-mars"
+    europa = "https://images-api.nasa.gov/item/europa-ocean"
+
+    def fetcher(url: str) -> bytes:
+        return {
+            mars: b"Mars is cold, red, dry, and has a thin atmosphere of carbon dioxide.",
+            europa: b"Europa has a subsurface ocean of liquid water.",
+        }[url]
+
+    def extractor(topic: str, src: list, identity=None):
+        for s in src:
+            if s.url == mars:
+                # Model paraphrased the content; no quote matches -> grounding failure.
+                raise ResearchError(
+                    "production extractor returned no claims with verbatim evidence"
+                )
+            yield Extraction(
+                claim="Europa harbors a subsurface ocean.",
+                quote="Europa has a subsurface ocean of liquid water.",
+                classification="confirmed fact",
+            )
+
+    result = run_research(
+        "Water in the outer solar system",
+        [mars, europa],
+        content_fetcher=fetcher,
+        production_extractor=extractor,  # type: ignore[arg-type]
+        droppable_urls=frozenset({mars}),
+    )
+    assert len(result.dropped_sources) == 1
+    drop = result.dropped_sources[0]
+    assert isinstance(drop, SourceDrop)
+    assert drop.url == mars and drop.stage == "extraction"
+    # Europa retained; Mars excluded from provenance.
+    assert [s.url for s in result.sources] == [europa]
+    assert europa in result.source_content_hashes
+    assert mars not in result.source_content_hashes
+    assert len(result.claims) == 1
+
+
+def test_run_research_fails_closed_on_non_droppable_grounding(tmp_path: Path) -> None:
+    """A non-droppable source whose extractor yields no verbatim-grounded claim fails
+    the whole run (ungrounded output never becomes verified facts)."""
+    europa = "https://images-api.nasa.gov/item/europa-ocean"
+
+    def fetcher(url: str) -> bytes:
+        return b"Europa has a subsurface ocean of liquid water."
+
+    def extractor(topic: str, src: list, identity=None):
+        raise ResearchError("production extractor returned no claims with verbatim evidence")
+
+    with pytest.raises(ResearchError):
         run_research(
             "Water in the outer solar system",
             [europa],

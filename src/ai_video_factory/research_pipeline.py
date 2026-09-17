@@ -82,7 +82,12 @@ EXTRACTION_SCHEMA_VERSION = "2026-09-07"
 # emit preamble/empty/junk on another. A bounded retry lets transient variance recover
 # while still failing closed after every attempt is non-conforming. Transport errors
 # (endpoint unavailable) are deliberately NOT retried -- they must surface immediately.
-_EXTRACTION_RETRIES = 5
+# Kept low (2): each failed attempt costs a full ~15-20s model round-trip, and research
+# processes sources sequentially under a hard per-run budget (~180s). A flaky source that
+# never conforms would otherwise burn 5x~18s ~= 90s before dropping, blowing the budget for
+# every other source. Two attempts recover rare transient variance while letting a
+# persistently non-conforming source drop fast (recorded in provenance) instead of aborting.
+_EXTRACTION_RETRIES = 2
 
 # Matches one extraction output line: `[classification] | claim || "verbatim quote"`.
 _EVIDENCE_LINE_RE = re.compile(
@@ -747,7 +752,7 @@ def lm_studio_extract_claims(
         f"Topic: {topic}\nSources: {[s.url for s in sources]}\n"
     )
     payload = json.dumps({
-        "model": "qwen3.6-35b-a3b-udt-mtp",
+        "model": "tiel-coder-35b-a3b-mtp",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 1024,
         "temperature": 0.2,
@@ -845,7 +850,10 @@ def make_production_extractor(
     extractor_version: str = "1.0",
     prompt_version: str = PROMPT_VERSION,
     extraction_schema_version: str = EXTRACTION_SCHEMA_VERSION,
-    timeout_seconds: float = 180,
+    # Per-attempt wall-clock budget for fetch + model POST (SIGALRM-capped). Kept well
+    # below the ~180s global research run-budget so a hanging source drops fast and leaves
+    # room for the others; valid extraction is only ~15-20s, so 45s gives comfortable margin.
+    timeout_seconds: float = 45,
     max_attempts: int = _EXTRACTION_RETRIES,
 ) -> ProductionExtractor:
     """Build a schema-constrained production claim extractor.
@@ -1475,8 +1483,26 @@ def extract_from_source_content(
             retained.append(sc)
         except _SourceDeadlineExhausted as exc:
             # Extraction-stage deadline exhaustion: skip ONLY flagged sources and continue
-            # the same run. Other ResearchError (malformed schema / ungrounded quote) still
-            # fails closed immediately -- it is not a transient budget failure.
+            # the same run; non-droppable sources fail closed on budget exhaustion.
+            if sc.url not in droppable_urls or sc.url in dropped_seen:
+                raise
+            dropped_seen.add(sc.url)
+            if drops is not None:
+                drops.append(SourceDrop(
+                    url=sc.url,
+                    stage="extraction",
+                    limit_seconds=getattr(exc, "limit_seconds", 0.0),
+                    attempts=getattr(exc, "attempts", 1),
+                    elapsed_seconds=getattr(exc, "elapsed_seconds", 0.0),
+                    detail=getattr(exc, "detail", str(exc)),
+                ))
+            continue
+        except ResearchError as exc:
+            # A source that yields no verbatim-grounded claims (the local model paraphrases
+            # or cannot quote the content) is a content failure, not a transient budget one.
+            # Only an EXPLICITLY flagged droppable source may skip it; every other source still
+            # fails closed so ungrounded output never becomes verified facts. A dropped source
+            # is recorded in provenance and excluded from hashes/content/brief/assets downstream.
             if sc.url not in droppable_urls or sc.url in dropped_seen:
                 raise
             dropped_seen.add(sc.url)
@@ -1608,10 +1634,12 @@ def run_research(
     hashes, and an output digest — all part of the research-stage fingerprint.
 
     ``droppable_urls`` lists sources that may be skipped (rather than fail the run)
-    when they exhaust their bounded per-attempt deadline budget during fetch or
-    extraction; such sources are recorded in ``result.dropped_sources`` and excluded
-    from provenance, hashes, content, and the brief. Every other source still fails
-    closed on deadline exhaustion.
+    when they either exhaust their bounded per-attempt deadline budget during fetch or
+    extraction, OR fail to yield any verbatim-grounded claims (the local model
+    paraphrases content it cannot quote). Such sources are recorded in
+    ``result.dropped_sources`` and excluded from provenance, hashes, content, and the
+    brief. Every other source still fails closed on either failure mode so ungrounded
+    output never becomes verified facts.
     """
     observed_at = observed_at or datetime.now(UTC).isoformat()
     sources = collect_sources(source_urls)

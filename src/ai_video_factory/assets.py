@@ -37,7 +37,7 @@ from typing import Any, Callable, Literal, Sequence
 
 from ai_video_factory.sanitization import sanitize_diagnostic
 
-Provider = Literal["nasa", "wikimedia"]
+Provider = Literal["nasa", "wikimedia", "esa"]
 LicenseStatus = Literal["approved", "pending_review", "rejected"]
 AssetKind = Literal["clip", "image", "map", "chart", "generated_visual", "source_excerpt"]
 AssetStrategy = Literal[
@@ -154,8 +154,12 @@ _NASA_USAGE_TERMS_URL_RE = re.compile(
 # U.S. agencies (NOAA, Interior/USGS, Smithsonian, Armed Forces, NRL, ...) are not
 # auto-cleared here; they would need their own explicit compatible item license/terms.
 # A structured author is acceptable when it names NASA (matched as a standalone token so
-# "nasal" does not match) or one of the known NASA centers. Contractor-operated facilities
-# such as JPL/Caltech are deliberately excluded here and rejected by the contractor-marker check.
+# "nasal" does not match) or one of the known NASA centers/abbreviations. NASA-led works —
+# including those prepared by operating FFRDC institutions such as JPL (Caltech), GSFC, JSC,
+# and ARC — are government works under 17 U.S.C. § 105; the FFRDC operator suffix does not
+# defeat federal authorship. Only a NON-NASA-led author that carries a contractor/FFRDC
+# suffix (e.g. "Jet Propulsion Laboratory, Caltech") or an individual/third-party credit is
+# rejected as ambiguous provenance.
 _NASA_AGENCY_MARKERS = (
     "nasa",
     "national aeronautics and space administration",
@@ -170,13 +174,16 @@ _NASA_CENTER_NAMES = (
     "armstrong flight center",
     "glenn research center",
 )
+# Common NASA-center abbreviations as they appear in NASA metadata creator/center fields.
+_NASA_CENTER_ABBREVIATIONS = ("jpl", "gsfc", "ksc", "jsc", "arc", "larc", "msfc")
 
-# Explicit mixed / contractor attribution in a structured author field supersedes
-# agency authorship and is rejected (JPL/Caltech and other FFRDC suffixes are included).
+# Explicit third-party rights / human-credit phrases in a structured author field are
+# rejected. A bare FFRDC operator suffix (Caltech) on an otherwise non-NASA-led author is
+# also rejected; NASA-led authors pass via the nasa-token rule before this check runs.
 _NASA_CONTRACTOR_MARKERS = (
     "contractor", "third party", "third-party", "courtesy of",
     "photo by ", "photos by ", "licensed from ", "rights held by",
-    "jpl", "caltech", "jet propulsion laboratory",
+    "caltech",
 )
 
 # Disqualifying restrictions/claims. Checked against the broader metadata blob
@@ -228,8 +235,14 @@ def _is_allowlisted_author(author: str) -> bool:
     for marker in _NASA_AGENCY_MARKERS:
         if re.search(r"(?<![a-z])" + re.escape(marker) + r"(?![a-z])", author):
             return True
-    return any(author == center or author.startswith(center + " ")
-               for center in _NASA_CENTER_NAMES)
+    for center in _NASA_CENTER_NAMES:
+        if author == center or author.startswith(center + " "):
+            return True
+    # Common NASA-center abbreviations (JPL, GSFC, JSC, ARC, ...) as they appear in metadata.
+    for abbr in _NASA_CENTER_ABBREVIATIONS:
+        if re.search(r"(?<![a-z0-9/])" + re.escape(abbr) + r"(?![a-z0-9/])", author):
+            return True
+    return False
 
 
 def _nasa_authorship_eligible(record: RightsRecord) -> tuple[bool, str]:
@@ -244,7 +257,12 @@ def _nasa_authorship_eligible(record: RightsRecord) -> tuple[bool, str]:
     if not authors:
         return False, "no structured NASA author field on record"
     for author in authors:
-        # Explicit mixed / contractor attribution (incl. JPL/Caltech) is always rejected.
+        # NASA-led works (incl. operating FFRDC institutions like JPL/Caltech) are §105
+        # government works; federal authorship is not defeated by an FFRDC operator suffix.
+        if re.search(r"(?<![a-z])nasa(?![a-z])", author):
+            continue
+        # A non-NASA-led author carrying a contractor/FFRDC suffix or human-credit phrase
+        # (e.g. "Jet Propulsion Laboratory, Caltech") is rejected as ambiguous provenance.
         if any(marker in author for marker in _NASA_CONTRACTOR_MARKERS):
             return False, "structured author indicates contractor/mixed attribution"
         if not _is_allowlisted_author(author):
@@ -462,6 +480,37 @@ def search_wikimedia(
 
 # ========== Acquisition + rights assembly ==========
 
+def _nasa_result_eligible(result: dict[str, Any]) -> bool:
+    """True when a raw NASA search result clears the item-level rights gate.
+
+    Checked from metadata alone (no download) so acquisition can skip an ineligible
+    top result — e.g. one carrying a contractor/individual photographer credit such as
+    "david ladd" — and pick the first eligible asset instead of failing the whole scene
+    at the gate. Authorship is read from the structured creator plus the raw metadata's
+    creator/secondary_creator/center, exactly as :func:`nasa_eligible` does on a record.
+    """
+    license_name, _url = classify_license(result.get("license_url", ""), provider="nasa")
+    candidate = RightsRecord(
+        asset_id=_asset_id("nasa", str(result.get("download_url") or "")),
+        kind="image",
+        provider="nasa",
+        original_url=str(result.get("provider_url") or ""),
+        download_url=str(result.get("download_url") or ""),
+        creator=str(result.get("creator") or ""),
+        license_name=license_name or "Public Domain (NASA)",
+        license_url="",
+        attribution="",
+        acquired_at="",
+        checksum_sha256="",
+        properties=MediaProperties(),
+        nasa_id=str(result.get("nasa_id") or ""),
+        canonical_url=str(result.get("canonical_url") or ""),
+        retrieved_metadata=dict(result.get("retrieved_metadata") or {}),
+        license_basis=str(result.get("license_basis") or ""),
+        usage_terms_url=str(result.get("usage_terms_url") or ""),
+    )
+    ok, _reason = nasa_eligible(candidate)
+    return ok
 def acquire_asset(
     provider: Provider,
     query: str,
@@ -491,7 +540,21 @@ def acquire_asset(
     if not results:
         raise AssetError(f"no licensed assets found for query {query!r} on {provider}")
 
-    chosen = results[0]
+    # Fail-closed eligibility pre-filter. For NASA, skip any result that fails the item-level
+    # rights gate (contractor/individual author credit, identifiable human subject, ambiguous
+    # provenance) and use the first eligible one; if none qualify raise so the scene never
+    # packages unapproved media. Wikimedia keeps its concrete-license approval path via approve_asset
+    # in the gate, so it takes the first result unchanged.
+    chosen = None
+    if provider == "nasa":
+        for candidate in results:
+            if _nasa_result_eligible(candidate):
+                chosen = candidate
+                break
+        if chosen is None:
+            raise AssetError(f"no rights-eligible NASA asset found for query {query!r}")
+    else:
+        chosen = results[0]
     download_url = str(chosen.get("download_url") or "")
     if not download_url:
         raise AssetError(f"asset for {query!r} has no download URL")

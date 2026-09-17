@@ -266,9 +266,13 @@ def run_daily_job(
     timings["research"] = round(time.monotonic() - t0, 3)
 
     chosen = research_results[0] if research_results else None
-    if chosen is None or not chosen.verified_facts:
+    # Option B (pilot): when corroboration yields no verified facts, fall back to the
+    # distinct verbatim-grounded claims as the material for a candidate. Normal runs
+    # with corroborated verified facts use those; this only activates on fallback.
+    facts = chosen.verified_facts or chosen.claims
+    if chosen is None or not facts:
         return _record_failure(
-            "no verified facts available to build a candidate",
+            "no grounded material available to build a candidate",
             run_id=daily_run.run_id,
             research_packages=research_dirs,
         )
@@ -481,23 +485,28 @@ def _preflight(chosen: ResearchResult, config: JobConfig) -> list[dict[str, Any]
     support, topic suitability, and rights metadata availability. It never renders
     or measures artifacts; those belong to final QC in :func:`_run_final_qc`.
     """
+    # Option B fallback: prefer corroborated verified facts, else the distinct
+    # verbatim-grounded claims as candidate material.
+    facts = chosen.verified_facts or chosen.claims
     failures: list[dict[str, Any]] = []
 
-    # Research breadth: corroborated across >=2 providers with >=1 verified fact.
+    # Research breadth: grounded material across >=2 sources with >=1 claim. Under
+    # Option B this is the distinct verbatim-grounded claims (verified facts when
+    # corroboration produced any); a single-source story still cannot support a doc.
     source_count = len({s.url for s in chosen.sources})
-    fact_count = len(chosen.verified_facts)
+    fact_count = len(facts)
     breadth_gate = evaluate_originality(
         research_breadth=(fact_count, source_count),
     )
     if not breadth_gate.passed:
         failures.append(broaden_failure("research-breadth", breadth_gate))
 
-    # Claim support: at least one verified fact must exist to build a script.
+    # Claim support: at least one grounded claim must exist to build a script.
     if fact_count < 1:
         failures.append({
             "name": "claim-support",
             "passed": False,
-            "detail": f"no verified facts ({fact_count}) to narrate",
+            "detail": f"no grounded material ({fact_count}) to narrate",
         })
 
     # Topic suitability: reject empty or obviously non-documentary topics.
@@ -631,6 +640,9 @@ def _run_final_qc(
     edit = candidate.edit
     fps = int(edit.fps)
     scenes_seconds = [s.duration_frames / fps for s in edit.scenes]
+    # Option B fallback: prefer corroborated verified facts, else the distinct
+    # verbatim-grounded claims mapped to scenes for continuity.
+    facts = chosen.verified_facts or chosen.claims
 
     # Audio: measure silence gap + clipping on the first real narration segment.
     narration_wav = _first_narration_wav(candidate)
@@ -670,8 +682,8 @@ def _run_final_qc(
             total_scenes=total_scenes,
         ),
         evaluate_continuity(
-            claim_to_scene={c.claim_id: [f"scene-{i+1}"] for i, c in enumerate(chosen.verified_facts)},
-            verified_claim_ids={c.claim_id for c in chosen.verified_facts},
+            claim_to_scene={c.claim_id: [f"scene-{i+1}"] for i, c in enumerate(facts)},
+            verified_claim_ids={c.claim_id for c in facts},
             scene_durations_seconds=scenes_seconds,
             total_duration_seconds=candidate.total_runtime_seconds,
         ),

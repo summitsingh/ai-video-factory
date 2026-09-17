@@ -209,6 +209,32 @@ def test_gate_enforces_eligibility_even_when_preapproved() -> None:
     with pytest.raises(AssetError):
         gate_assets([preapproved])
 
+
+
+def _esa_record(license_name: str) -> RightsRecord:
+    # An ESA (European Space Agency) asset is NOT U.S. government work, so it can
+    # never clear NASA public-domain eligibility under 17 U.S.C. §105; the gate must
+    # exclude it unless the individual asset carries an explicitly compatible license.
+    return RightsRecord(
+        asset_id="asset-esa-x", kind="image", provider="esa",
+        original_url="https://images.esa.int/item/x", download_url="https://cdn.example/esa.jpg",
+        creator="ESA", license_name=license_name, license_url="", attribution="",
+        acquired_at="2026-09-06T00:00:00+00:00", checksum_sha256="deadbeef",
+        properties=MediaProperties(width=1920, height=1080), review_status="pending_review",
+        retrieved_metadata={"title": "ESA asset"},
+    )
+
+
+def test_gate_rejects_esa_without_compatible_license() -> None:
+    # ESA material has no U.S. §105 basis and is excluded by default (fail closed).
+    with pytest.raises(AssetError):
+        gate_assets([_esa_record("")])
+
+
+def test_gate_approves_esa_with_compatible_license() -> None:
+    # ...unless the individual asset carries an explicitly compatible license.
+    approved = gate_assets([_esa_record("CC-BY")])
+    assert approved[0].review_status == "approved"
 # ========== Acquisition with injected transport ==========
 
 _NASA_SEARCH_JSON = json.dumps({
@@ -260,6 +286,93 @@ def test_acquire_asset_rejects_no_download_url(tmp_path: Path) -> None:
                       mediatype="clip", transport=transport)
 
 
+# ========== NASA acquisition eligibility pre-filter (injected transport) ==========
+
+
+_TWO_NASA_ITEMS_JSON = json.dumps({
+    "collection": {
+        "items": [
+            # Ineligible first result: an individual/third-party photographer credit.
+            {"item_id": "BAD001", "title": "Mars ancient riverbed",
+             "metadata": {"creator": "David Ladd", "center": "JPL"},
+             "links": [{"rel": "media", "href": "https://cdn.nasa.gov/bad.jpg"}]},
+            # Eligible result: NASA-led FFRDC work, center JPL (17 U.S.C. § 105).
+            {"item_id": "GOOD002", "title": "Europa subsurface ocean",
+             "metadata": {"creator": "NASA/JPL-Caltech", "center": "JPL"},
+             "links": [{"rel": "media", "href": "https://cdn.nasa.gov/good.jpg"}]},
+        ]
+    }
+})
+
+
+def test_acquire_asset_skips_ineligible_nasa_result_and_picks_eligible(tmp_path: Path) -> None:
+    # The first search result is ineligible (individual photographer credit); acquisition must
+    # skip it and download the first eligible NASA asset instead of failing at the rights gate.
+    downloaded: list[str] = []
+
+    def transport(url: str) -> bytes:
+        if "images-api.nasa.gov" in url:
+            return _TWO_NASA_ITEMS_JSON.encode("utf-8")
+        downloaded.append(url)
+        return b"\x00\x01\x02fake-bytes"
+
+    dest = tmp_path / "asset.jpg"
+    record = acquire_asset(
+        "nasa", "europa ocean", scene_id="scene-01", destination=dest,
+        mediatype="image", transport=transport,
+    )
+    assert record.nasa_id == "GOOD002"                 # eligible item chosen, not BAD001
+    assert downloaded == ["https://cdn.nasa.gov/good.jpg"]  # only the eligible one was downloaded
+    assert record.provider == "nasa" and record.kind == "image"
+    assert gate_assets([record])[0].review_status == "approved"   # clears the gate
+
+
+def test_acquire_asset_raises_when_no_nasa_result_eligible(tmp_path: Path) -> None:
+    # Every search result carries an ineligible credit -> acquisition fails closed.
+    only_bad = json.dumps({"collection": {"items": [
+        {"item_id": "BAD1", "title": "t",
+         "metadata": {"creator": "Ryan Sicilia", "center": "JPL"},
+         "links": [{"rel": "media", "href": "https://cdn.nasa.gov/x.jpg"}]},
+    ]}})
+
+    def transport(url: str) -> bytes:
+        return only_bad.encode("utf-8")
+
+    with pytest.raises(AssetError):
+        acquire_asset("nasa", "europa ocean", scene_id="scene-01", destination=tmp_path / "x.jpg",
+                      mediatype="image", transport=transport)
+
+
+def _nasa_record_for_test(*, creator: str | None = None, center: str | None = None,
+                          secondary_creator: str | None = None) -> RightsRecord:
+    meta: dict = {}
+    if center is not None:
+        meta["center"] = center
+    if secondary_creator is not None:
+        meta["secondary_creator"] = secondary_creator
+    return RightsRecord(
+        asset_id="n1", kind="image", provider="nasa", original_url="", download_url="",
+        creator=(creator or center or ""), license_name="Public Domain (NASA)", license_url="",
+        attribution="", acquired_at="", checksum_sha256="", properties=MediaProperties(), nasa_id="N1",
+        canonical_url="", retrieved_metadata={**meta, "title": "Sample NASA asset"},
+        license_basis="Public domain — 17 U.S.C. § 105", usage_terms_url=NASA_MEDIA_USAGE_TERMS_URL,
+    )
+
+
+def test_nasa_eligible_approves_ffrdc_and_center_abbreviation_authorship() -> None:
+    # NASA-led FFRDC works (JPL operated by Caltech) are government works under § 105.
+    ok, reason = nasa_eligible(_nasa_record_for_test(creator="NASA/JPL-Caltech", center="JPL"))
+    assert ok is True and reason == ""
+    # A bare NASA-center abbreviation in metadata is likewise eligible.
+    assert nasa_eligible(_nasa_record_for_test(center="GSFC"))[0] is True
+    assert nasa_eligible(_nasa_record_for_test(center="JSC"))[0] is True
+
+
+def test_nasa_eligible_rejects_individual_credit_even_with_center() -> None:
+    # A mixed individual/third-party credit makes the item ambiguous even when a NASA center
+    # is also present — the whole record is rejected, not silently approved.
+    ok, reason = nasa_eligible(_nasa_record_for_test(creator="David Ladd", center="JPL"))
+    assert ok is False and "author credit" in reason
 # ========== Selection scoring ==========
 
 def test_score_asset_rewards_relevance_and_rights() -> None:

@@ -20,7 +20,7 @@ class HermesConfig(BaseModel):
     parent_provider: Literal["nous"]
     parent_model: Literal["stepfun/step-3.7-flash:free"]
     delegation_base_url: str
-    delegation_model: Literal["avf-qwen36-executor"]
+    delegation_model: Literal["avf-tiel-coder-executor"]
     delegation_api_mode: Literal["chat_completions"]
     local_api_key_placeholder: Literal["no-key-required"]
     max_concurrent_children: Literal[1]

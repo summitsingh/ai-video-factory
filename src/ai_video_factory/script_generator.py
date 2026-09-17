@@ -41,7 +41,7 @@ def generate_script_with_lm_studio(
     topic_description: str,
     source_url: str,
     api_url: str = "http://localhost:1234/v1/chat/completions",
-    model: str = "qwen3.6-35b-a3b-udt-mtp",
+    model: str = "tiel-coder-35b-a3b-mtp",
     max_tokens: int = 2048,
     temperature: float = 0.7,
 ) -> dict[str, Any]:

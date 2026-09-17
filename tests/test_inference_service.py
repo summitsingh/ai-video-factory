@@ -15,19 +15,19 @@ from ai_video_factory.sanitization import MAX_DIAGNOSTIC_CHARS
 
 
 ESTIMATE_COMMAND = (
-    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
+    "lms", "load", "tiel-coder-35b-a3b-mtp", "--gpu", "max",
     "--context-length", "65536", "--no-speculative-draft-mtp",
     "--estimate-only", "-y",
 )
 LOAD_COMMAND = (
-    "lms", "load", "qwen3.6-35b-a3b-udt-mtp", "--gpu", "max",
+    "lms", "load", "tiel-coder-35b-a3b-mtp", "--gpu", "max",
     "--context-length", "65536", "--parallel", "1", "--ttl", "3600",
-    "--no-speculative-draft-mtp", "--identifier", "avf-qwen36-executor", "-y",
+    "--no-speculative-draft-mtp", "--identifier", "avf-tiel-coder-executor", "-y",
 )
 SERVER_START_COMMAND = (
     "lms", "server", "start", "--port", "1234", "--bind", "127.0.0.1",
 )
-UNLOAD_COMMAND = ("lms", "unload", "avf-qwen36-executor")
+UNLOAD_COMMAND = ("lms", "unload", "avf-tiel-coder-executor")
 FORBIDDEN_FRAGMENTS = (
     ("get",),
     ("runtime", "select"),
@@ -45,8 +45,8 @@ def config(tmp_path: Path) -> InferenceConfig:
             "backend": "lm_studio",
             "base_url": "http://127.0.0.1:1234/v1",
             "lms_binary": "lms",
-            "model_key": "qwen3.6-35b-a3b-udt-mtp",
-            "identifier": "avf-qwen36-executor",
+            "model_key": "tiel-coder-35b-a3b-mtp",
+            "identifier": "avf-tiel-coder-executor",
             "context_length": 65_536,
             "gpu": "max",
             "parallel": 1,

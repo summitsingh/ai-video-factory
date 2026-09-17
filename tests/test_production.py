@@ -328,11 +328,11 @@ def test_build_candidate_maps_narration_offsets_to_scene_frames(tmp_path, monkey
     )
     research = ResearchResult(
         topic="water test topic",
-        verified_facts=[
-            Claim(claim_id=f"c{i}", text=f"Fact number {i} about water.", source_ids=[f"s{i}"],
-                  provisional_classification="confirmed fact")
-            for i in range(3)
-        ],
+    claims=[
+        Claim(claim_id=f"c{i}", text=f"Fact number {i} about water.", source_ids=[f"s{i}"],
+              provisional_classification="confirmed fact")
+        for i in range(3)
+    ],
         source_contents={"https://example.com/water": content},
     )
 
@@ -347,3 +347,51 @@ def test_build_candidate_maps_narration_offsets_to_scene_frames(tmp_path, monkey
         assert offset == scene.from_frame / 30
     # First normal scene starts after the 4s intro bookend (offset 4.0s).
     assert captured_segs[0][1] == 4.0
+
+def test_build_scene_plan_uses_grounded_claims_not_verified_facts():
+    """Option B: build_scene_plan is backed by verbatim-grounded claims, not
+    corroborated verified facts. A candidate with grounded claims but zero verified
+    facts still builds a plan; fewer than MIN_GROUNDED_CLAIMS rejects (fail closed)."""
+    from ai_video_factory.production import build_scene_plan, MIN_GROUNDED_CLAIMS
+
+    sentences = [" ".join(f"topic{i}_{j}" for j in range(50)) + "." for i in range(3)]
+    content = SourceContent(url="https://example.com/water", title="Water",
+                            quality="reliable", content=" ".join(sentences), content_hash="0" * 64)
+    claims = [Claim(claim_id=f"c{i}", text=f"Grounded claim {i} about water.",
+                    source_ids=[f"s{i}"], provisional_classification="confirmed fact")
+              for i in range(3)]
+    research = ResearchResult(topic="water", claims=claims, verified_facts=[],
+                              source_contents={"https://example.com/water": content})
+    plan = build_scene_plan(research, min_words=120)
+    assert len(plan) == 3
+
+    # Fewer than MIN_GROUNDED_CLAIMS grounded claims rejects before the word floor.
+    sparse = ResearchResult(topic="water", claims=claims[:1], verified_facts=[],
+                            source_contents={"https://example.com/water": content})
+    with pytest.raises(ProductionError, match="grounded claims"):
+        build_scene_plan(sparse, min_words=120)
+
+def test_build_scene_plan_runtime_stays_within_long_form_band():
+    """Regression: narration that overshoots each scene's word target must be capped so
+    total runtime stays within [MIN_RUNTIME, MAX_RUNTIME] rather than exceeding it."""
+    from ai_video_factory.production import (
+        build_scene_plan, synthesize_and_time, enforce_runtime, OfflineRenderEngine,
+        MIN_RUNTIME_SECONDS, MAX_RUNTIME_SECONDS, _BOOKEND_SECONDS,
+    )
+    # Source has far more words than each scene's share, so the per-scene "append one
+    # extra sentence" drift would push total narration past MAX_RUNTIME without the cap.
+    sentences = [" ".join(f"water_{i}_{j}" for j in range(40)) + "." for i in range(90)]
+    content = SourceContent(url="https://example.com/water", title="Water",
+                            quality="reliable", content=" ".join(sentences),
+                            content_hash="0" * 64)
+    claims = [Claim(claim_id=f"c{i}", text=f"Grounded claim {i} about water.",
+                    source_ids=[f"s{i}"], provisional_classification="confirmed fact")
+              for i in range(3)]
+    research = ResearchResult(topic="Water Beyond Earth", claims=claims, verified_facts=[],
+                              source_contents={"https://example.com/water": content})
+    plan = build_scene_plan(research, min_words=2200)
+    plan, durations = synthesize_and_time(plan, OfflineRenderEngine())
+    # Must not raise: total runtime (scenes + bookends) is within the long-form band.
+    enforce_runtime(durations)
+    total = sum(durations) + _BOOKEND_SECONDS
+    assert MIN_RUNTIME_SECONDS <= total <= MAX_RUNTIME_SECONDS

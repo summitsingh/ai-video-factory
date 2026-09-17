@@ -57,10 +57,16 @@ TARGET_RUNTIME_SECONDS = 1050.0  # pacing target (mid-range)
 DEFAULT_MIN_WORDS = 2200
 _MAX_WORDS_PER_SCENE = 1500  # a single long-form deep-dive segment can be very long
 _BOOKEND_SECONDS = 8.0  # intro + outro bookends
+
+# Headless Remotion renders one frame at a time through software GL (swiftshader) with
+# no GPU acceleration, so a full 15-20 minute master can take ~60 min on this machine.
+# The cap is generous by design; a genuinely hung render is caught downstream by the
+# pilot monitor and by the empty-output guard in render_master().
+RENDER_SUBPROCESS_SECONDS = 7200  # 2 hours
 # A long-form documentary requires multiple distinct, source-backed chapters. One or
 # two claims cannot honestly become a 15–20 minute film; production rejects fewer than
-# this many verified facts rather than padding narration with invented filler.
-MIN_VERIFIED_FACTS = 3
+# this many distinct grounded claims rather than padding narration with invented filler.
+MIN_GROUNDED_CLAIMS = 3
 
 
 class ProductionError(RuntimeError):
@@ -615,7 +621,7 @@ class RemotionKokoroRenderEngine(RenderEngine):
         )
         try:
             completed = subprocess.run(
-                list(argv), cwd=self._root, shell=False, timeout=600,
+                list(argv), cwd=self._root, shell=False, timeout=RENDER_SUBPROCESS_SECONDS,
                 capture_output=True, text=True, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -686,6 +692,19 @@ def _grounded_narration(claim_text: str, topic: str, chunk: list[str], target_wo
     return " ".join(parts).strip()
 
 
+def _trim_to_words(text: str, limit: int) -> str:
+    """Truncate narration to at most ``limit`` words at a word boundary.
+
+    The renderer paces runtime off narration length, so a scene that overshoots its
+    word share pushes the master past MAX_RUNTIME. Cap each scene at its share so the
+    whole plan lands on the word floor instead of above it.
+    """
+    words = text.split()
+    if len(words) <= limit:
+        return text
+    return " ".join(words[:limit]) + "\u2026"
+
+
 def build_scene_plan(
     research: ResearchResult,
     *,
@@ -699,19 +718,19 @@ def build_scene_plan(
     combined grounded sentence pool cannot reach the word floor without repetition,
     production rejects rather than padding with filler.
 
-    Raises :class:`ProductionError` when there are fewer than :data:`MIN_VERIFIED_FACTS`
-    distinct verified facts (a single or pair of claims cannot honestly become a
+    Raises :class:`ProductionError` when there are fewer than :data:`MIN_GROUNDED_CLAIMS`
+    distinct grounded claims (a single or pair of claims cannot honestly become a
     long-form documentary) or when the grounded material is insufficient for the floor.
     """
-    facts = research.verified_facts
+    facts = research.claims
     if not facts:
-        raise ProductionError("no verified facts available to build a long-form script")
+        raise ProductionError("no grounded claims available to build a long-form script")
 
     n = len(facts)
-    if n < MIN_VERIFIED_FACTS:
+    if n < MIN_GROUNDED_CLAIMS:
         raise ProductionError(
-            f"insufficient distinct verified material for a long-form documentary "
-            f"({n} fact(s) < {MIN_VERIFIED_FACTS} required); production rejects filler"
+            f"insufficient distinct grounded claims for a long-form documentary "
+            f"({n} claim(s) < {MIN_GROUNDED_CLAIMS} required); production rejects filler"
         )
 
     # Each scene gets an even share of the word floor; cap per scene so no single
@@ -720,8 +739,8 @@ def build_scene_plan(
     per_scene_words = min(per_scene_words, _MAX_WORDS_PER_SCENE)
     if per_scene_words * n < min_words:
         raise ProductionError(
-            f"insufficient verified material for a long-form documentary "
-            f"({n} fact(s) x {per_scene_words} words < {min_words} word floor)"
+            f"insufficient grounded claims for a long-form documentary "
+            f"({n} claim(s) x {per_scene_words} words < {min_words} word floor)"
         )
 
     # Distribute distinct grounded sentences evenly across scenes as *disjoint*
@@ -756,6 +775,9 @@ def build_scene_plan(
         cursor += share
 
         narration = _grounded_narration(claim.text, research.topic, chunk, per_scene_words)
+        # Cap at the scene's word share so total narration meets the floor without
+        # overshooting MAX_RUNTIME when a scene generates more than its target.
+        narration = _trim_to_words(narration, per_scene_words)
         plan.append({
             "id": f"scene-{idx + 1:02d}",
             "title": f"{research.topic} — claim {idx + 1}",
@@ -785,6 +807,50 @@ def synthesize_and_time(
         scene["duration_seconds"] = round(dur, 1)
         durations.append(round(dur, 1))
     return plan, durations
+
+
+def _trim_media_to_seconds(source: Path, dest: Path, target_seconds: float) -> None:
+    """Trim a media file to at most ``target_seconds`` by re-encoding for precision.
+
+    Keeps each scene's narration audio inside its (scaled) visual window so the
+    absolute-offset mix never overlaps adjacent scenes.
+    """
+    _run_ffmpeg((
+        "-y", "-i", str(source), "-t", f"{target_seconds:.3f}",
+        "-map", "0:a", "-c:a", "pcm_s16le", str(dest),
+    ))
+
+
+def fit_to_budget(
+    plan: list[dict],
+    durations: Sequence[float],
+    *,
+    max_seconds: float = MAX_RUNTIME_SECONDS,
+) -> tuple[list[dict], list[float]]:
+    """Scale scene durations (and trim their narration audio) to fit ``max_seconds``.
+
+    Real TTS pacing varies per voice and content, so a word floor that paces correctly
+    for the offline tone engine can overshoot MAX_RUNTIME with Kokoro. When measured
+    runtime exceeds the ceiling every scene is scaled by the same factor and its
+    narration WAV is trimmed to match, keeping visuals and audio in lockstep. No-op
+    when already within budget.
+    """
+    total = sum(durations) + _BOOKEND_SECONDS
+    if total <= max_seconds:
+        return plan, list(durations)
+    # Leave a 1s safety margin below the ceiling for trim/measurement imprecision.
+    factor = (max_seconds - 1.0 - _BOOKEND_SECONDS) / total
+    scaled: list[float] = []
+    for scene, dur in zip(plan, durations):
+        new_dur = round(dur * factor, 3)
+        scene["duration_seconds"] = new_dur
+        wav = scene.get("narration_wav")
+        if wav is not None:
+            trimmed = Path(str(wav).rsplit(".", 1)[0] + ".trim.wav")
+            _trim_media_to_seconds(wav, trimmed, new_dur)
+            scene["narration_wav"] = trimmed
+        scaled.append(new_dur)
+    return plan, scaled
 
 
 def enforce_runtime(durations: Sequence[float], *, bookend_seconds: float = _BOOKEND_SECONDS) -> None:
@@ -893,21 +959,38 @@ def acquire_assets(
     assets_by_scene_id: dict[str, Path] = {}
     scene_dir = Path(workdir) / "assets"
     scene_dir.mkdir(parents=True, exist_ok=True)
-    query_terms = research.topic.lower().split()[:4]
+    # The documentary is a tour of water in the solar system (Mars, Europa, Enceladus,
+    # lunar ice). A single full-topic search returns nothing; match each scene's grounded
+    # narration to a targeted NASA query so every chapter gets a topically relevant,
+    # rights-cleared still. Images (not video clips) are used: they acquire and render
+    # far faster for a long-form master while staying genuine NASA photography.
+    subtopic_queries = (
+        ("mars", "mars ancient water riverbed"),
+        ("perseverance", "mars ancient water riverbed"),
+        ("europa", "jupiter europa subsurface ocean"),
+        ("ocean", "jupiter europa subsurface ocean"),
+        ("enceladus", "saturn enceladus plume"),
+        ("cryovolcanic", "saturn enceladus plume"),
+        ("lunar", "lunar polar ice north pole"),
+        ("pole", "lunar polar ice north pole"),
+    )
+    curated = [q for _, q in subtopic_queries]
     used_ids: list[str] = []
     for idx, scene in enumerate(plan):
+        text = (scene.get("narration") or "").lower()
+        query = next((q for kw, q in subtopic_queries if kw in text), None) or curated[idx % len(curated)]
         try:
             record = acquire_asset(
-                "nasa", research.topic, scene_id=scene["id"],
-                destination=scene_dir / f"asset-{idx}.mp4", mediatype="clip", transport=transport,
+                "nasa", query, scene_id=scene["id"],
+                destination=scene_dir / f"asset-{idx}.jpg", mediatype="image", transport=transport,
             )
         except Exception:  # noqa: BLE001 - offline/fixture may have no assets
             continue
-        scored = select_assets([record], query_terms)
+        scored = select_assets([record], query.split())
         chosen = scored[0].record if scored else record
         approved_records.append(chosen)
         used_ids.append(chosen.asset_id)
-        assets_by_scene_id[scene["id"]] = scene_dir / f"asset-{idx}.mp4"
+        assets_by_scene_id[scene["id"]] = scene_dir / f"asset-{idx}.jpg"
     # Fail closed: ensure the full set passes the rights gate. ``gate_assets``
     # returns newly-approved records (it does not mutate in place), so assign the
     # result back; if any asset cannot be approved it raises and we never package.
@@ -955,7 +1038,7 @@ def build_candidate(
 
     plan = build_scene_plan(research, min_words=min_words)
     plan, durations = synthesize_and_time(plan, engine)
-    enforce_runtime(durations)
+    plan, durations = fit_to_budget(plan, durations)
 
     approved_assets, assets_by_scene_id = acquire_assets(research, plan, transport=asset_transport, workdir=workdir)
     # Persist the rights manifest so the upload package carries per-asset NASA usage

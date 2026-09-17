@@ -22,7 +22,7 @@ app.add_typer(inference_app, name="inference")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DATA_ROOT = _PROJECT_ROOT / "data"
-_MODEL_IDENTIFIER = "avf-qwen36-executor"
+_MODEL_IDENTIFIER = "avf-tiel-coder-executor"
 _InferenceCommand = Literal[
     "doctor", "estimate", "start", "status", "benchmark", "stop"
 ]

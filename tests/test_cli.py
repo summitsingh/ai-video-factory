@@ -14,7 +14,7 @@ class _InferenceService:
     def __init__(self, command: str, *, status: str = "pass") -> None:
         self.command = command
         self.result_status = status
-        self.config = SimpleNamespace(identifier="avf-qwen36-executor")
+        self.config = SimpleNamespace(identifier="avf-tiel-coder-executor")
 
     def _result(self, command: str) -> InferenceResult:
         assert command == self.command
@@ -50,7 +50,7 @@ def _inference_result(command: str, *, status: str = "pass") -> InferenceResult:
         command=command,
         status=status,
         retryable=status != "pass",
-        model_identifier="avf-qwen36-executor",
+        model_identifier="avf-tiel-coder-executor",
         checks={},
         metrics={},
         artifacts={},
