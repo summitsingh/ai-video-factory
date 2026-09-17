@@ -12,6 +12,12 @@ dependencies = [
 [project.scripts]
 ai-video-factory = "ai_video_factory.cli:app"
 
+[project.optional-dependencies]
+youtube = [
+    "google-api-python-client>=2.0,<3",
+    "google-auth-oauthlib>=1.2,<2",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8,<10",
