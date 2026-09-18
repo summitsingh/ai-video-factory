@@ -228,7 +228,7 @@ def fetch_nasa_for_scene(
     max_images: int = 2,
     max_clips: int = 1,
     relevance_text: str = "",
-    min_relevance: float = 0.15,
+    min_relevance: float = 0.08,
 ) -> list[StockAsset]:
     """Download NASA public-domain assets for one scene's queries.
 
