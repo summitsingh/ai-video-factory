@@ -1686,9 +1686,11 @@ def run_video_pipeline(
             )
 
             # Step 4.4b: Asset QC + memory + AI-visual fallback. Verify every
-            # attached asset (black frames, title slates, dimensions); record
+            # attached asset (black frames, slates, dimensions); record
             # rejections in the persistent blocklist; generate a cinematic
-            # still for scenes left with nothing usable.
+            # still for scenes left with nothing usable. Generated stills go
+            # into the per-scene assets dir so copy_scene_assets_to_public
+            # stages them for Remotion (staticFile needs public/ paths).
             try:
                 from ai_video_factory.asset_memory import AssetMemory
                 from ai_video_factory.asset_qc import (
@@ -1699,9 +1701,9 @@ def run_video_pipeline(
 
                 memory = AssetMemory()
                 qc_dir = job_dir / "qc"
-                generated_dir = job_dir / "generated_visuals"
                 rejected = 0
                 generated = 0
+                assets_root = Path(assets_dir_used)
                 for scene in edit_doc.scenes:
                     for kind, asset_path in (("clip", scene.clip), ("image", scene.image)):
                         if not asset_path:
@@ -1714,10 +1716,17 @@ def run_video_pipeline(
                             else:
                                 scene.image = None
                             continue
+                        # Resolve the on-disk path for QC: public-relative
+                        # names live in the per-scene assets dir.
+                        disk_path = assets_root / asset_path
+                        if not disk_path.is_file():
+                            # Fall back to scanning the scene dir for the file.
+                            candidates = list(assets_root.glob(f"*/{asset_path}"))
+                            disk_path = candidates[0] if candidates else disk_path
                         check = (
-                            verify_video_asset(asset_path, qc_dir)
+                            verify_video_asset(str(disk_path), qc_dir)
                             if kind == "clip"
-                            else verify_image_asset(asset_path)
+                            else verify_image_asset(str(disk_path))
                         )
                         if not check.get("usable", False):
                             memory.record_rejection(
@@ -1726,17 +1735,32 @@ def run_video_pipeline(
                                 source="nasa",
                             )
                             rejected += 1
+                            # Remove the rejected file so re-attach cannot
+                            # pick it back up.
+                            try:
+                                if disk_path.is_file():
+                                    disk_path.unlink()
+                            except OSError:
+                                pass
                             if kind == "clip":
                                 scene.clip = None
                             else:
                                 scene.image = None
-                    if not scene.clip and not scene.image:
-                        out = generated_dir / f"{scene.id}.png"
-                        generate_scene_visual(
-                            scene.visual, scene.narration, out
-                        )
-                        scene.image = str(out)
-                        generated += 1
+                    if not scene.clip and not scene.image and scene.id.startswith("scene-"):
+                        try:
+                            idx = int(scene.id.split("-", 1)[1])
+                        except ValueError:
+                            idx = None
+                        if idx is not None:
+                            scene_dir = assets_root / f"scene-{idx:02d}"
+                            scene_dir.mkdir(parents=True, exist_ok=True)
+                            out = scene_dir / "generated.png"
+                            generate_scene_visual(
+                                scene.visual, scene.narration, out
+                            )
+                            generated += 1
+                # Re-attach so generated stills get public-relative filenames.
+                edit_doc = attach_scene_assets(edit_doc, assets_dir_used)
                 save_edit(edit_doc, job.edit_path)
                 metadata["assets_qc_rejected"] = rejected
                 metadata["assets_generated"] = generated
