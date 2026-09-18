@@ -1728,10 +1728,12 @@ def run_video_pipeline(
                             if kind == "clip"
                             else verify_image_asset(str(disk_path))
                         )
-                        if not check.get("usable", False):
+                        # Verdict shape: {"ok": bool, "reasons": [str], "scores": {...}}.
+                        if not check.get("ok", False):
+                            reasons = check.get("reasons") or ["qc_failed"]
                             memory.record_rejection(
                                 asset_id,
-                                check.get("reason", "qc_failed"),
+                                ",".join(reasons),
                                 source="nasa",
                             )
                             rejected += 1

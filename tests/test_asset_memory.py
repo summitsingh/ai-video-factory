@@ -99,3 +99,56 @@ def test_score_relevance_no_overlap():
 def test_score_relevance_empty_visual():
     assert score_relevance("Some title", "") == 0.0
     assert score_relevance("", "some visual") == 0.0
+
+
+def test_event_blocklist_covers_talking_heads():
+    from ai_video_factory.nasa_media import _record_is_event_photo
+
+    for title in (
+        "NASA astronaut interview in studio",
+        "News anchor desk segment about Artemis",
+        "Media day Q&A with engineers",
+        "Roundtable discussion on Mars",
+    ):
+        assert _record_is_event_photo(title) is True, title
+    assert _record_is_event_photo("Earth from the ISS cupola") is False
+
+
+def test_fetch_nasa_skips_low_relevance(monkeypatch, tmp_path):
+    from ai_video_factory import nasa_media
+
+    records = [
+        {
+            "title": "News anchor desk segment about space",
+            "nasa_id": "junk-1",
+            "source_url": "https://example.com/1",
+        },
+        {
+            "title": "The Andromeda galaxy in ultraviolet",
+            "nasa_id": "good-1",
+            "source_url": "https://example.com/2",
+        },
+    ]
+    monkeypatch.setattr(
+        nasa_media, "search_nasa", lambda q, mediatype: records
+    )
+    monkeypatch.setattr(
+        nasa_media, "_nasa_image_url",
+        lambda nasa_id: f"https://example.com/{nasa_id}.jpg",
+    )
+    # Fake download: write a tiny valid PNG so _image_is_usable passes.
+    from PIL import Image
+
+    def fake_download(url, dest):
+        Image.new("RGB", (800, 450), (10, 10, 40)).save(dest)
+
+    monkeypatch.setattr(nasa_media, "download_asset", fake_download)
+
+    assets = nasa_media.fetch_nasa_for_scene(
+        ["galaxy"],
+        tmp_path / "scene-00",
+        max_images=2,
+        relevance_text="a spiral galaxy with bright stars",
+    )
+    titles = [a.title for a in assets]
+    assert titles == ["The Andromeda galaxy in ultraviolet"], titles

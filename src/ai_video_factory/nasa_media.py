@@ -55,6 +55,10 @@ _EVENT_BLOCKLIST = (
     "press conference", "press briefing", "news briefing", "briefing",
     "panel discussion", "town hall", "award", "ceremony", "gala",
     "ribbon cutting", "signing ceremony",
+    # Talking-head / studio formats that read as off-topic B-roll.
+    "interview", "news desk", "news anchor", "anchor desk",
+    "in the studio", "studio interview", "talk show",
+    "media day", "q&a", "q & a", "roundtable",
 )
 
 # Minimum usable still-image width in pixels. Anything smaller looks soft
@@ -125,7 +129,11 @@ def _extract_visual_query(
 
 def _record_is_event_photo(record_title: str) -> bool:
     low = (record_title or "").lower()
-    return any(term in low for term in _EVENT_BLOCKLIST)
+    # Word-boundary match: "gala" must not fire on "galaxy".
+    return any(
+        re.search(r"\b" + re.escape(term) + r"\b", low)
+        for term in _EVENT_BLOCKLIST
+    )
 
 
 def _query_variants(title: str, stop_words: frozenset[str] | None = None) -> list[str]:
@@ -219,8 +227,19 @@ def fetch_nasa_for_scene(
     *,
     max_images: int = 2,
     max_clips: int = 1,
+    relevance_text: str = "",
+    min_relevance: float = 0.15,
 ) -> list[StockAsset]:
-    """Download NASA public-domain assets for one scene's queries."""
+    """Download NASA public-domain assets for one scene's queries.
+
+    When ``relevance_text`` (usually the scene's visual direction) is given,
+    each candidate record is scored with
+    :func:`ai_video_factory.asset_memory.score_relevance` and records below
+    ``min_relevance`` are skipped, so a space documentary does not end up
+    with news-desk B-roll.
+    """
+    from ai_video_factory.asset_memory import score_relevance
+
     scene_dir = Path(scene_dir)
     scene_dir.mkdir(parents=True, exist_ok=True)
     assets: list[StockAsset] = []
@@ -238,10 +257,16 @@ def fetch_nasa_for_scene(
                     mediatype == "video" and clips >= max_clips
                 ):
                     break
-                # Skip press-conference / ceremony imagery: it reads as
-                # off-topic B-roll for science storytelling.
+                # Skip press-conference / ceremony / talking-head imagery: it
+                # reads as off-topic B-roll for science storytelling.
                 if _record_is_event_photo(record["title"]):
                     continue
+                if relevance_text:
+                    relevance = score_relevance(
+                        str(record["title"]), relevance_text
+                    )
+                    if relevance < min_relevance:
+                        continue
                 try:
                     if mediatype == "image":
                         url = _nasa_image_url(record["nasa_id"])
@@ -331,6 +356,7 @@ def populate_assets_from_nasa(
                 assets = fetch_nasa_for_scene(
                     [candidate], scene_dir,
                     max_images=max_images, max_clips=max_clips,
+                    relevance_text=visual or title,
                 )
                 if assets:
                     query = candidate

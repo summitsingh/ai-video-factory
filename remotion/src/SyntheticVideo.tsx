@@ -611,18 +611,6 @@ const SceneCard = ({
           >
             {scene.caption}
           </div>
-          {scene.visual && (
-            <div
-              style={{
-                color: '#64748b',
-                fontSize: Math.max(15, Math.round(height * 0.024)),
-                fontStyle: 'italic',
-                marginTop: Math.round(height * 0.02),
-              }}
-            >
-              {scene.visual}
-            </div>
-          )}
         </AbsoluteFill>
         {isLast && sources && sources.length > 0 && (
           <div
