@@ -27,12 +27,28 @@ Requirements:
 6. Provide visual suggestions for each segment
 7. Write for a 60-90 second video (typically 150-250 words)
 
-Output format:
-- title: Creative video title
-- narration: Full narration script
-- scenes: List of scene objects with timing and visuals
-- sources: List of source URLs used
-- captions: SRT-style captions
+Output format: a single JSON object with EXACTLY these fields:
+{
+  "title": "Creative video title",
+  "narration": "Full narration script",
+  "scenes": [
+    {
+      "id": "scene-0",
+      "title": "Short scene title",
+      "caption": "Short on-screen caption",
+      "narration": "Narration spoken during this scene",
+      "duration_frames": 90,
+      "visual": "Visual suggestion for this scene"
+    }
+  ],
+  "sources": ["https://source-url-1", "https://source-url-2"],
+  "captions": []
+}
+Rules:
+- Every scene object MUST include a non-empty "title" and a non-empty
+  "narration". A scene without a title will be rejected.
+- "duration_frames" is an integer; 90 frames = 3 seconds at 30 fps.
+- Write for a 60-90 second video (typically 150-250 words).
 
 Only output valid JSON, no markdown formatting."""
 
@@ -135,12 +151,12 @@ Create a 60-90 second video script with:
 
 Make it engaging, factual, and visually descriptive."""
 
-    def _build_payload(budget: int) -> bytes:
+    def _build_payload(budget: int, prompt: str) -> bytes:
         return json.dumps({
             "model": model,
             "messages": [
                 {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": prompt}
             ],
             "max_tokens": budget,
             "temperature": temperature,
@@ -169,9 +185,10 @@ Make it engaging, factual, and visually descriptive."""
 
     last_error: ScriptGenerationError | None = None
     last_content = ""
+    prompt = user_prompt
     for budget in (max_tokens, max_tokens * 2):
         try:
-            content = _post(_build_payload(budget), budget)
+            content = _post(_build_payload(budget, prompt), budget)
         except ScriptGenerationError:
             raise
         except Exception as error:
@@ -194,6 +211,14 @@ Make it engaging, factual, and visually descriptive."""
             return parsed
         except ScriptGenerationError as error:
             last_error = error
+            # Tell the model exactly what was wrong so the retry can fix it
+            # instead of guessing again with the same vague prompt.
+            prompt = (
+                user_prompt
+                + "\n\nYour previous response was rejected for this reason:\n"
+                + str(error)
+                + "\nFix the JSON and return ONLY the corrected JSON object."
+            )
             continue
 
     preview = sanitize_diagnostic(last_content, max_chars=500)

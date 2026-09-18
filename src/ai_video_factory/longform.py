@@ -257,21 +257,26 @@ def _generate_beat_text(
     messages: list[dict[str, str]],
     max_tokens: int,
     beat_key: str,
+    validate: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Call the chat backend for one beat, retrying once on empty output.
 
     Reasoning models can burn their whole token budget thinking and return
     an empty message (or a truncated stream) with ``finish_reason=length``.
     The first attempt uses ``max_tokens``; the retry doubles it. A response
-    is only accepted when it actually contains a JSON object. Transport
-    errors are not retried here; they fail loud immediately.
+    is only accepted when it actually contains a JSON object. When
+    ``validate`` is given it also runs inside the retry loop, and a
+    validation failure is fed back to the model so the retry can correct
+    the exact problem instead of guessing again. Transport errors are not
+    retried here; they fail loud immediately.
     """
     budgets = [max_tokens, max_tokens * 2][:BEAT_ATTEMPTS]
     last_error: LongformError | None = None
     raw_text = ""
+    current_messages = list(messages)
     for attempt, budget in enumerate(budgets, start=1):
         try:
-            raw_text = chat(messages, budget)
+            raw_text = chat(current_messages, budget)
         except LongformError as error:
             last_error = error
             raw_text = ""
@@ -287,9 +292,21 @@ def _generate_beat_text(
             )
             continue
         try:
-            _extract_json_object(raw_text)
+            parsed = _extract_json_object(raw_text)
+            if validate is not None:
+                validate(parsed)
         except LongformError as error:
             last_error = error
+            current_messages = list(messages) + [
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous response was rejected for this reason:\n"
+                        f"{error}\n"
+                        "Fix the JSON and return ONLY the corrected JSON object."
+                    ),
+                }
+            ]
             continue
         return raw_text
     preview = sanitize_diagnostic(raw_text or "", max_chars=500)
@@ -492,6 +509,11 @@ def generate_longform_script(
             scene_target=scene_target,
             previous_beats=previous_titles,
         )
+        def _validate_beat_json(
+            raw: dict[str, Any], _spec: BeatSpec = spec, _target: int = word_target
+        ) -> None:
+            _validate_beat(_spec, _parse_beat_scenes(_spec, raw), _target)
+
         try:
             raw_text = _generate_beat_text(
                 chat,
@@ -501,6 +523,7 @@ def generate_longform_script(
                 ],
                 max(BEAT_MIN_TOKENS, word_target * BEAT_TOKEN_HEADROOM),
                 spec.key,
+                validate=_validate_beat_json,
             )
         except LongformError:
             raise

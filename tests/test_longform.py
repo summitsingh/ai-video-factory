@@ -20,7 +20,13 @@ def make_fake_chat():
     """A fake LM Studio chat that honors the word/scene counts in the prompt."""
 
     def fake_chat(messages, max_tokens):
-        user = messages[-1]["content"]
+        # On a feedback retry the last message is the rejection note; the
+        # beat prompt is the last message that carries the word target.
+        user = next(
+            message["content"]
+            for message in reversed(messages)
+            if re.search(r"About (\d+) words", message["content"])
+        )
         word_target = int(re.search(r"About (\d+) words", user).group(1))
         scene_count = int(re.search(r"Exactly (\d+) scenes", user).group(1))
         per_scene = max(45, word_target // scene_count)
@@ -200,3 +206,33 @@ def test_generate_longform_retry_exhaustion_fails_loud():
         generate_longform_script(
             "T", "D", "https://example.com", target_minutes=20.0, chat_fn=empty_chat
         )
+
+
+def test_generate_longform_feeds_back_validation_error():
+    """A beat that fails shape validation is retried with the exact reason."""
+    seen: list[list[dict]] = []
+    good = make_fake_chat()
+
+    def thin_then_good(messages, max_tokens):
+        seen.append(messages)
+        if len(seen) == 1:
+            return json.dumps(
+                {
+                    "scenes": [
+                        {
+                            "title": "Thin",
+                            "narration": "Too short.",
+                            "visual_direction": "V",
+                        }
+                    ]
+                }
+            )
+        return good(messages, max_tokens)
+
+    script = generate_longform_script(
+        "T", "D", "https://example.com", target_minutes=20.0, chat_fn=thin_then_good
+    )
+    assert len(script.beats) == 7
+    assert len(seen) == 8  # seven beats, first beat retried once
+    assert "rejected for this reason" in seen[1][-1]["content"]
+    assert "too thin" in seen[1][-1]["content"]

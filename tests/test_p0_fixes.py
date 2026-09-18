@@ -708,3 +708,37 @@ def test_script_generation_retry_exhaustion_fails_loud(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     with pytest.raises(ScriptGenerationError, match="2 attempts"):
         generate_script_with_lm_studio("T", "D", "https://example.com")
+
+
+def test_script_generation_retry_includes_rejection_feedback(monkeypatch):
+    """The retry tells the model exactly why its JSON was rejected."""
+    seen_prompts: list[str] = []
+    bad_shape = {
+        "title": "T",
+        "narration": "N",
+        "scenes": [{"id": "scene-0", "narration": "No title or caption."}],
+        "sources": [],
+        "captions": [],
+    }
+
+    def fake_urlopen(request, timeout=None):
+        payload = json.loads(request.data.decode("utf-8"))
+        seen_prompts.append(payload["messages"][1]["content"])
+        if len(seen_prompts) == 1:
+            return _FakeResponse(_lm_studio_payload(bad_shape))
+        return _FakeResponse(_lm_studio_payload(_valid_script_dict()))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    parsed = generate_script_with_lm_studio("T", "D", "https://example.com")
+    assert parsed["title"] == "Test"
+    assert len(seen_prompts) == 2
+    assert "rejected for this reason" in seen_prompts[1]
+    assert "neither 'title' nor 'caption'" in seen_prompts[1]
+
+
+def test_script_system_prompt_spells_out_scene_schema():
+    """The prompt must name the exact per-scene fields the validator needs."""
+    from ai_video_factory.script_generator import SCRIPT_SYSTEM_PROMPT
+
+    assert '"title": "Short scene title"' in SCRIPT_SYSTEM_PROMPT
+    assert "MUST include" in SCRIPT_SYSTEM_PROMPT
