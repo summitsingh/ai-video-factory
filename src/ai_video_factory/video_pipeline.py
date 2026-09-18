@@ -50,6 +50,7 @@ from ai_video_factory.longform import (
     DEFAULT_LONGFORM_MINUTES,
     LongformError,
     LongformScript,
+    _lm_studio_chat,
     generate_longform_script,
     longform_script_from_dict,
     longform_to_edit_document,
@@ -1427,6 +1428,9 @@ def run_video_pipeline(
                         if job.research_path.is_file()
                         else None
                     )
+                    # Wrap _lm_studio_chat with the CLI-provided llm_url
+                    def _chat_with_url(messages, max_tokens):
+                        return _lm_studio_chat(messages, max_tokens, api_url=llm_url)
                     longform_script = generate_longform_script(
                         topic=trending_topic.title,
                         description=trending_topic.description,
@@ -1437,6 +1441,7 @@ def run_video_pipeline(
                         sources=[trending_topic.url],
                         output_path=job.script_path,
                         format_key=format_key,
+                        chat_fn=_chat_with_url,
                     )
                     state_store.heartbeat(script_run.run_id)
                 except Exception as error:
