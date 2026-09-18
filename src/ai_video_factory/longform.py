@@ -206,6 +206,18 @@ def _lm_studio_chat(
         # Thinking models are slow: budget a ~6 tok/s floor so a large
         # beat cannot time out mid-stream on a CPU-only box.
         timeout = max(600, max_tokens // 6)
+    # Qwen3 thinking models burn the token budget on chain-of-thought and
+    # return an empty message body. /no_think disables thinking for these
+    # structured JSON beats, where deliberation adds nothing.
+    if "qwen3" in model.lower():
+        messages = [
+            (
+                {**m, "content": "/no_think\n" + m["content"]}
+                if m.get("role") == "user"
+                else m
+            )
+            for m in messages
+        ]
     payload = json.dumps(
         {
             "model": model,
@@ -227,9 +239,17 @@ def _lm_studio_chat(
     except Exception as error:
         raise LongformError(f"LM Studio request failed: {error}") from error
     try:
-        return result["choices"][0]["message"]["content"]
+        message = result["choices"][0]["message"] or {}
     except (KeyError, IndexError, TypeError) as error:
         raise LongformError("LM Studio response had no message content") from error
+    content = message.get("content") or ""
+    if not content.strip():
+        # Thinking models can exhaust the budget inside reasoning_content;
+        # the answer is sometimes recoverable from the thinking trace.
+        content = message.get("reasoning_content") or ""
+    if not content.strip():
+        raise LongformError("LM Studio response had no message content")
+    return content
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:

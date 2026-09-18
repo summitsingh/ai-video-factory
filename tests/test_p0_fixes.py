@@ -29,6 +29,7 @@ from ai_video_factory.script_generator import (
     _extract_json,
     generate_script_with_lm_studio,
 )
+from ai_video_factory.longform import _lm_studio_chat
 from ai_video_factory.subtitle_export import (
     build_srt,
     distribute_cues,
@@ -292,6 +293,86 @@ def test_script_generation_valid_response(monkeypatch):
     parsed = generate_script_with_lm_studio("T", "D", "https://example.com")
     assert parsed["title"] == "Test"
     assert len(parsed["scenes"]) == 1
+
+
+def test_script_generation_qwen3_gets_no_think_prefix(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["payload"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse(_lm_studio_payload(_valid_script_dict()))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    # Default model is a Qwen3 thinker: qwen3.6-35b-a3b-udt-mtp.
+    generate_script_with_lm_studio("T", "D", "https://example.com")
+    user_msg = seen["payload"]["messages"][1]["content"]
+    assert user_msg.startswith("/no_think")
+
+
+def test_script_generation_skips_no_think_for_non_qwen3(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["payload"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse(_lm_studio_payload(_valid_script_dict()))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    generate_script_with_lm_studio(
+        "T", "D", "https://example.com", model="gemma-4-26b-a4b-it"
+    )
+    user_msg = seen["payload"]["messages"][1]["content"]
+    assert not user_msg.startswith("/no_think")
+
+
+def test_script_generation_falls_back_to_reasoning_content(monkeypatch):
+    payload = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": json.dumps(_valid_script_dict()),
+                    }
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    def fake_urlopen(request, timeout=None):
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    parsed = generate_script_with_lm_studio("T", "D", "https://example.com")
+    assert parsed["title"] == "Test"
+
+
+def test_lm_studio_chat_qwen3_gets_no_think_prefix(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["payload"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse(
+            json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    result = _lm_studio_chat(
+        [{"role": "user", "content": "hi"}], 100, model="dirk-qwen3.8-27b"
+    )
+    assert result == "ok"
+    assert seen["payload"]["messages"][0]["content"].startswith("/no_think")
+
+
+def test_lm_studio_chat_falls_back_to_reasoning_content(monkeypatch):
+    payload = json.dumps(
+        {"choices": [{"message": {"content": "", "reasoning_content": "ok"}}]}
+    ).encode("utf-8")
+
+    def fake_urlopen(request, timeout=None):
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert _lm_studio_chat([{"role": "user", "content": "hi"}], 100) == "ok"
 
 
 # ---------------------------------------------------------------------------

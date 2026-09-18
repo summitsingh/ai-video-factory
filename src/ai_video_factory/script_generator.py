@@ -131,8 +131,11 @@ def generate_script_with_lm_studio(
     unattended runs never silently produce placeholder videos.
 
     Reasoning models can spend their token budget thinking and return an
-    empty message, so the request is retried once with a doubled budget
-    when the model returns empty or unparseable content.
+    empty message. Qwen3-family thinkers get the ``/no_think`` prefix so the
+    budget goes to the answer, and ``reasoning_content`` is used as a
+    fallback source when the message body comes back empty. The request is
+    retried once with a doubled budget when the model returns empty or
+    unparseable content.
     """
     
     user_prompt = f"""Generate a video script about the following trending topic:
@@ -150,6 +153,13 @@ Create a 60-90 second video script with:
 6. SRT-style captions
 
 Make it engaging, factual, and visually descriptive."""
+
+    # Qwen3 thinking models burn the token budget on chain-of-thought and
+    # return an empty message body. /no_think disables thinking for this
+    # structured JSON task, where deliberation adds nothing.
+    base_prompt = (
+        "/no_think\n" + user_prompt if "qwen3" in model.lower() else user_prompt
+    )
 
     def _build_payload(budget: int, prompt: str) -> bytes:
         return json.dumps({
@@ -178,14 +188,20 @@ Make it engaging, factual, and visually descriptive."""
         )
         with urllib.request.urlopen(req, timeout=request_timeout) as response:
             result = json.loads(response.read().decode('utf-8'))
-        return result.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        message = result.get("choices", [{}])[0].get("message", {})
+        content = message.get("content") or ""
+        if not content.strip():
+            # Thinking models can exhaust the budget inside reasoning_content;
+            # the answer is sometimes recoverable from the thinking trace.
+            content = message.get("reasoning_content") or ""
+        return content
 
     def _use_fallback() -> dict[str, Any]:
         return _generate_fallback_script(topic_title, topic_description, source_url)
 
     last_error: ScriptGenerationError | None = None
     last_content = ""
-    prompt = user_prompt
+    prompt = base_prompt
     for budget in (max_tokens, max_tokens * 2):
         try:
             content = _post(_build_payload(budget, prompt), budget)
@@ -214,7 +230,7 @@ Make it engaging, factual, and visually descriptive."""
             # Tell the model exactly what was wrong so the retry can fix it
             # instead of guessing again with the same vague prompt.
             prompt = (
-                user_prompt
+                base_prompt
                 + "\n\nYour previous response was rejected for this reason:\n"
                 + str(error)
                 + "\nFix the JSON and return ONLY the corrected JSON object."
