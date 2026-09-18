@@ -47,8 +47,8 @@ _THEMES: dict[str, dict] = {
             "earth", "globe", "world", "atmosphere", "continent",
             "blue marble",
         ),
-        "top": (10, 24, 64),
-        "bottom": (2, 6, 18),
+        "top": (24, 48, 110),
+        "bottom": (8, 16, 42),
         "accents": [(59, 130, 246), (34, 211, 238), (16, 122, 180)],
         "stars": 500,
         "nebula_blobs": 4,
@@ -59,8 +59,8 @@ _THEMES: dict[str, dict] = {
             "fire", "flame", "explosion", "lava", "ember", "inferno",
             "engulfed", "burning", "blast",
         ),
-        "top": (48, 10, 6),
-        "bottom": (8, 4, 2),
+        "top": (92, 28, 16),
+        "bottom": (24, 10, 6),
         "accents": [(249, 115, 22), (239, 68, 68), (250, 204, 21)],
         "stars": 120,
         "nebula_blobs": 7,
@@ -70,8 +70,8 @@ _THEMES: dict[str, dict] = {
         "keywords": (
             "ocean", "sea", "water", "wave", "tide", "abyss",
         ),
-        "top": (6, 40, 64),
-        "bottom": (1, 10, 24),
+        "top": (16, 72, 112),
+        "bottom": (4, 24, 52),
         "accents": [(34, 211, 238), (59, 130, 246), (103, 232, 249)],
         "stars": 60,
         "nebula_blobs": 5,
@@ -249,8 +249,8 @@ def render_procedural(
 
     canvas = _vertical_gradient(
         height, width,
-        spec.get("top", (10, 12, 24)),
-        spec.get("bottom", (3, 4, 10)),
+        spec.get("top", (28, 32, 68)),
+        spec.get("bottom", (10, 14, 36)),
         rng,
     )
     _add_nebula(canvas, rng, spec.get("accents", [(90, 110, 200)]),

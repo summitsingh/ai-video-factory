@@ -426,14 +426,26 @@ def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocu
                     images = sorted(
                         [p for p in scene_dir.iterdir()
                          if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
-                         and p.is_file()]
+                         and p.is_file()
+                         # Prefer downloaded stock over generated fallback:
+                         # generated.png sorts first alphabetically and would
+                         # shadow a good NASA asset.
+                         and p.name != "generated.png"]
                     )
                     # Use a scene-specific filename so each scene resolves to
                     # its own media file in Remotion's public/ directory.
+                    # Rename the file now so QC (which runs after attach) can
+                    # find it at the canonical path.
                     if clips:
-                        update["clip"] = f"scene-{idx:02d}-clip{clips[0].suffix}"
+                        clip_name = f"scene-{idx:02d}-clip{clips[0].suffix}"
+                        if clips[0].name != clip_name:
+                            clips[0].rename(scene_dir / clip_name)
+                        update["clip"] = clip_name
                     if images:
-                        update["image"] = f"scene-{idx:02d}-image{images[0].suffix}"
+                        image_name = f"scene-{idx:02d}-image{images[0].suffix}"
+                        if images[0].name != image_name:
+                            images[0].rename(scene_dir / image_name)
+                        update["image"] = image_name
         scenes.append(scene.model_copy(update=update) if update else scene)
     return edit.model_copy(update={"scenes": scenes})
 
