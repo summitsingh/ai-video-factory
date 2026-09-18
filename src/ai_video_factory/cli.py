@@ -174,6 +174,8 @@ def video_pipeline(
     duration_minutes: float = typer.Option(25.0, "--duration-minutes", help="Target runtime in minutes for --longform (20-30)"),
     json_output: bool = typer.Option(False, "--json", help="Output result as JSON"),
     llm_url: str = typer.Option("http://localhost:1234/v1/chat/completions", "--llm-url", help="OpenAI-compatible chat completions URL for script generation (LM Studio default, or llama-server e.g. http://localhost:8080/v1/chat/completions)"),
+    draft: bool = typer.Option(False, "--draft", help="Render at 640x360 for fast review iterations instead of full 1280x720"),
+    format_key: str = typer.Option(None, "--format", help="YouTube format preset for --longform: business_autopsy, systems_explainer, history_reconstruction, mystery_deep_dive, science_doc, armchair_true_crime, horror_anthology"),
 ) -> None:
     """Run a complete video production pipeline for a trending topic.
     
@@ -214,6 +216,8 @@ def video_pipeline(
             longform=longform,
             target_duration_minutes=duration_minutes,
             llm_url=llm_url,
+            draft=draft,
+            format_key=format_key,
         )
         
         if json_output:
@@ -692,6 +696,131 @@ def review_reject(
         typer.echo(str(error), err=True)
         raise typer.Exit(code=2)
 
+
+@app.command("nightly-batch")
+def nightly_batch(
+    topics: int = typer.Option(3, "--topics", help="Draft topics per night"),
+    theme: str = typer.Option("space", "--theme", help="Theming preset"),
+    trend_source: str = typer.Option("all", "--trend-source", help="reddit, gnews, or all"),
+    target_minutes: float = typer.Option(25.0, "--target-minutes", help="Target runtime per video"),
+    format_key: str = typer.Option("business_autopsy", "--format", help="YouTube format preset"),
+    llm_url: str = typer.Option("http://localhost:8080/v1/chat/completions", "--llm-url", help="LLM chat completions URL"),
+    date: str = typer.Option(None, "--date", help="Run date YYYY-MM-DD (default: today)"),
+) -> None:
+    """Research topics, draft long-form videos, and queue them for morning review.
+
+    Idempotent per date: re-running never duplicates queued topics.
+    Drafts render at low resolution; nothing is uploaded.
+    """
+    from ai_video_factory.nightly_batch import (
+        NightlyConfig, approve_item, load_queue_items, queue_dir,
+        reject_item, run_nightly,
+    )
+    from ai_video_factory.research import research_trending_topics
+    from ai_video_factory.formats import format_names
+
+    if format_key not in format_names():
+        typer.echo(f"Unknown format {format_key!r}. Choices: {', '.join(format_names())}", err=True)
+        raise typer.Exit(code=2)
+
+    config = NightlyConfig(
+        topics_per_night=topics,
+        trend_source=trend_source,
+        theme=theme,
+        target_duration_minutes=target_minutes,
+        llm_url=llm_url,
+        date=date,
+    )
+
+    def research_fn(n: int) -> list[dict]:
+        result = research_trending_topics(
+            max_topics=n, trend_source=trend_source
+        )
+        return [
+            {"title": t.title, "description": t.description, "url": t.url}
+            for t in result.topics
+        ]
+
+    def script_fn(candidate: dict) -> dict:
+        from ai_video_factory.longform import generate_longform_script
+        from pathlib import Path as _Path
+        script = generate_longform_script(
+            topic=candidate["title"],
+            description=candidate.get("description") or candidate["title"],
+            source_url=candidate.get("url") or "https://example.com",
+            target_minutes=target_minutes,
+            format_key=format_key,
+        )
+        return {"words": script.total_words, "title": script.title}
+
+    def pipeline_fn(topic: dict, script: dict, draft: bool, **kwargs) -> dict:
+        job = VideoJob(
+            topic=topic["title"],
+            description=topic.get("description") or topic["title"],
+            source_url=topic.get("url") or "https://example.com",
+            output_path=_DATA_ROOT / "projects" / "nightly",
+            duration_seconds=int(target_minutes * 60),
+        )
+        result = run_video_pipeline(
+            project_root=_PROJECT_ROOT,
+            data_root=_DATA_ROOT,
+            job=job,
+            theme=resolve_theme(theme),
+            trend_source=trend_source,
+            longform=True,
+            target_duration_minutes=target_minutes,
+            llm_url=llm_url,
+            draft=draft,
+            format_key=format_key,
+        )
+        return {
+            "status": result.status,
+            "run_id": result.run_id,
+            "artifacts": result.artifacts,
+            "error": result.error,
+        }
+
+    try:
+        report = run_nightly(
+            _DATA_ROOT, config,
+            research_fn=research_fn, script_fn=script_fn, pipeline_fn=pipeline_fn,
+        )
+        typer.echo(f"Nightly batch {report['run_date']}: "
+                   f"{report['drafted']} drafted, {report['failed']} failed, "
+                   f"{report['skipped']} skipped. Queue: {report['queue_path']}")
+    except Exception as error:
+        typer.echo(sanitize_diagnostic(error), err=True)
+        raise typer.Exit(code=2)
+
+
+@app.command("shorts")
+def shorts_cmd(
+    project: str = typer.Argument(..., help="Project directory containing master.mp4 and edit.json"),
+    max_shorts: int = typer.Option(3, "--max", help="Maximum shorts to render"),
+) -> None:
+    """Cut vertical 9:16 Shorts from a finished long-form master."""
+    from ai_video_factory.edit_schema import EditDocument
+    from ai_video_factory.shorts import render_shorts
+
+    try:
+        project_dir = Path(project)
+        master = project_dir / "master.mp4"
+        edit_path = project_dir / "edit.json"
+        if not master.is_file():
+            typer.echo(f"No master.mp4 in {project}", err=True)
+            raise typer.Exit(code=2)
+        edit_doc = EditDocument.model_validate(
+            json.loads(edit_path.read_text(encoding="utf-8"))
+        )
+        results = render_shorts(master, edit_doc, project_dir / "shorts", max_shorts=max_shorts)
+        for r in results:
+            typer.echo(f"short-{r['index'] + 1:02d}.mp4: {r['duration_seconds']}s hook='{r['hook'][:60]}'")
+        typer.echo(f"Rendered {len(results)} shorts.")
+    except typer.Exit:
+        raise
+    except Exception as error:
+        typer.echo(sanitize_diagnostic(error), err=True)
+        raise typer.Exit(code=2)
 
 
 if __name__ == "__main__":

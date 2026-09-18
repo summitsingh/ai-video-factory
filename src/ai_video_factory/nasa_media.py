@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ai_video_factory.stock_media import StockAsset, StockMediaError, download_asset
@@ -298,18 +300,20 @@ def populate_assets_from_nasa(
 
     assets_dir = Path(assets_dir)
     summary: dict[str, int] = {"scenes": 0, "images": 0, "clips": 0}
-    for scene in edit_doc.scenes:
+    lock = threading.Lock()
+
+    def _populate_scene(scene) -> tuple[int, int, int]:
         if not isinstance(scene, EditScene):
-            continue
+            return (0, 0, 0)
         if not str(getattr(scene, "id", "")).startswith("scene-"):
-            continue
+            return (0, 0, 0)
         try:
             idx = int(str(getattr(scene, "id", "")).split("-", 1)[1])
         except (ValueError, IndexError):
-            continue
+            return (0, 0, 0)
         title = str(getattr(scene, "title", "") or "").strip()
         if not title:
-            continue
+            return (0, 0, 0)
         visual = str(getattr(scene, "visual", "") or "").strip()
         scene_dir = assets_dir / f"scene-{idx:02d}"
         try:
@@ -333,9 +337,22 @@ def populate_assets_from_nasa(
                     break
         except Exception as error:  # noqa: BLE001 - best-effort per scene
             print(f"[nasa] scene-{idx} failed: {error}")
-            continue
+            return (0, 0, 0)
         if assets:
-            summary["scenes"] += 1
-            summary["images"] += sum(1 for a in assets if a.kind == "image")
-            summary["clips"] += sum(1 for a in assets if a.kind == "clip")
+            return (
+                1,
+                sum(1 for a in assets if a.kind == "image"),
+                sum(1 for a in assets if a.kind == "clip"),
+            )
+        return (0, 0, 0)
+
+    # Scenes download in parallel (network-bound; each scene writes to its own
+    # scene-NN directory so there is no contention).
+    scenes = list(edit_doc.scenes)
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(scenes)))) as pool:
+        for s_count, i_count, c_count in pool.map(_populate_scene, scenes):
+            with lock:
+                summary["scenes"] += s_count
+                summary["images"] += i_count
+                summary["clips"] += c_count
     return summary

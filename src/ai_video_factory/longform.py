@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ai_video_factory.edit_schema import EditDocument, EditScene
+from ai_video_factory.formats import FormatPreset, get_preset
 from ai_video_factory.sanitization import sanitize_diagnostic
 
 
@@ -139,6 +140,42 @@ LONGFORM_BEATS: tuple[BeatSpec, ...] = (
 
 def _words(text: str) -> int:
     return len(text.split())
+
+
+def _beats_for_format(preset: FormatPreset | None) -> tuple[BeatSpec, ...]:
+    """Build beat specs from a format preset, or fall back to the default arc."""
+    if preset is None:
+        return LONGFORM_BEATS
+    specs: list[BeatSpec] = []
+    for beat in preset.beats:
+        retention = "End on a forward pull: a question, tease, or reversal."
+        if beat["key"] == "cold_open":
+            retention = (
+                "Universal 3-beat 60s hook: 0:00-0:10 pattern interrupt, "
+                "0:10-0:30 promise + credibility, 0:30-1:00 the map. "
+                f"Hook plan: {preset.hook.beat1_0_10} / {preset.hook.beat2_10_30} "
+                f"/ {preset.hook.beat3_30_60}"
+            )
+        specs.append(
+            BeatSpec(
+                key=beat["key"],
+                label=beat.get("label", beat["key"].replace("_", " ").upper()),
+                fraction=beat["fraction"],
+                purpose=beat["purpose"],
+                retention=retention,
+            )
+        )
+    return tuple(specs)
+
+
+def _format_voice_line(preset: FormatPreset | None) -> str:
+    if preset is None:
+        return "Tone: cinematic documentary. Confident, curious, precise. No hype, no filler, no invented facts."
+    return (
+        f"Format: {preset.label}. Narration: {preset.narration_person}, "
+        f"{preset.narration_tense}. Tone: {preset.narration_tone}. "
+        f"{preset.sentence_guidance} Target pace {preset.wpm} words per minute."
+    )
 
 
 def beat_word_target(spec: BeatSpec, target_minutes: float) -> int:
@@ -368,6 +405,7 @@ class LongformScript:
     beats: list[LongformBeat] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
     generated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    format_key: str | None = None
 
     @property
     def total_words(self) -> int:
@@ -392,6 +430,7 @@ class LongformScript:
                 "estimated_minutes": round(self.estimated_minutes, 2),
                 "sources": self.sources,
                 "generated_at": self.generated_at,
+                "format_key": self.format_key,
                 "beats": [
                     {
                         "key": beat.spec.key,
@@ -465,6 +504,7 @@ def _build_bible(
     source_url: str,
     research_brief: str | None,
     title: str | None,
+    preset: FormatPreset | None = None,
 ) -> str:
     lines = [
         f"Topic: {topic}",
@@ -476,10 +516,7 @@ def _build_bible(
     if research_brief:
         brief = research_brief.strip()
         lines.append(f"Research brief (ground every claim in this):\n{brief[:4000]}")
-    lines.append(
-        "Tone: cinematic documentary. Confident, curious, precise. "
-        "No hype, no filler, no invented facts."
-    )
+    lines.append(_format_voice_line(preset))
     return "\n".join(lines)
 
 
@@ -494,11 +531,14 @@ def generate_longform_script(
     sources: list[str] | None = None,
     chat_fn: Callable[[list[dict[str, str]], int], str] | None = None,
     output_path: Path | None = None,
+    format_key: str | None = None,
 ) -> LongformScript:
     """Generate a long-form documentary script beat by beat.
 
     Each beat is generated in its own model call against a shared series
     bible, so the model sustains coherence across thousands of words.
+    Pass ``format_key`` (see ``ai_video_factory.formats``) to use a winning
+    YouTube format's beat structure, hook plan, and narration register.
     Raises ``LongformError`` when any beat is missing, malformed, or too
     far from its word target, and when the assembled script misses the
     target duration by more than 15%.
@@ -509,7 +549,9 @@ def generate_longform_script(
             f"{MAX_LONGFORM_MINUTES}; got {target_minutes}"
         )
     chat = chat_fn or _lm_studio_chat
-    bible = _build_bible(topic, description, source_url, research_brief, title)
+    preset = get_preset(format_key) if format_key else None
+    bible = _build_bible(topic, description, source_url, research_brief, title, preset)
+    beats = _beats_for_format(preset)
 
     script = LongformScript(
         title=title or f"{topic}",
@@ -517,9 +559,10 @@ def generate_longform_script(
         topic=topic,
         target_minutes=target_minutes,
         sources=sources or [source_url],
+        format_key=format_key,
     )
     previous_titles: list[str] = []
-    for spec in LONGFORM_BEATS:
+    for spec in beats:
         word_target = beat_word_target(spec, target_minutes)
         scene_target = max(2, round(word_target / 150))
         prompt = _beat_user_prompt(

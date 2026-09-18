@@ -429,13 +429,16 @@ def build_thumbnails(
     count: int = 3,
     target_size: tuple[int, int] = (1280, 720),
     power_words: set[str] | list[str] | None = None,
+    text_overlays: list[str] | None = None,
 ) -> dict[str, Path]:
     """Generate ``count`` thumbnail variants from ``master``.
 
     Returns a mapping of variant name to written path. The primary title is the
     document title (falling back to the first scene's title). Output is normalized
     to ``target_size`` (default YouTube 16:9, 1280x720). ``power_words``
-    overrides the default hook vocabulary for per-topic theming.
+    overrides the default hook vocabulary for per-topic theming. ``text_overlays``
+    optionally supplies per-variant overlay copy (e.g. from packaging briefs);
+    when provided it replaces the auto-generated hook.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -474,8 +477,13 @@ def build_thumbnails(
         placement = placement_variants[i % len(placement_variants)]
         normalized = _normalize_frame(base, target_size)
         scrimmed = _apply_scrim(normalized, strength=0.55)
+        # Prefer caller-supplied overlay copy (packaging briefs); fall back
+        # to the auto-generated hook.
+        overlay = hook
+        if text_overlays and i < len(text_overlays) and text_overlays[i].strip():
+            overlay = text_overlays[i].strip()
         variant = _composite_title(
-            scrimmed, hook, accent=accent, placement=placement, target_size=target_size
+            scrimmed, overlay, accent=accent, placement=placement, target_size=target_size
         )
         out_path = output_dir / f"thumbnail-{i + 1}.jpg"
         variant.save(out_path, quality=92)
@@ -484,7 +492,17 @@ def build_thumbnails(
     # Write a small manifest describing the variants.
     manifest_path = output_dir / "thumbnails.json"
     manifest_path.write_text(
-        json.dumps({"title": title, "variants": list(thumbnails)}, indent=2),
+        json.dumps(
+            {
+                "title": title,
+                "variants": list(thumbnails),
+                "overlays": [
+                    text_overlays[i] if text_overlays and i < len(text_overlays) else hook
+                    for i in range(count)
+                ],
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
     thumbnails["manifest"] = manifest_path

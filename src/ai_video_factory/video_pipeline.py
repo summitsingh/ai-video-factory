@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -810,6 +811,7 @@ def _mux_narration_audio(
     music_track: Path | None = None,
     sfx_track: Path | None = None,
     room_tone_track: Path | None = None,
+    duration_seconds: float | None = None,
 ) -> None:
     """Mux the video with narration, ducked music, and sound design.
 
@@ -825,6 +827,10 @@ def _mux_narration_audio(
 
     ffmpeg filter semantics: ``sidechaincompress`` takes [signal][sidechain],
     so music is the signal and narration is the sidechain trigger.
+
+    The mux timeout scales with ``duration_seconds`` (a fixed 180s budget
+    killed a 90s mux on a loaded machine) and the command is retried once,
+    since a hung mux almost always succeeds on the second attempt.
     """
     source = Path(source).resolve()
     destination = Path(destination).resolve()
@@ -937,6 +943,8 @@ def _mux_narration_audio(
         tuple(argv),
         cwd=destination.parent,
         name="FFmpeg narration + music mux",
+        timeout=max(300, int((duration_seconds or 90) * 4)),
+        retries=1,
     )
 
 
@@ -961,12 +969,20 @@ def _synthesize_narration_track(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = str(ffmpeg) if ffmpeg else "ffmpeg"
-    segments: list[tuple[Path, float]] = []
-    for i, scene in enumerate(edit.scenes):
-        if not scene.narration or not scene.narration.strip():
-            continue
+
+    speakable = [
+        (i, scene)
+        for i, scene in enumerate(edit.scenes)
+        if (scene.narration or "").strip()
+    ]
+    if not speakable:
+        return None
+
+    def _render_scene(item: tuple[int, EditScene]) -> tuple[Path, float, dict[str, Any]]:
+        i, scene = item
+        local_meta: dict[str, Any] = {}
         raw_wav = workdir / f"scene-{i}.raw.wav"
-        synthesize_to_wav(scene.narration, raw_wav, metadata=tts_metadata)
+        synthesize_to_wav(scene.narration, raw_wav, metadata=local_meta)
         # Deterministic per-scene WPM variation (±12 wpm around 170) so pace
         # shifts sentence-to-sentence without being distracting.
         speed_wpm = 170 + ((i * 37 + len(scene.narration)) % 25) - 12
@@ -987,7 +1003,17 @@ def _synthesize_narration_track(
             trim_audio_start(varied_wav, final_wav, seconds=lead_in, ffmpeg=ffmpeg_bin)
         else:
             shutil.copy2(varied_wav, final_wav)
-        segments.append((final_wav, scene.from_frame / edit.fps))
+        return final_wav, scene.from_frame / edit.fps, local_meta
+
+    # Scenes synthesize in parallel (subprocess-bound: kokoro/espeak run as
+    # child processes, so threads help a lot). Order is preserved via map.
+    segments: list[tuple[Path, float]] = []
+    with ThreadPoolExecutor(max_workers=min(4, len(speakable))) as pool:
+        for final_wav, offset, local_meta in pool.map(_render_scene, speakable):
+            segments.append((final_wav, offset))
+            if tts_metadata is not None:
+                for key, value in local_meta.items():
+                    tts_metadata.setdefault(key, value)
     if not segments:
         return None
     return mix_scenes_to_track(
@@ -1061,24 +1087,41 @@ def _mux_silent_audio(
     )
 
 
-def _run_command(argv: Sequence[str], *, cwd: Path, name: str, timeout: int = 180) -> None:
-    try:
-        completed = subprocess.run(
-            argv,
-            cwd=cwd,
-            shell=False,
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise PipelineCommandError(sanitize_diagnostic(
-            f"{name} could not run: {sanitize_diagnostic(error)}"
-        )) from error
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
-        raise PipelineCommandError(sanitize_diagnostic(f"{name} failed: {detail}"))
+def _run_command(
+    argv: Sequence[str], *, cwd: Path, name: str, timeout: int = 180,
+    retries: int = 0,
+) -> None:
+    """Run a subprocess, retrying transient failures.
+
+    ``retries`` controls how many extra attempts follow a timeout or a
+    non-zero exit (a hung ffmpeg mux, for example, usually succeeds on the
+    second try once the machine is no longer contended).
+    """
+    last_error: str | None = None
+    for attempt in range(retries + 1):
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=cwd,
+                shell=False,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            last_error = sanitize_diagnostic(
+                f"{name} could not run: {sanitize_diagnostic(error)}"
+            )
+        else:
+            if completed.returncode == 0:
+                return
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+            last_error = sanitize_diagnostic(f"{name} failed: {detail}")
+        if attempt < retries:
+            print(f"[pipeline] {name}: attempt {attempt + 1} failed, retrying...")
+            time.sleep(5)
+    raise PipelineCommandError(last_error or f"{name} failed")
 
 
 def _polish_master(
@@ -1221,6 +1264,8 @@ def run_video_pipeline(
     longform: bool = False,
     target_duration_minutes: float = DEFAULT_LONGFORM_MINUTES,
     llm_url: str = "http://localhost:1234/v1/chat/completions",
+    draft: bool = False,
+    format_key: str | None = None,
 ) -> PipelineResult:
     """Run the complete video production pipeline.
 
@@ -1250,6 +1295,11 @@ def run_video_pipeline(
             instead of the default 90-second short script.
         target_duration_minutes: Target narration length for longform mode.
             Must be between 20 and 30. Ignored when longform is False.
+        draft: When True, render at 640x360 for fast review iterations.
+            Draft renders are fingerprinted separately from full renders.
+        format_key: YouTube format preset for longform scripts
+            (business_autopsy, systems_explainer, ...). Passed to
+            generate_longform_script. Ignored when longform is False.
     """
     state_store: RunStore | None = None
     run_id: str | None = None
@@ -1369,6 +1419,7 @@ def run_video_pipeline(
                         title=job.title or None,
                         sources=[trending_topic.url],
                         output_path=job.script_path,
+                        format_key=format_key,
                     )
                     state_store.heartbeat(script_run.run_id)
                 except Exception as error:
@@ -1460,6 +1511,49 @@ def run_video_pipeline(
             artifacts["script"] = str(job.script_path)
         job.title = script.title
         metadata["script_status"] = "complete"
+
+        # Step 2b: YouTube packaging (titles, thumbnail briefs, description).
+        # Deterministic and LLM-free; the chosen title flows downstream.
+        try:
+            from ai_video_factory.packaging import (
+                generate_description,
+                generate_thumbnail_briefs,
+                generate_title_variants,
+                score_title,
+            )
+            from ai_video_factory.formats import get_preset as _get_preset
+
+            fmt = _get_preset(format_key) if format_key else None
+            variants = generate_title_variants(
+                job.topic, script.title, description or "", count=5
+            )
+            scored = sorted(
+                ((score_title(v), v) for v in variants), reverse=True
+            )
+            chosen_title = scored[0][1] if scored else script.title
+            briefs = generate_thumbnail_briefs(
+                {"title": script.title, "scenes": script.scenes}, count=3
+            )
+            description_text = generate_description(
+                job.topic,
+                {"title": script.title, "scenes": script.scenes},
+                script.sources,
+            )
+            packaging = {
+                "chosen_title": chosen_title,
+                "title_variants": [v for _, v in scored],
+                "thumbnail_briefs": briefs,
+                "description": description_text,
+                "format_key": format_key,
+                "format_label": fmt.label if fmt else None,
+            }
+            job_dir.joinpath("packaging.json").write_text(
+                json.dumps(packaging, indent=2), encoding="utf-8"
+            )
+            artifacts["packaging"] = str(job_dir / "packaging.json")
+            metadata["chosen_title"] = chosen_title
+        except Exception as error:
+            metadata["packaging_status"] = f"skipped: {error}"
 
         # Step 3: Create storyboard/edit document
         metadata["edit_status"] = "in_progress"
@@ -1590,6 +1684,65 @@ def run_video_pipeline(
             metadata["assets_attached"] = sum(
                 1 for s in edit_doc.scenes if s.clip or s.image
             )
+
+            # Step 4.4b: Asset QC + memory + AI-visual fallback. Verify every
+            # attached asset (black frames, title slates, dimensions); record
+            # rejections in the persistent blocklist; generate a cinematic
+            # still for scenes left with nothing usable.
+            try:
+                from ai_video_factory.asset_memory import AssetMemory
+                from ai_video_factory.asset_qc import (
+                    verify_image_asset,
+                    verify_video_asset,
+                )
+                from ai_video_factory.ai_visuals import generate_scene_visual
+
+                memory = AssetMemory()
+                qc_dir = job_dir / "qc"
+                generated_dir = job_dir / "generated_visuals"
+                rejected = 0
+                generated = 0
+                for scene in edit_doc.scenes:
+                    for kind, asset_path in (("clip", scene.clip), ("image", scene.image)):
+                        if not asset_path:
+                            continue
+                        asset_id = str(asset_path)
+                        if memory.is_blocked(asset_id):
+                            rejected += 1
+                            if kind == "clip":
+                                scene.clip = None
+                            else:
+                                scene.image = None
+                            continue
+                        check = (
+                            verify_video_asset(asset_path, qc_dir)
+                            if kind == "clip"
+                            else verify_image_asset(asset_path)
+                        )
+                        if not check.get("usable", False):
+                            memory.record_rejection(
+                                asset_id,
+                                check.get("reason", "qc_failed"),
+                                source="nasa",
+                            )
+                            rejected += 1
+                            if kind == "clip":
+                                scene.clip = None
+                            else:
+                                scene.image = None
+                    if not scene.clip and not scene.image:
+                        out = generated_dir / f"{scene.id}.png"
+                        generate_scene_visual(
+                            scene.visual, scene.narration, out
+                        )
+                        scene.image = str(out)
+                        generated += 1
+                save_edit(edit_doc, job.edit_path)
+                metadata["assets_qc_rejected"] = rejected
+                metadata["assets_generated"] = generated
+                metadata["assets_qc"] = "complete"
+            except Exception as error:  # noqa: BLE001 - QC is best-effort
+                metadata["assets_qc"] = f"skipped: {sanitize_diagnostic(error)}"
         metadata["edit_status"] = "complete"
         artifacts["edit"] = str(job.edit_path)
 
@@ -1647,136 +1800,271 @@ def run_video_pipeline(
                 job.master_path = root / job.master_path
             job.master_path.parent.mkdir(parents=True, exist_ok=True)
 
-        render_run = state_store.start(
-            "video-render",
-            _pipeline_inputs(
-                root,
-                job.edit_path,
-                root / "remotion" / "package-lock.json",
-                tools,
-            ),
-        )
-        run_id = render_run.run_id
-        run_directory = artifact_root / render_run.run_id
-        temporary_path = run_directory / "render.tmp.mp4"
-
-        if render_run.resumed:
-            # Reuse the previously rendered master instead of re-rendering.
-            job.master_path = Path(render_run.artifacts["master"])
-        else:
-            state_store.event(render_run.run_id, "render_started", {"topic": job.topic})
-            run_directory.mkdir(parents=True, exist_ok=True)
-            run_master = run_directory / "master.mp4"
-
-            # The lock is released after the chunked render finishes; the
-            # narration/mux/polish steps below only touch this run's own
-            # run directory, so they run without the lock.
-            xfade_degraded = False
-            with remotion_public_lock(data_root):
-                # Copy assets to Remotion public directory for rendering
-                if job.assets_dir is not None:
-                    remotion_public = root / "remotion" / "public"
-                    cache_assets_for_remotion(Path(job.assets_dir), remotion_public)
-
-                if render is None:
-                    xfade_degraded = _render_chunked(
-                        root,
-                        job.edit_path,
-                        temporary_path,
-                        run_directory,
-                        browser=_required_tool(tools, "browser"),
-                        npm=_required_tool(tools, "npm"),
-                        ffmpeg=_required_tool(tools, "ffmpeg"),
-                        on_chunk=lambda done, total: state_store.heartbeat(
-                            render_run.run_id
-                        ),
-                    )
-                else:
-                    render(job.edit_path, run_master)
-            # True when chunk concat fell back from xfade cross-dissolves to
-            # hard cuts; False for single-chunk and custom renders.
-            metadata["xfade_degraded"] = xfade_degraded
-
-            if render is None:
-                edit_doc_render = load_edit(job.edit_path)
-                tts_info: dict[str, Any] = {}
-                state_store.heartbeat(render_run.run_id)
-                narration_track = _synthesize_narration_track(
-                    edit_doc_render,
-                    run_directory / "narration",
-                    ffmpeg=_required_tool(tools, "ffmpeg"),
-                    tts_metadata=tts_info,
-                )
-                state_store.heartbeat(render_run.run_id)
-                if narration_track is not None:
-                    metadata["narration_status"] = "complete"
-                    metadata["narration_segments"] = len([
-                        s for s in edit_doc_render.scenes if (s.narration or "").strip()
-                    ])
-                    # Effective TTS engine/voice actually used (may differ
-                    # from the requested Kokoro voice when the chain falls
-                    # through to espeak, which cannot use Kokoro voice names).
-                    metadata["tts_engine"] = tts_info.get("tts_engine", "unknown")
-                    metadata["tts_voice"] = tts_info.get("tts_voice", "unknown")
-                else:
-                    metadata["narration_status"] = "silent_fallback"
-                # Generate a subtle ambient music bed and duck it under narration.
-                duration_seconds = edit_doc_render.duration_frames / edit_doc_render.fps
-                music_track = _generate_music_bed(
-                    duration_seconds,
-                    run_directory / "music.wav",
-                    ffmpeg=_required_tool(tools, "ffmpeg"),
-                )
-                metadata["music_status"] = "complete"
-                # Generate a sound-design track (whooshes/drones at scene
-                # boundaries) to complement narration and music (#4).
-                sfx_track = _generate_sfx_track(
-                    edit_doc_render,
-                    run_directory / "sfx",
-                    ffmpeg=_required_tool(tools, "ffmpeg"),
-                )
-                if sfx_track is not None:
-                    metadata["sfx_status"] = "complete"
-                # Generate a continuous room-tone bed so there are no dead-silence
-                # gaps between narration segments (#2).
-                duration_seconds = edit_doc_render.duration_frames / edit_doc_render.fps
-                room_tone_track = generate_room_tone(
-                    duration_seconds,
-                    run_directory / "room_tone.wav",
-                    ffmpeg=_required_tool(tools, "ffmpeg"),
-                )
-                metadata["room_tone_status"] = "complete"
-                _mux_narration_audio(
-                    temporary_path,
-                    narration_track,
-                    run_master,
-                    ffmpeg=_required_tool(tools, "ffmpeg"),
-                    music_track=music_track,
-                    sfx_track=sfx_track,
-                    room_tone_track=room_tone_track,
-                )
-                # Apply final visual polish (#3 film grain, #9 letterboxing) to
-                # the muxed master. Polish into a temp file then move it over
-                # run_master so the artifact path stays consistent for QC.
-                polished_path = run_directory / "master.polished.mp4"
-                _polish_master(
-                    run_master,
-                    polished_path,
-                    ffmpeg=_required_tool(tools, "ffmpeg"),
-                )
-                shutil.move(str(polished_path), str(run_master))
-                metadata["polish_status"] = "complete"
-                temporary_path.unlink(missing_ok=True)
-
-            render_run = state_store.complete(
-                render_run.run_id,
-                {"master": str(run_master)},
-                expected_artifacts={"master": run_master},
+        # Draft mode: render at 640x360 for fast review iterations. The draft
+        # fixture is written to the job dir (stable across attempts) and its
+        # fingerprint keeps draft and full renders cached separately.
+        fixture_path = job.edit_path
+        if draft:
+            draft_edit = load_edit(job.edit_path).model_copy(
+                update={"width": 640, "height": 360}
             )
-            # Publish a stable draft copy outside the run directory.
-            shutil.copy2(run_master, job.master_path)
+            fixture_path = job_dir / "edit.draft.json"
+            save_edit(draft_edit, fixture_path)
+            metadata["draft"] = True
+            metadata["draft_resolution"] = "640x360"
 
-            job.master_path = run_master
+        # The old monolithic render stage is split into three resumable
+        # stages so a failure in the final mux (or in TTS) no longer forces a
+        # full re-render: re-running the same command resumes completed
+        # stages by content fingerprint.
+        render_inputs = _pipeline_inputs(
+            root,
+            fixture_path,
+            root / "remotion" / "package-lock.json",
+            tools,
+        )
+        render_inputs["draft"] = draft
+
+        if render is not None:
+            # Custom render callable: single stage producing the master
+            # directly (legacy behavior, used by tests).
+            render_run = state_store.start("video-render", render_inputs)
+            run_id = render_run.run_id
+            run_directory = artifact_root / render_run.run_id
+            if render_run.resumed:
+                job.master_path = Path(render_run.artifacts["master"])
+            else:
+                try:
+                    run_directory.mkdir(parents=True, exist_ok=True)
+                    run_master = run_directory / "master.mp4"
+                    with remotion_public_lock(data_root):
+                        if job.assets_dir is not None:
+                            remotion_public = root / "remotion" / "public"
+                            cache_assets_for_remotion(Path(job.assets_dir), remotion_public)
+                        render(fixture_path, run_master)
+                except Exception as error:
+                    state_store.fail(render_run.run_id, error)
+                    raise
+                render_run = state_store.complete(
+                    render_run.run_id,
+                    {"master": str(run_master)},
+                    expected_artifacts={"master": run_master},
+                )
+                shutil.copy2(run_master, job.master_path)
+                job.master_path = run_master
+        else:
+            # Stage 4a: Remotion video render -> render.tmp.mp4
+            render_run = state_store.start("video-render", render_inputs)
+            run_id = render_run.run_id
+            run_directory = artifact_root / render_run.run_id
+            temporary_path = run_directory / "render.tmp.mp4"
+            if render_run.resumed:
+                temporary_path = Path(render_run.artifacts["tmp"])
+                metadata["render_status"] = "resumed"
+            else:
+                try:
+                    state_store.event(
+                        render_run.run_id, "render_started", {"topic": job.topic}
+                    )
+                    run_directory.mkdir(parents=True, exist_ok=True)
+                    # The lock is released after the chunked render finishes;
+                    # the audio/mux stages below only touch this run's own
+                    # run directory, so they run without the lock.
+                    xfade_degraded = False
+                    with remotion_public_lock(data_root):
+                        if job.assets_dir is not None:
+                            remotion_public = root / "remotion" / "public"
+                            cache_assets_for_remotion(
+                                Path(job.assets_dir), remotion_public
+                            )
+                        xfade_degraded = _render_chunked(
+                            root,
+                            fixture_path,
+                            temporary_path,
+                            run_directory,
+                            browser=_required_tool(tools, "browser"),
+                            npm=_required_tool(tools, "npm"),
+                            ffmpeg=_required_tool(tools, "ffmpeg"),
+                            on_chunk=lambda done, total: state_store.heartbeat(
+                                render_run.run_id
+                            ),
+                        )
+                    # True when chunk concat fell back from xfade
+                    # cross-dissolves to hard cuts; False for single-chunk.
+                    metadata["xfade_degraded"] = xfade_degraded
+                except Exception as error:
+                    state_store.fail(render_run.run_id, error)
+                    raise
+                render_run = state_store.complete(
+                    render_run.run_id,
+                    {"tmp": str(temporary_path)},
+                    expected_artifacts={"tmp": temporary_path},
+                )
+                metadata["render_status"] = "complete"
+
+            # Stage 4b: audio tracks (TTS narration, music bed, SFX, room
+            # tone). Fingerprinted on the fixture content so a re-run after a
+            # mux failure reuses the already-synthesized tracks.
+            edit_doc_render = load_edit(fixture_path)
+            audio_inputs = {
+                "fixture_sha256": _sha256(fixture_path),
+                "tts": "kokoro/af_heart",
+                "draft": draft,
+            }
+            audio_run = state_store.start("video-audio", audio_inputs)
+            audio_dir = artifact_root / audio_run.run_id
+            narration_track: Path | None = None
+            music_track: Path | None = None
+            sfx_track: Path | None = None
+            room_tone_track: Path | None = None
+            if audio_run.resumed:
+                artifacts_audio = audio_run.artifacts
+                narration_track = Path(artifacts_audio["narration"])
+                music_track = Path(artifacts_audio["music"])
+                room_tone_track = Path(artifacts_audio["room_tone"])
+                if "sfx" in artifacts_audio:
+                    sfx_track = Path(artifacts_audio["sfx"])
+                metadata["narration_status"] = "resumed"
+            else:
+                try:
+                    audio_dir.mkdir(parents=True, exist_ok=True)
+                    tts_info: dict[str, Any] = {}
+                    state_store.heartbeat(audio_run.run_id)
+                    narration_track = _synthesize_narration_track(
+                        edit_doc_render,
+                        audio_dir / "narration",
+                        ffmpeg=_required_tool(tools, "ffmpeg"),
+                        tts_metadata=tts_info,
+                    )
+                    state_store.heartbeat(audio_run.run_id)
+                    if narration_track is not None:
+                        metadata["narration_status"] = "complete"
+                        metadata["narration_segments"] = len([
+                            s for s in edit_doc_render.scenes
+                            if (s.narration or "").strip()
+                        ])
+                        # Effective TTS engine/voice actually used (may differ
+                        # from the requested Kokoro voice when the chain falls
+                        # through to espeak, which cannot use Kokoro voices).
+                        metadata["tts_engine"] = tts_info.get("tts_engine", "unknown")
+                        metadata["tts_voice"] = tts_info.get("tts_voice", "unknown")
+                    else:
+                        metadata["narration_status"] = "silent_fallback"
+                    # Generate a subtle ambient music bed and duck it under
+                    # narration.
+                    duration_seconds = (
+                        edit_doc_render.duration_frames / edit_doc_render.fps
+                    )
+                    music_track = _generate_music_bed(
+                        duration_seconds,
+                        audio_dir / "music.wav",
+                        ffmpeg=_required_tool(tools, "ffmpeg"),
+                    )
+                    metadata["music_status"] = "complete"
+                    # Generate a sound-design track (whooshes/drones at scene
+                    # boundaries) to complement narration and music (#4).
+                    sfx_track = _generate_sfx_track(
+                        edit_doc_render,
+                        audio_dir / "sfx",
+                        ffmpeg=_required_tool(tools, "ffmpeg"),
+                    )
+                    if sfx_track is not None:
+                        metadata["sfx_status"] = "complete"
+                    # Generate a continuous room-tone bed so there are no
+                    # dead-silence gaps between narration segments (#2).
+                    room_tone_track = generate_room_tone(
+                        duration_seconds,
+                        audio_dir / "room_tone.wav",
+                        ffmpeg=_required_tool(tools, "ffmpeg"),
+                    )
+                    metadata["room_tone_status"] = "complete"
+                except Exception as error:
+                    state_store.fail(audio_run.run_id, error)
+                    raise
+                track_artifacts = {
+                    "narration": str(narration_track) if narration_track else "",
+                    "music": str(music_track),
+                    "room_tone": str(room_tone_track),
+                }
+                expected_tracks = {
+                    "music": music_track,
+                    "room_tone": room_tone_track,
+                }
+                if narration_track is not None:
+                    expected_tracks["narration"] = narration_track
+                if sfx_track is not None:
+                    track_artifacts["sfx"] = str(sfx_track)
+                    expected_tracks["sfx"] = sfx_track
+                # Drop empty narration entry when the silent fallback ran.
+                track_artifacts = {k: v for k, v in track_artifacts.items() if v}
+                audio_run = state_store.complete(
+                    audio_run.run_id, track_artifacts,
+                    expected_artifacts=expected_tracks,
+                )
+
+            # Stage 4c: mux video + audio tracks, then polish -> master.mp4.
+            # Fingerprinted on the content of every input so only genuinely
+            # new inputs trigger a re-mux.
+            mux_inputs = {
+                "video_sha256": _sha256(temporary_path),
+                "draft": draft,
+            }
+            for label, track in (
+                ("narration", narration_track),
+                ("music", music_track),
+                ("sfx", sfx_track),
+                ("room_tone", room_tone_track),
+            ):
+                if track is not None:
+                    mux_inputs[f"{label}_sha256"] = _sha256(track)
+            mux_run = state_store.start("video-mux", mux_inputs)
+            mux_dir = artifact_root / mux_run.run_id
+            if mux_run.resumed:
+                run_master = Path(mux_run.artifacts["master"])
+                job.master_path = run_master
+                metadata["mux_status"] = "resumed"
+            else:
+                try:
+                    mux_dir.mkdir(parents=True, exist_ok=True)
+                    run_master = mux_dir / "master.mp4"
+                    duration_seconds = (
+                        edit_doc_render.duration_frames / edit_doc_render.fps
+                    )
+                    _mux_narration_audio(
+                        temporary_path,
+                        narration_track,
+                        run_master,
+                        ffmpeg=_required_tool(tools, "ffmpeg"),
+                        music_track=music_track,
+                        sfx_track=sfx_track,
+                        room_tone_track=room_tone_track,
+                        duration_seconds=duration_seconds,
+                    )
+                    metadata["mux_status"] = "complete"
+                    # Apply final visual polish (#3 film grain, #9
+                    # letterboxing) to the muxed master. Polish into a temp
+                    # file then move it over run_master so the artifact path
+                    # stays consistent for QC.
+                    polished_path = mux_dir / "master.polished.mp4"
+                    _polish_master(
+                        run_master,
+                        polished_path,
+                        ffmpeg=_required_tool(tools, "ffmpeg"),
+                    )
+                    shutil.move(str(polished_path), str(run_master))
+                    metadata["polish_status"] = "complete"
+                    temporary_path.unlink(missing_ok=True)
+                except Exception as error:
+                    state_store.fail(mux_run.run_id, error)
+                    raise
+                mux_run = state_store.complete(
+                    mux_run.run_id,
+                    {"master": str(run_master)},
+                    expected_artifacts={"master": run_master},
+                )
+                # Publish a stable draft copy outside the run directory.
+                shutil.copy2(run_master, job.master_path)
+                job.master_path = run_master
 
         artifacts["master"] = str(job.master_path)
         artifacts["draft"] = str(output_dir / "master.mp4")
@@ -1786,12 +2074,29 @@ def run_video_pipeline(
         # step later; nothing is uploaded here. Best-effort - a thumbnail
         # failure must not fail an otherwise-passing render.
         try:
+            # Feed packaging thumbnail briefs (written at script time) into
+            # the thumbnail renderer so the overlay copy matches the plan.
+            overlays: list[str] | None = None
+            packaging_path = job_dir / "packaging.json"
+            if packaging_path.is_file():
+                try:
+                    briefs = json.loads(packaging_path.read_text(encoding="utf-8")).get(
+                        "thumbnail_briefs", []
+                    )
+                    overlays = [
+                        b.get("text_overlay", "")
+                        for b in briefs
+                        if isinstance(b, dict)
+                    ] or None
+                except Exception:  # noqa: BLE001 - briefs are advisory
+                    overlays = None
             thumb_artifacts = build_thumbnails(
                 edit_doc,
                 job.master_path,
                 output_dir / "thumbnails",
                 count=3,
                 power_words=theme.thumbnail_power_words,
+                text_overlays=overlays,
             )
             artifacts["thumbnail_1"] = str(thumb_artifacts["thumbnail_1"])
             artifacts["thumbnail_2"] = str(thumb_artifacts["thumbnail_2"])
@@ -1799,6 +2104,20 @@ def run_video_pipeline(
             metadata["thumbnail_status"] = "complete"
         except Exception as error:  # noqa: BLE001 - thumbnails are best-effort
             metadata["thumbnail_status"] = f"failed: {sanitize_diagnostic(error)}"
+
+        # Step 4.6b: Cut vertical Shorts from the finished master as a funnel
+        # to the long-form video. Best-effort, like thumbnails.
+        try:
+            from ai_video_factory.shorts import render_shorts
+
+            short_results = render_shorts(
+                job.master_path, edit_doc, output_dir / "shorts"
+            )
+            artifacts["shorts"] = str(output_dir / "shorts" / "shorts.json")
+            metadata["shorts_rendered"] = len(short_results)
+            metadata["shorts_status"] = "complete"
+        except Exception as error:  # noqa: BLE001 - shorts are best-effort
+            metadata["shorts_status"] = f"failed: {sanitize_diagnostic(error)}"
 
         metadata["render_status"] = "complete"
 
