@@ -152,7 +152,9 @@ def _text_bands(img: Image.Image) -> tuple[float, float]:
 def _looks_text_heavy(img: Image.Image, brightness: float) -> bool:
     """Heuristic text detection for one frame."""
     peak, concentration = _text_bands(img)
-    if peak >= TEXT_EDGE_THRESHOLD:
+    # Require BOTH high edge density AND high concentration (text clusters
+    # in bands; starfields/natural textures spread edges evenly).
+    if peak >= TEXT_EDGE_THRESHOLD and concentration >= TEXT_CONCENTRATION_THRESHOLD:
         return True
     if (
         brightness < DARK_MEAN_THRESHOLD

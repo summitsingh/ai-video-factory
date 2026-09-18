@@ -625,7 +625,7 @@ const SceneCard = ({
               textAlign: 'center',
             }}
           >
-            Sources: {sources.join('  ·  ').slice(0, 160)}
+            {/* Sources in YouTube description, not on screen. */}
           </div>
         )}
       </AbsoluteFill>
@@ -1071,19 +1071,7 @@ const OutroSequence = ({title, sources}: {title: string; sources?: string[]}) =>
         >
           PRODUCTION · AI VIDEO FACTORY
         </div>
-        {sourceLabels.length > 0 && (
-          <div
-            style={{
-              color: '#64748b',
-              fontSize: Math.round(height * 0.02),
-              marginTop: height * 0.03,
-              maxWidth: '85%',
-              fontStyle: 'italic',
-            }}
-          >
-            Sources: {sourceLabels.join(' · ')}
-          </div>
-        )}
+        {/* Sources live in the YouTube description. */}
       </AbsoluteFill>
     </AbsoluteFill>
   );
@@ -1248,7 +1236,9 @@ const ActCard = ({act, accentColor}: {act: string; accentColor?: string}) => {
   );
 };
 
-export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
+export const SyntheticVideo = ({scenes, sources, total_scenes, scene_start_index}: EditDocument) => {
+  const fullTotal = total_scenes ?? scenes.length;
+  const startIdx = scene_start_index ?? 0;
   return (
     <AbsoluteFill>
       {scenes.map((scene, index) => (
@@ -1259,11 +1249,11 @@ export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
           layout="none"
         >
           <SceneCard
-            index={index}
-            isLast={index === scenes.length - 1}
+            index={startIdx + index}
+            isLast={startIdx + index === fullTotal - 1}
             scene={scene}
             sources={sources}
-            total={scenes.length}
+            total={fullTotal}
           />
         </Sequence>
       ))}
@@ -1282,11 +1272,11 @@ export const SyntheticVideo = ({scenes, sources}: EditDocument) => {
           layout="none"
         >
           <SceneCard
-            index={index + 1}
-            isLast={index === scenes.length - 2}
+            index={startIdx + index + 1}
+            isLast={startIdx + index === fullTotal - 2}
             scene={scenes[index + 1]}
             sources={sources}
-            total={scenes.length}
+            total={fullTotal}
             overlay
           />
         </Sequence>

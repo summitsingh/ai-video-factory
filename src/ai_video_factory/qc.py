@@ -87,7 +87,7 @@ def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
         _check(
             "dimensions",
             dimensions_match,
-            f"expected {edit.width}x{edit.height}; got {media.width}x{media.height}",
+            f"expected {edit.width}x{edit.height} or 2.39:1 letterbox; got {media.width}x{media.height}" + (" (2.39:1 letterbox OK)" if dimensions_match and (media.width, media.height) != (edit.width, edit.height) else ""),
         ),
         _check(
             "frame-rate",

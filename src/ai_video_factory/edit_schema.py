@@ -60,6 +60,10 @@ class EditDocument(BaseModel):
     description: str | None = None
     created_at: str | None = None
     sources: list[str] = Field(default_factory=list)
+    # Chunk rendering metadata: when an edit is split into chunks, these
+    # preserve the full-video scene numbering for on-screen chapter cards.
+    total_scenes: int | None = None
+    scene_start_index: int | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod

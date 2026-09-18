@@ -459,9 +459,12 @@ def _chunk_edit(edit: EditDocument, max_frames: int) -> list[EditDocument]:
     chunks: list[EditDocument] = []
     current: list[EditScene] = []
     current_frames = 0
+    total_scenes = len(edit.scenes)
+    scene_start_idx = 0
     for scene in edit.scenes:
         if current and current_frames + scene.duration_frames > max_frames:
-            chunks.append(_finish_chunk(edit, current))
+            chunks.append(_finish_chunk(edit, current, total_scenes, scene_start_idx))
+            scene_start_idx += len(current)
             current = []
             current_frames = 0
         offset = current_frames
@@ -471,11 +474,11 @@ def _chunk_edit(edit: EditDocument, max_frames: int) -> list[EditDocument]:
         }))
         current_frames += scene.duration_frames
     if current:
-        chunks.append(_finish_chunk(edit, current))
+        chunks.append(_finish_chunk(edit, current, total_scenes, scene_start_idx))
     return chunks
 
 
-def _finish_chunk(edit: EditDocument, scenes: list[EditScene]) -> EditDocument:
+def _finish_chunk(edit: EditDocument, scenes: list[EditScene], total_scenes: int | None = None, scene_start_index: int | None = None) -> EditDocument:
     total = sum(s.duration_frames for s in scenes)
     return EditDocument(
         schema_version=1,
@@ -488,6 +491,8 @@ def _finish_chunk(edit: EditDocument, scenes: list[EditScene]) -> EditDocument:
         description=edit.description,
         sources=edit.sources,
         created_at=edit.created_at,
+        total_scenes=total_scenes,
+        scene_start_index=scene_start_index,
     )
 
 

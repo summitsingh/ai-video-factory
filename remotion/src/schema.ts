@@ -29,6 +29,8 @@ export type EditDocument = {
   description?: string;
   created_at?: string;
   sources?: string[];
+  total_scenes?: number;
+  scene_start_index?: number;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
