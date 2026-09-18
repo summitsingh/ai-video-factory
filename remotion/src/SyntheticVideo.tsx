@@ -923,7 +923,7 @@ const IntroSequence = ({title, subtitle}: {title: string; subtitle: string}) => 
       <AbsoluteFill
         style={{
           background:
-            'radial-gradient(ellipse at center, #0a1a3d 0%, #000000 100%)',
+            'radial-gradient(ellipse at center, #1a2f6b 0%, #0a152e 60%, #050a18 100%)',
         }}
       />
       <AbsoluteFill
