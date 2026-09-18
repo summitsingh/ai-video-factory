@@ -222,6 +222,11 @@ def _lm_studio_payload(script_dict):
     ).encode("utf-8")
 
 
+def _lm_studio_payload_text(content: str):
+    """Raw LM Studio response envelope with literal message content."""
+    return json.dumps({"choices": [{"message": {"content": content}}]}).encode("utf-8")
+
+
 def _valid_script_dict():
     return {
         "title": "Test",
@@ -676,3 +681,30 @@ def test_public_lock_releasable_and_reacquirable(tmp_path):
         pass
     with remotion_public_lock(tmp_path):
         pass
+
+
+def test_script_generation_retries_empty_thinking_output(monkeypatch):
+    """A reasoning model returning empty content once must be retried."""
+    calls: list[int] = []
+
+    def fake_urlopen(request, timeout=None):
+        payload = json.loads(request.data.decode("utf-8"))
+        calls.append(payload["max_tokens"])
+        if len(calls) == 1:
+            return _FakeResponse(_lm_studio_payload_text(""))
+        return _FakeResponse(_lm_studio_payload(_valid_script_dict()))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    parsed = generate_script_with_lm_studio("T", "D", "https://example.com")
+    assert parsed["title"] == "Test"
+    assert len(calls) == 2
+    assert calls[1] == calls[0] * 2  # retry doubles the token budget
+
+
+def test_script_generation_retry_exhaustion_fails_loud(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        return _FakeResponse(_lm_studio_payload_text(""))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(ScriptGenerationError, match="2 attempts"):
+        generate_script_with_lm_studio("T", "D", "https://example.com")

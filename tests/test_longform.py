@@ -153,3 +153,50 @@ def test_longform_scene_duration_matches_narration():
         assert scene.from_frame == cursor
         cursor += scene.duration_frames
     assert cursor == doc.duration_frames
+
+
+def test_generate_longform_retries_empty_thinking_output():
+    """A reasoning model that returns empty content once must be retried."""
+    calls: list[int] = []
+    good = make_fake_chat()
+
+    def flaky_chat(messages, max_tokens):
+        calls.append(max_tokens)
+        if len(calls) == 1:
+            return ""  # budget burned thinking; finish_reason=length
+        return good(messages, max_tokens)
+
+    script = generate_longform_script(
+        "T", "D", "https://example.com", target_minutes=20.0, chat_fn=flaky_chat
+    )
+    assert len(script.beats) == 7
+    assert len(calls) == 8  # seven beats, first beat retried once
+    assert calls[0] >= 8192
+    assert calls[1] == calls[0] * 2  # retry doubles the token budget
+
+
+def test_generate_longform_retries_truncated_json():
+    good = make_fake_chat()
+    calls: list[int] = []
+
+    def trunc_chat(messages, max_tokens):
+        calls.append(max_tokens)
+        if len(calls) == 1:
+            return '{"scenes": [{"title": "cut off mid-stream"'
+        return good(messages, max_tokens)
+
+    script = generate_longform_script(
+        "T", "D", "https://example.com", target_minutes=20.0, chat_fn=trunc_chat
+    )
+    assert len(script.beats) == 7
+    assert len(calls) == 8
+
+
+def test_generate_longform_retry_exhaustion_fails_loud():
+    def empty_chat(messages, max_tokens):
+        return ""
+
+    with pytest.raises(LongformError, match="after 2 attempts"):
+        generate_longform_script(
+            "T", "D", "https://example.com", target_minutes=20.0, chat_fn=empty_chat
+        )

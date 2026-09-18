@@ -23,11 +23,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ai_video_factory.edit_schema import EditDocument, EditScene
+from ai_video_factory.sanitization import sanitize_diagnostic
 
 
 WORDS_PER_MINUTE = 150
 MIN_LONGFORM_MINUTES = 20
 MAX_LONGFORM_MINUTES = 30
+# Reasoning models spend a large share of their token budget thinking
+# before they write. Beats budget content tokens plus thinking headroom,
+# and retry once on empty/truncated output, so a thinking model can never
+# silently collapse a beat the way a 2048-token cap did.
+BEAT_MIN_TOKENS = 8192
+BEAT_TOKEN_HEADROOM = 4
+BEAT_ATTEMPTS = 2
 DEFAULT_LONGFORM_MINUTES = 25.0
 
 
@@ -192,8 +200,12 @@ def _lm_studio_chat(
     api_url: str = "http://localhost:1234/v1/chat/completions",
     model: str = "qwen3.6-35b-a3b-udt-mtp",
     temperature: float = 0.7,
-    timeout: int = 300,
+    timeout: int | None = None,
 ) -> str:
+    if timeout is None:
+        # Thinking models are slow: budget a ~6 tok/s floor so a large
+        # beat cannot time out mid-stream on a CPU-only box.
+        timeout = max(600, max_tokens // 6)
     payload = json.dumps(
         {
             "model": model,
@@ -238,6 +250,54 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise LongformError("model output JSON was not an object")
     return parsed
+
+
+def _generate_beat_text(
+    chat: Callable[..., str],
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    beat_key: str,
+) -> str:
+    """Call the chat backend for one beat, retrying once on empty output.
+
+    Reasoning models can burn their whole token budget thinking and return
+    an empty message (or a truncated stream) with ``finish_reason=length``.
+    The first attempt uses ``max_tokens``; the retry doubles it. A response
+    is only accepted when it actually contains a JSON object. Transport
+    errors are not retried here; they fail loud immediately.
+    """
+    budgets = [max_tokens, max_tokens * 2][:BEAT_ATTEMPTS]
+    last_error: LongformError | None = None
+    raw_text = ""
+    for attempt, budget in enumerate(budgets, start=1):
+        try:
+            raw_text = chat(messages, budget)
+        except LongformError as error:
+            last_error = error
+            raw_text = ""
+            continue
+        except Exception as error:
+            raise LongformError(
+                f"beat {beat_key!r} generation failed: {error}"
+            ) from error
+        if not (raw_text or "").strip():
+            last_error = LongformError(
+                f"beat {beat_key!r} returned empty content (attempt {attempt}; "
+                "the model likely spent its token budget thinking)"
+            )
+            continue
+        try:
+            _extract_json_object(raw_text)
+        except LongformError as error:
+            last_error = error
+            continue
+        return raw_text
+    preview = sanitize_diagnostic(raw_text or "", max_chars=500)
+    detail = f": {last_error}" if last_error else ""
+    raise LongformError(
+        f"beat {beat_key!r} produced no usable JSON after "
+        f"{len(budgets)} attempts{detail}; model preview: {preview}"
+    )
 
 
 @dataclass
@@ -433,12 +493,14 @@ def generate_longform_script(
             previous_beats=previous_titles,
         )
         try:
-            raw_text = chat(
+            raw_text = _generate_beat_text(
+                chat,
                 [
                     {"role": "system", "content": LONGFORM_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                max(2048, word_target * 2),
+                max(BEAT_MIN_TOKENS, word_target * BEAT_TOKEN_HEADROOM),
+                spec.key,
             )
         except LongformError:
             raise

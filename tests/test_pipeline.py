@@ -330,3 +330,88 @@ def _copy_pipeline_project(tmp_path: Path) -> Path:
         ignore=shutil.ignore_patterns("node_modules", "dist"),
     )
     return project
+
+
+def test_resolve_effective_topic_keeps_caller_topic() -> None:
+    """Research must enrich the requested topic, never replace it."""
+    from datetime import datetime
+
+    from ai_video_factory.research import ResearchResult, TrendingTopic
+    from ai_video_factory.video_pipeline import VideoJob, _resolve_effective_topic
+
+    job = VideoJob(
+        topic="The Fermi Paradox",
+        description="",
+        source_url="https://example.com",
+        output_path=Path("data/projects/out"),
+    )
+    research = ResearchResult(
+        topics=[
+            TrendingTopic(
+                title="UN report on Iran",
+                description="A CNBC story",
+                source="cnbc",
+                url="https://example.com/iran",
+                timestamp=datetime.now(),
+            )
+        ],
+        timestamp=datetime.now(),
+        methodology="test",
+        synthetic=False,
+    )
+    effective = _resolve_effective_topic(job, research)
+    assert effective.title == "The Fermi Paradox"
+    assert effective.url == "https://example.com/iran"  # research still enriches
+    assert effective.description == "A CNBC story"  # job had no description
+
+
+def test_resolve_effective_topic_prefers_job_description() -> None:
+    from datetime import datetime
+
+    from ai_video_factory.research import ResearchResult, TrendingTopic
+    from ai_video_factory.video_pipeline import VideoJob, _resolve_effective_topic
+
+    job = VideoJob(
+        topic="The Fermi Paradox",
+        description="Where is everybody?",
+        source_url="https://example.com",
+        output_path=Path("data/projects/out"),
+    )
+    research = ResearchResult(
+        topics=[
+            TrendingTopic(
+                title="UN report on Iran",
+                description="A CNBC story",
+                source="cnbc",
+                url="https://example.com/iran",
+                timestamp=datetime.now(),
+            )
+        ],
+        timestamp=datetime.now(),
+        methodology="test",
+        synthetic=False,
+    )
+    assert _resolve_effective_topic(job, research).description == "Where is everybody?"
+
+
+def test_resolve_run_dirs_honors_output_path(tmp_path: Path) -> None:
+    """--output must own the run directory; nothing goes to a default tree."""
+    from ai_video_factory.video_pipeline import _resolve_run_dirs
+
+    root = tmp_path / "project"
+    output_root, job_dir, job_run_id = _resolve_run_dirs(
+        root, Path("data/projects/smoke-fermi")
+    )
+    assert output_root == (root / "data" / "projects" / "smoke-fermi").resolve()
+    assert job_dir == output_root / "runs" / job_run_id
+    assert job_dir.is_dir()
+
+
+def test_resolve_run_dirs_accepts_absolute_output(tmp_path: Path) -> None:
+    from ai_video_factory.video_pipeline import _resolve_run_dirs
+
+    output_root, job_dir, _ = _resolve_run_dirs(
+        tmp_path / "project", tmp_path / "custom-out"
+    )
+    assert output_root == (tmp_path / "custom-out").resolve()
+    assert job_dir.parent == output_root / "runs"

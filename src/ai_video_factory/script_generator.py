@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import urllib.request
+from ai_video_factory.sanitization import sanitize_diagnostic
 
 
 # System prompt for script writing
@@ -102,7 +103,7 @@ def generate_script_with_lm_studio(
     source_url: str,
     api_url: str = "http://localhost:1234/v1/chat/completions",
     model: str = "qwen3.6-35b-a3b-udt-mtp",
-    max_tokens: int = 2048,
+    max_tokens: int = 8192,
     temperature: float = 0.7,
     allow_fallback: bool = False,
 ) -> dict[str, Any]:
@@ -112,6 +113,10 @@ def generate_script_with_lm_studio(
     cannot be parsed/validated, unless ``allow_fallback`` is True, in which
     case a generic template script is returned. The default is fail-loud so
     unattended runs never silently produce placeholder videos.
+
+    Reasoning models can spend their token budget thinking and return an
+    empty message, so the request is retried once with a doubled budget
+    when the model returns empty or unparseable content.
     """
     
     user_prompt = f"""Generate a video script about the following trending topic:
@@ -130,47 +135,77 @@ Create a 60-90 second video script with:
 
 Make it engaging, factual, and visually descriptive."""
 
-    payload = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": False
-    }).encode('utf-8')
+    def _build_payload(budget: int) -> bytes:
+        return json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            "max_tokens": budget,
+            "temperature": temperature,
+            "stream": False
+        }).encode('utf-8')
 
-    req = urllib.request.Request(
-        api_url,
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+    def _post(payload: bytes, budget: int) -> str:
+        # Thinking models are slow: budget a ~6 tok/s floor so the call
+        # cannot time out mid-stream on a CPU-only box.
+        request_timeout = max(600, budget // 6)
+        req = urllib.request.Request(
+            api_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=request_timeout) as response:
             result = json.loads(response.read().decode('utf-8'))
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        return result.get("choices", [{}])[0].get("message", {}).get("content") or ""
+
+    def _use_fallback() -> dict[str, Any]:
+        return _generate_fallback_script(topic_title, topic_description, source_url)
+
+    last_error: ScriptGenerationError | None = None
+    last_content = ""
+    for budget in (max_tokens, max_tokens * 2):
+        try:
+            content = _post(_build_payload(budget), budget)
+        except ScriptGenerationError:
+            raise
+        except Exception as error:
+            if allow_fallback:
+                # Explicitly requested fallback: produce a generic template.
+                return _use_fallback()
+            raise ScriptGenerationError(
+                f"LM Studio script request failed: {error}"
+            ) from error
+        last_content = content
+        if not content.strip():
+            last_error = ScriptGenerationError(
+                "LM Studio returned empty content "
+                "(the model likely spent its token budget thinking)"
+            )
+            continue
+        try:
             parsed = _extract_json(content)
             _validate_script_shape(parsed)
             return parsed
-    except ScriptGenerationError:
-        if allow_fallback:
-            # Explicitly requested fallback: parse/validation failures also
-            # degrade to the generic template rather than failing loud.
-            return _generate_fallback_script(topic_title, topic_description, source_url)
-        raise
-    except Exception as error:
-        if allow_fallback:
-            # Explicitly requested fallback: produce a generic template.
-            return _generate_fallback_script(topic_title, topic_description, source_url)
-        raise ScriptGenerationError(
-            f"LM Studio script request failed: {error}"
-        ) from error
+        except ScriptGenerationError as error:
+            last_error = error
+            continue
+
+    preview = sanitize_diagnostic(last_content, max_chars=500)
+    if allow_fallback:
+        # Explicitly requested fallback: parse/validation failures also
+        # degrade to the generic template rather than failing loud.
+        return _use_fallback()
+    detail = f": {last_error}" if last_error else ""
+    raise ScriptGenerationError(
+        f"LM Studio produced no usable script after 2 attempts{detail}; "
+        f"model preview: {preview}"
+    )
 
 
 def _generate_fallback_script(

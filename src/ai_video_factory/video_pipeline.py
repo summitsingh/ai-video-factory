@@ -1175,6 +1175,39 @@ def _status(result: Mapping[str, Any]) -> Literal["pass", "fail"]:
 
 # ========== Main Pipeline Function ==========
 
+def _resolve_run_dirs(root: Path, output_path: Path) -> tuple[Path, Path, str]:
+    """Resolve the run directories for a pipeline run.
+
+    Every run gets its own job directory beneath the requested ``--output``
+    path so artifacts never land somewhere the caller did not ask for.
+    Returns ``(output_root, job_dir, job_run_id)``.
+    """
+    resolved_root = Path(output_path)
+    if not resolved_root.is_absolute():
+        resolved_root = root / resolved_root
+    resolved_root = resolved_root.resolve()
+    job_run_id = uuid4().hex
+    job_dir = resolved_root / "runs" / job_run_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return resolved_root, job_dir, job_run_id
+
+
+def _resolve_effective_topic(job: VideoJob, research_result) -> TrendingTopic:
+    """Pick the documentary topic for a run.
+
+    The caller's topic is authoritative: research enriches the documentary
+    (description, sources) but must never replace the requested topic.
+    """
+    research_topic = research_result.topics[0]
+    return TrendingTopic(
+        title=job.topic,
+        description=job.description or research_topic.description,
+        source=research_topic.source,
+        url=research_topic.url,
+        timestamp=research_topic.timestamp,
+    )
+
+
 def run_video_pipeline(
     project_root: Path,
     data_root: Path,
@@ -1231,19 +1264,19 @@ def run_video_pipeline(
         root = Path(project_root).resolve()
         data_root = Path(data_root).resolve()
 
-        # Setup paths. The topic slug namespaces one project directory; every
-        # run gets its own job directory beneath it so no two runs share
-        # mutable files (research/script/edit JSONs live in the job dir, not
-        # a shared project dir).
+        # Setup paths. The topic slug namespaces metadata; every run gets its
+        # own job directory beneath the requested --output path so artifacts
+        # never land somewhere the caller did not ask for. The state store
+        # lives next to it, which keeps resume working when the same
+        # --output is reused. All run artifacts stay contained under the
+        # artifact root so RunStore integrity checks pass.
         slug = slugify_topic(job.topic)
-        project_data = data_root / "projects" / slug
-        job_run_id = uuid4().hex
-        job_dir = project_data / "runs" / job_run_id
-        job_dir.mkdir(parents=True, exist_ok=True)
+        output_root, job_dir, job_run_id = _resolve_run_dirs(root, job.output_path)
         metadata["topic_slug"] = slug
         metadata["job_run_id"] = job_run_id
-        artifact_root = project_data / "runs"
-        state_store = RunStore(project_data / "state", artifact_root=artifact_root)
+        metadata["output_root"] = str(output_root)
+        artifact_root = output_root / "runs"
+        state_store = RunStore(output_root / "state", artifact_root=artifact_root)
 
         # Step 1: Research trending topic (skip if script provided)
         metadata["research_status"] = "in_progress"
@@ -1255,8 +1288,10 @@ def run_video_pipeline(
             if not research_result.topics:
                 raise PipelineCommandError("No trending topics found for research")
             save_research_result(research_result, job.research_path)
-            trending_topic = research_result.topics[0]
+            research_topic = research_result.topics[0]
+            trending_topic = _resolve_effective_topic(job, research_result)
             metadata["selected_topic"] = trending_topic.title
+            metadata["research_topic"] = research_topic.title
             metadata["source_url"] = trending_topic.url
             metadata["trend_source"] = trend_source
             metadata["research_synthetic"] = research_result.synthetic
