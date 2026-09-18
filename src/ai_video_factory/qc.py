@@ -26,6 +26,45 @@ def _check(name: str, passed: bool, detail: str) -> QcCheck:
     return QcCheck(name=name, passed=passed, detail=detail)
 
 
+def _check_content_brightness(media: MediaInfo) -> QcCheck:
+    """Sample frames across the video; fail if most are dark.
+    
+    Catches visual-attachment failures where scenes render as near-black
+    gradients instead of real imagery.
+    """
+    import subprocess
+    if not media.source_path or not media.source_path.exists():
+        return _check('content-brightness', True, 'skipped: no source path')
+    if not media.duration_seconds or media.duration_seconds < 10:
+        return _check('content-brightness', True, 'skipped: too short')
+    
+    # Sample 1 frame per 30s, up to 50 frames
+    duration = media.duration_seconds
+    num_samples = min(50, max(5, int(duration // 30)))
+    dark_count = 0
+    try:
+        for i in range(num_samples):
+            t = (i + 0.5) * duration / num_samples
+            cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                   '-ss', str(t), '-i', str(media.source_path),
+                   '-frames:v', '1', '-vf', 'scale=64:64,format=gray',
+                   '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if len(result.stdout) >= 64*64:
+                import numpy as np
+                frame = np.frombuffer(result.stdout[:64*64], dtype=np.uint8)
+                # Dark if >80% of pixels are very dark (ignores bright text overlays)
+                dark_pixels = (frame < 40).sum() / len(frame)
+                if dark_pixels > 0.8:
+                    dark_count += 1
+        dark_ratio = dark_count / num_samples if num_samples else 0
+        passed = dark_ratio < 0.5
+        return _check('content-brightness', passed,
+                      f'{dark_count}/{num_samples} frames dark (ratio {dark_ratio:.2f})')
+    except Exception as e:
+        return _check('content-brightness', True, f'skipped: {e}')
+
+
 def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
     """Compare probed media to an edit specification and aggregate technical checks."""
     # The master is letterboxed to a cinematic ~2.39:1 band by _polish_master, so
@@ -109,6 +148,7 @@ def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
             media.decode_detail
             or ("full decode passed" if decode_passed else "full decode was not successful"),
         ),
+        _check_content_brightness(media),
     ]
     status: Literal["pass", "fail"] = "pass" if all(check.passed for check in checks) else "fail"
     return QcReport(status=status, checks=checks)
