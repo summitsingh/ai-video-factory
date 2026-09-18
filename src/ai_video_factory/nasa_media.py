@@ -7,6 +7,7 @@ the source page URL.
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -28,6 +29,35 @@ _STOP_WORDS = frozenset({
 
 # Common possessive/contraction suffixes to strip before keyword matching.
 _SUFFIXES = ("'s", "'re", "'ve", "'ll", "'d")
+
+# Concrete visual nouns the NASA library is likely to have. Matched against
+# a scene's visual direction (not its poetic title) so the query describes
+# what should be ON SCREEN. Multi-word anchors come first in matching.
+_VISUAL_ANCHORS = (
+    "black hole", "space station", "mission control", "launch pad",
+    "solar eclipse", "lunar eclipse",
+    "nebula", "galaxy", "galaxies", "star", "stars", "planet", "planets",
+    "earth", "moon", "mars", "jupiter", "saturn", "sun", "comet", "asteroid",
+    "telescope", "observatory", "astronaut", "spacewalk", "spacesuit",
+    "rocket", "launch", "satellite", "shuttle", "capsule", "lander", "rover",
+    "laboratory", "lab", "scientist", "engineer",
+    "aurora", "eclipse", "crater", "volcano", "ocean", "desert", "glacier",
+    "wildfire", "hurricane", "storm", "clouds",
+    "dinosaur", "fossil",
+)
+
+# NASA record titles that signal event/promo imagery (press conferences,
+# briefings, award ceremonies). These read as off-topic B-roll for science
+# storytelling, so they are skipped unless nothing else matches.
+_EVENT_BLOCKLIST = (
+    "press conference", "press briefing", "news briefing", "briefing",
+    "panel discussion", "town hall", "award", "ceremony", "gala",
+    "ribbon cutting", "signing ceremony",
+)
+
+# Minimum usable still-image width in pixels. Anything smaller looks soft
+# when stretched fullscreen; the scene falls back to the title-card look.
+_MIN_IMAGE_WIDTH = 640
 
 
 def _extract_query(title: str, stop_words: frozenset[str] | None = None) -> str:
@@ -54,6 +84,46 @@ def _extract_query(title: str, stop_words: frozenset[str] | None = None) -> str:
             continue
         tokens.append(token)
     return " ".join(tokens) or title.strip()
+
+
+def _extract_visual_query(
+    visual: str | None,
+    title: str,
+    stop_words: frozenset[str] | None = None,
+) -> str:
+    """Build a NASA query from the scene's visual direction.
+
+    The visual direction describes what should be on screen ("a planet
+    engulfed in fire", "camera pulls back from Earth"), so concrete nouns
+    pulled from it match the NASA catalog far better than the scene's poetic
+    title ("Wild Explanations"). Falls back to the title-based extraction
+    when no known visual anchor appears.
+    """
+    text = (visual or "").lower()
+    hits: list[str] = []
+    for anchor in _VISUAL_ANCHORS:
+        # Word-boundary match so "lab" doesn't fire on "elaborate".
+        if re.search(rf"(?<![a-z]){re.escape(anchor)}(?![a-z])", text):
+            # Normalize plurals to the singular anchor for cleaner queries.
+            hits.append(anchor)
+            if len(hits) >= 3:
+                break
+    if hits:
+        # De-dupe singular/plural pairs ("star"/"stars" -> "stars").
+        seen: set[str] = set()
+        unique: list[str] = []
+        for hit in hits:
+            key = hit.rstrip("s")
+            if key not in seen:
+                seen.add(key)
+                unique.append(hit)
+        return " ".join(unique[:3])
+    return _extract_query(title, stop_words)
+
+
+def _record_is_event_photo(record_title: str) -> bool:
+    low = (record_title or "").lower()
+    return any(term in low for term in _EVENT_BLOCKLIST)
 
 
 def _query_variants(title: str, stop_words: frozenset[str] | None = None) -> list[str]:
@@ -128,6 +198,19 @@ def _nasa_clip_url(nasa_id: str) -> str | None:
     return mp4s[0] if mp4s else None
 
 
+def _image_is_usable(path: Path) -> bool:
+    """Reject tiny or unreadable stills; they look soft stretched fullscreen."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, _ = image.size
+        return width >= _MIN_IMAGE_WIDTH
+    except Exception:
+        # If PIL can't read it, don't trust it as B-roll.
+        return False
+
+
 def fetch_nasa_for_scene(
     queries: list[str],
     scene_dir: Path,
@@ -153,6 +236,10 @@ def fetch_nasa_for_scene(
                     mediatype == "video" and clips >= max_clips
                 ):
                     break
+                # Skip press-conference / ceremony imagery: it reads as
+                # off-topic B-roll for science storytelling.
+                if _record_is_event_photo(record["title"]):
+                    continue
                 try:
                     if mediatype == "image":
                         url = _nasa_image_url(record["nasa_id"])
@@ -164,6 +251,9 @@ def fetch_nasa_for_scene(
                         destination = scene_dir / f"nasa-clip-{len(assets)}.mp4"
                     download_asset(url, destination)
                 except StockMediaError:
+                    continue
+                if mediatype == "image" and not _image_is_usable(destination):
+                    destination.unlink(missing_ok=True)
                     continue
                 assets.append(StockAsset(
                     kind="image" if mediatype == "image" else "clip",
@@ -194,9 +284,12 @@ def populate_assets_from_nasa(
 
     Each normal content scene (``scene-0``, ``scene-1``, ...) is matched to a
     ``scene-NN/`` directory beneath ``assets_dir`` and populated by searching
-    NASA for that scene's title. Intro/outro scenes are skipped. Returns a
-    small summary of how many images/clips were downloaded per scene so the
-    caller can report it in pipeline metadata.
+    NASA for that scene's visual direction first (concrete on-screen nouns),
+    falling back to the scene title. Intro/outro scenes are skipped. Records
+    that look like press conferences or ceremonies are skipped, and stills
+    narrower than 640px are rejected. Returns a small summary of how many
+    images/clips were downloaded per scene so the caller can report it in
+    pipeline metadata.
 
     This is best-effort: network failures, empty queries, or missing media are
     logged and skipped so a single bad scene never aborts the whole render.
@@ -217,13 +310,20 @@ def populate_assets_from_nasa(
         title = str(getattr(scene, "title", "") or "").strip()
         if not title:
             continue
+        visual = str(getattr(scene, "visual", "") or "").strip()
         scene_dir = assets_dir / f"scene-{idx:02d}"
         try:
-            # Try progressively simpler queries until a variant returns media,
-            # so poetic titles still surface something from the NASA catalog.
-            query = _extract_query(title, stop_words)
+            # Query from the visual direction first: it describes what should
+            # be on screen ("a planet engulfed in fire"), while the title is
+            # often poetic ("Wild Explanations") and pulls junk. Fall back to
+            # the title ladder when the visual yields no usable media.
+            query = _extract_visual_query(visual, title, stop_words)
             assets: list[StockAsset] = []
-            for candidate in _query_variants(title, stop_words):
+            candidates = [query]
+            candidates.extend(
+                c for c in _query_variants(title, stop_words) if c != query
+            )
+            for candidate in candidates:
                 assets = fetch_nasa_for_scene(
                     [candidate], scene_dir,
                     max_images=max_images, max_clips=max_clips,

@@ -122,6 +122,7 @@ def generate_script_with_lm_studio(
     max_tokens: int = 8192,
     temperature: float = 0.7,
     allow_fallback: bool = False,
+    duration_seconds: int = 90,
 ) -> dict[str, Any]:
     """Generate a video script using LM Studio's local model.
 
@@ -144,8 +145,9 @@ Title: {topic_title}
 Description: {topic_description}
 Source: {source_url}
 
-Create a 60-90 second video script with:
-1. An engaging title
+Create a {duration_seconds}-second video script with:
+1. An engaging title that states the true {duration_seconds}-second runtime
+   (never invent a different length like "in 75 seconds")
 2. A narration script with natural flow
 3. Scene breakdown with timing (in frames at 30fps)
 4. Visual suggestions for each scene
@@ -311,6 +313,7 @@ def generate_script(
     use_local_model: bool = True,
     allow_fallback: bool = False,
     api_url: str = "http://localhost:1234/v1/chat/completions",
+    duration_seconds: int = 90,
 ) -> ScriptOutput:
     """Generate a video script about a trending topic.
 
@@ -341,6 +344,7 @@ def generate_script(
             source_url,
             api_url=api_url,
             allow_fallback=allow_fallback,
+            duration_seconds=duration_seconds,
         )
     else:
         result = _generate_fallback_script(topic_title, topic_description, source_url)

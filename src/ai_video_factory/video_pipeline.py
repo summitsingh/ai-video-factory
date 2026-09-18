@@ -1442,6 +1442,7 @@ def run_video_pipeline(
                         output_path=job.script_path,
                         use_local_model=True,
                         api_url=llm_url,
+                        duration_seconds=job.duration_seconds,
                     )
                     state_store.heartbeat(script_run.run_id)
                 except Exception as error:

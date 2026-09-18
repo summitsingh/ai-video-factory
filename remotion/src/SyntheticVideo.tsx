@@ -1012,6 +1012,24 @@ const OutroSequence = ({title, sources}: {title: string; sources?: string[]}) =>
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
   });
+  // Raw URLs look terrible burned into the frame. Show a clean publisher
+  // label instead: "NASA", "Google News", or the bare domain.
+  const cleanSource = (raw: string): string => {
+    const lower = raw.toLowerCase();
+    if (lower.includes('nasa.gov')) return 'NASA';
+    if (lower.includes('news.google.com')) return 'Google News';
+    if (lower.includes('wikipedia.org')) return 'Wikipedia';
+    try {
+      const host = new URL(raw).hostname.replace(/^www\./, '');
+      return host || raw;
+    } catch {
+      return raw.length > 40 ? `${raw.slice(0, 40)}…` : raw;
+    }
+  };
+  const sourceLabels = (sources || [])
+    .map(cleanSource)
+    .filter((label, i, all) => label && all.indexOf(label) === i)
+    .slice(0, 4);
   return (
     <AbsoluteFill>
       <StarField count={100} />
@@ -1065,7 +1083,7 @@ const OutroSequence = ({title, sources}: {title: string; sources?: string[]}) =>
         >
           PRODUCTION · AI VIDEO FACTORY
         </div>
-        {sources && sources.length > 0 && (
+        {sourceLabels.length > 0 && (
           <div
             style={{
               color: '#64748b',
@@ -1075,7 +1093,7 @@ const OutroSequence = ({title, sources}: {title: string; sources?: string[]}) =>
               fontStyle: 'italic',
             }}
           >
-            Sources: {sources.join(' · ').slice(0, 140)}
+            Sources: {sourceLabels.join(' · ')}
           </div>
         )}
       </AbsoluteFill>
