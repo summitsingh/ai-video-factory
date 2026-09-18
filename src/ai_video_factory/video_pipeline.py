@@ -1220,6 +1220,7 @@ def run_video_pipeline(
     trend_source: str = "all",
     longform: bool = False,
     target_duration_minutes: float = DEFAULT_LONGFORM_MINUTES,
+    llm_url: str = "http://localhost:1234/v1/chat/completions",
 ) -> PipelineResult:
     """Run the complete video production pipeline.
 
@@ -1440,6 +1441,7 @@ def run_video_pipeline(
                         source_url=trending_topic.url,
                         output_path=job.script_path,
                         use_local_model=True,
+                        api_url=llm_url,
                     )
                     state_store.heartbeat(script_run.run_id)
                 except Exception as error:

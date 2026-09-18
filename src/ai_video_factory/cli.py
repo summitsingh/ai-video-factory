@@ -173,6 +173,7 @@ def video_pipeline(
     longform: bool = typer.Option(False, "--longform", help="Generate a 20-30 minute documentary script (three-act structure) instead of a 90-second short"),
     duration_minutes: float = typer.Option(25.0, "--duration-minutes", help="Target runtime in minutes for --longform (20-30)"),
     json_output: bool = typer.Option(False, "--json", help="Output result as JSON"),
+    llm_url: str = typer.Option("http://localhost:1234/v1/chat/completions", "--llm-url", help="OpenAI-compatible chat completions URL for script generation (LM Studio default, or llama-server e.g. http://localhost:8080/v1/chat/completions)"),
 ) -> None:
     """Run a complete video production pipeline for a trending topic.
     
@@ -212,6 +213,7 @@ def video_pipeline(
             trend_source=trend_source,
             longform=longform,
             target_duration_minutes=duration_minutes,
+            llm_url=llm_url,
         )
         
         if json_output:

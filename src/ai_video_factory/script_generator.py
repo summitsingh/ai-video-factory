@@ -294,6 +294,7 @@ def generate_script(
     output_path: Path | None = None,
     use_local_model: bool = True,
     allow_fallback: bool = False,
+    api_url: str = "http://localhost:1234/v1/chat/completions",
 ) -> ScriptOutput:
     """Generate a video script about a trending topic.
 
@@ -319,7 +320,11 @@ def generate_script(
 
     if use_local_model:
         result = generate_script_with_lm_studio(
-            topic_title, topic_description, source_url, allow_fallback=allow_fallback
+            topic_title,
+            topic_description,
+            source_url,
+            api_url=api_url,
+            allow_fallback=allow_fallback,
         )
     else:
         result = _generate_fallback_script(topic_title, topic_description, source_url)
