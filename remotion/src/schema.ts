@@ -112,7 +112,7 @@ export const parseEditDocument = (value: unknown): EditDocument => {
   }
   assertExactKeys(
     value,
-    ['schema_version', 'width', 'height', 'fps', 'duration_frames', 'scenes', 'title', 'description', 'created_at', 'sources'],
+    ['schema_version', 'width', 'height', 'fps', 'duration_frames', 'scenes', 'title', 'description', 'created_at', 'sources', 'total_scenes'],
     'edit document',
   );
 
