@@ -238,6 +238,7 @@ def _lm_studio_chat(
     model: str = "qwen3.6-35b-a3b-udt-mtp",
     temperature: float = 0.7,
     timeout: int | None = None,
+    json_mode: bool = False,
 ) -> str:
     if timeout is None:
         # Thinking models are slow: budget a ~6 tok/s floor so a large
@@ -255,15 +256,19 @@ def _lm_studio_chat(
             )
             for m in messages
         ]
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": False,
-        }
-    ).encode("utf-8")
+    payload_dict = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.1 if json_mode else temperature,
+        "stream": False,
+    }
+    # JSON mode constrains the model to output valid JSON only.
+    # Critical for reasoning models like Bonsai that otherwise leak
+    # chain-of-thought into the response.
+    if json_mode:
+        payload_dict["response_format"] = {"type": "json_object"}
+    payload = json.dumps(payload_dict).encode("utf-8")
     request = urllib.request.Request(
         api_url,
         data=payload,

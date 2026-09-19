@@ -1429,11 +1429,10 @@ def run_video_pipeline(
                         else None
                     )
                     # Wrap _lm_studio_chat with the CLI-provided llm_url.
-                    # Use a non-Qwen model name so the Qwen-specific /no_think
-                    # prefix is not applied to non-Qwen models like Bonsai.
+                    # Bonsai is Qwen-based, so keep a Qwen model name to ensure
+                    # the /no_think prefix is applied for clean JSON output.
                     def _chat_with_url(messages, max_tokens):
-                        model_name = 'bonsai' if '8081' in llm_url else 'qwen3.6-35b-a3b-udt-mtp'
-                        return _lm_studio_chat(messages, max_tokens, api_url=llm_url, model=model_name)
+                        return _lm_studio_chat(messages, max_tokens, api_url=llm_url, json_mode=True)
                     longform_script = generate_longform_script(
                         topic=trending_topic.title,
                         description=trending_topic.description,
