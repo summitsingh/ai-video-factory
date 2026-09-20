@@ -578,82 +578,208 @@ def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None
         return True
 
 
+def _probe_chunk_streams(
+    probe_bin: str, chunk: Path
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Probe one chunk's first video and audio streams.
+
+    Returns ``(video, audio)`` dicts. ``video`` carries width/height/fps
+    (as the ffprobe ``r_frame_rate`` fraction string) and duration;
+    ``audio`` carries sample_rate/channels/duration, or is None when the
+    chunk has no audio stream. Stream durations are preferred over the
+    container duration because xfade offsets are evaluated against actual
+    frame timestamps; the container duration is only a fallback.
+    """
+    completed = subprocess.run(
+        [
+            probe_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,width,height,r_frame_rate,duration,sample_rate,channels",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(chunk),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except ValueError:
+        raise PipelineCommandError(
+            f"xfade probe failed for {chunk.name}"
+        ) from None
+    streams = payload.get("streams") or []
+    format_duration: float | None = None
+    try:
+        format_duration = float((payload.get("format") or {}).get("duration"))
+    except (TypeError, ValueError):
+        format_duration = None
+
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if video is None:
+        raise PipelineCommandError(
+            f"xfade probe found no video stream in {chunk.name}"
+        )
+
+    def _stream_duration(stream: dict[str, Any]) -> float:
+        try:
+            return float(stream.get("duration"))
+        except (TypeError, ValueError):
+            if format_duration is None:
+                raise PipelineCommandError(
+                    f"xfade duration probe failed for {chunk.name}"
+                ) from None
+            return format_duration
+
+    video_info = {
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
+        "fps": str(video.get("r_frame_rate") or "0/0"),
+        "duration": _stream_duration(video),
+    }
+    if video_info["fps"] == "0/0":
+        video_info["fps"] = "30/1"
+    audio_info: dict[str, Any] | None = None
+    if audio is not None:
+        audio_info = {
+            "sample_rate": int(audio.get("sample_rate") or 48000),
+            "channels": int(audio.get("channels") or 2),
+            "duration": _stream_duration(audio),
+        }
+    return video_info, audio_info
+
+
 def _concat_with_xfade(
     chunks: list[Path], destination: Path, ffmpeg_bin: str, xfadeseconds: float
 ) -> None:
-    """Concatenate chunks using xfade transitions between each pair."""
+    """Concatenate chunks using xfade cross-dissolves between each pair.
+
+    Every input is normalized inside the filter graph before the transitions:
+
+    * video: scaled to the first chunk's WxH, forced to its frame rate,
+      ``format=yuv420p``, and a common timebase (``settb=AVTB``). This is the
+      historical failure mode: inputs whose timebases or frame rates differ
+      (e.g. 1/15360 vs 1/12800) make xfade abort with "Error reinitializing
+      filters", which used to degrade the whole concat to hard cuts.
+    * audio: resampled to 48 kHz stereo and trimmed/padded to exactly the
+      chunk's video duration, so each acrossfade lands on the same timeline
+      as its video dissolve and A/V stay in sync across the whole concat.
+      Chunks with no audio stream get generated silence of matching duration.
+
+    Offsets are computed from probed *video stream* durations (not container
+    durations): transition ``i`` starts at ``merged_duration_so_far - d`` so
+    each dissolve overlaps the merged stream's tail with the next chunk's
+    head by exactly ``d`` seconds.
+    """
     n = len(chunks)
     if n == 1:
         # Single chunk: just copy it.
         shutil.copy2(chunks[0], destination)
         return
 
-    # Probe durations to compute correct xfade offsets.
-    import subprocess
-
     probe_bin = _resolve_ffprobe(ffmpeg_bin)
-    durations = []
+    videos: list[dict[str, Any]] = []
+    audios: list[dict[str, Any] | None] = []
     for chunk in chunks:
-        probe = subprocess.run(
-            [
-                probe_bin,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(chunk),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        try:
-            durations.append(float(probe.stdout.strip()))
-        except (ValueError, AttributeError):
-            # Probe failed: fall back to stream-copy concat.
-            raise PipelineCommandError("xfade duration probe failed") from None
+        video, audio = _probe_chunk_streams(probe_bin, chunk)
+        videos.append(video)
+        audios.append(audio)
 
-    # Build the xfade filter chain. Each transition overlaps the tail of one
-    # chunk with the head of the next by xfadeseconds seconds.
-    inputs = []
+    durations = [float(v["duration"]) for v in videos]
+    if any(d <= 0 for d in durations):
+        raise PipelineCommandError("xfade duration probe failed")
+
+    # The transition must be strictly shorter than the shortest chunk or
+    # xfade/acrossfade reject it; clamp defensively instead of failing.
+    d = float(xfadeseconds)
+    if not d > 0:
+        raise PipelineCommandError("xfade transition duration must be positive")
+    min_duration = min(durations)
+    if d >= min_duration:
+        d = min_duration / 2.0
+        print(
+            f"WARNING: xfade transition clamped to {d:.3f}s "
+            f"(shortest chunk is {min_duration:.3f}s)",
+            file=sys.stderr,
+        )
+
+    target_w = int(videos[0]["width"] or 1280)
+    target_h = int(videos[0]["height"] or 720)
+    target_fps = str(videos[0]["fps"])
+
+    # Build inputs. Chunks missing an audio stream get a generated silence
+    # input so the acrossfade chain always has two audio sources per link.
+    inputs: list[str] = []
+    audio_input_index: list[int] = []
     for i, chunk in enumerate(chunks):
         inputs += ["-i", str(chunk)]
+        audio_input_index.append(i)
+    next_input = n
+    for i, (video, audio) in enumerate(zip(videos, audios)):
+        if audio is None:
+            inputs += [
+                "-f",
+                "lavfi",
+                "-i",
+                f"anullsrc=r=48000:cl=stereo:d={float(video['duration']):.3f}",
+            ]
+            audio_input_index[i] = next_input
+            next_input += 1
 
-    filters = ""
-    prev_label = "0:v"  # first input video, referenced without extra brackets
-    # acc tracks the accumulated duration of the merged stream so far. The
-    # first chunk contributes durations[0]; each transition overlaps by
-    # xfadeseconds, so transition i's offset is (acc - xfadeseconds) and the
-    # new accumulated duration becomes acc + durations[i] - xfadeseconds.
-    acc = durations[0]
-    for i in range(1, n):
-        offset = acc - xfadeseconds
-        filters += (
-            f"[{prev_label}][{i}:v]xfade=transition=dissolve:duration={xfadeseconds}"
-            f":offset={offset}[v{i}];"
+    filters: list[str] = []
+    # Normalize video: same size, frame rate, pixel format, and timebase.
+    for i in range(n):
+        filters.append(
+            f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=disable,"
+            f"setsar=1,fps={target_fps},format=yuv420p,settb=AVTB[vn{i}]"
         )
-        prev_label = f"v{i}"  # store label without brackets for next wrap
-        acc = acc + durations[i] - xfadeseconds
+    # Normalize audio: 48 kHz stereo, exactly the video chunk's duration.
+    for i in range(n):
+        ai = audio_input_index[i]
+        vdur = float(videos[i]["duration"])
+        filters.append(
+            f"[{ai}:a]aresample=48000,atrim=start=0:duration={vdur:.6f},"
+            f"apad=whole_dur={vdur:.6f},"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[an{i}]"
+        )
 
-    # Audio xfade: chain acrossfade filters, each taking exactly two inputs.
-    filters += "[0:a][1:a]acrossfade=d={xfadeseconds}[a1];".format(xfadeseconds=xfadeseconds)
-    for i in range(2, n):
-        filters += f"[a{i-1}][{i}:a]acrossfade=d={xfadeseconds}[a{i}];"
+    # Video dissolves. Transition i overlaps the merged stream's tail with
+    # chunk i's head by d seconds: offset = merged_duration_so_far - d, and
+    # the merged duration grows by durations[i] - d.
+    prev = "vn0"
+    merged = durations[0]
+    for i in range(1, n):
+        offset = merged - d
+        filters.append(
+            f"[{prev}][vn{i}]xfade=transition=dissolve:duration={d:.6f}"
+            f":offset={offset:.6f}[vx{i}]"
+        )
+        prev = f"vx{i}"
+        merged += durations[i] - d
 
-    # Map video and audio outputs.
+    # Audio crossfades, chained pairwise like the video dissolves.
+    prev_a = "an0"
+    for i in range(1, n):
+        filters.append(f"[{prev_a}][an{i}]acrossfade=d={d:.6f}[ax{i}]")
+        prev_a = f"ax{i}"
+
     argv = [
         ffmpeg_bin,
         "-y",
         *inputs,
         "-filter_complex",
-        filters,
+        ";".join(filters),
         "-map",
-        f"[{prev_label}]",
+        f"[{prev}]",
         "-map",
-        f"[a{n-1}]",
+        f"[{prev_a}]",
         "-c:v",
         "libx264",
         "-preset",
