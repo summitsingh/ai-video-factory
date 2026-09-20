@@ -431,6 +431,7 @@ const SceneCard = ({
   isLast,
   sources,
   overlay,
+  karaokeCaptions,
 }: {
   scene: EditScene;
   index: number;
@@ -438,6 +439,7 @@ const SceneCard = ({
   isLast: boolean;
   sources?: string[];
   overlay?: boolean;
+  karaokeCaptions?: boolean;
 }) => {
   const frame = useCurrentFrame();
   const {height} = useVideoConfig();
@@ -540,12 +542,15 @@ const SceneCard = ({
             accentColor={scene.accent_color}
           />
         )}
-        {/* Burned-in subtitle (#1): legible caption anchored to the lower area */}
-        {scene.subtitle ? (
-          <Subtitle text={scene.subtitle} />
-        ) : scene.caption ? (
-          <Subtitle text={scene.caption} />
-        ) : null}
+        {/* Burned-in subtitle (#1): legible caption anchored to the lower area.
+            Suppressed when karaoke word-highlight captions are burned onto the
+            final master instead (#9). */}
+        {!karaokeCaptions &&
+          (scene.subtitle ? (
+            <Subtitle text={scene.subtitle} />
+          ) : scene.caption ? (
+            <Subtitle text={scene.caption} />
+          ) : null)}
         {/* Motion graphics: keyword-driven overlays (timeline/data/label) */}
         <MotionGraphics text={`${scene.narration || ''} ${scene.caption || ''} ${scene.title || ''}`} />
         {/* Data visualization (#7): animated bars for detected statistics */}
@@ -1236,7 +1241,7 @@ const ActCard = ({act, accentColor}: {act: string; accentColor?: string}) => {
   );
 };
 
-export const SyntheticVideo = ({scenes, sources, total_scenes, scene_start_index}: EditDocument) => {
+export const SyntheticVideo = ({scenes, sources, total_scenes, scene_start_index, karaoke_captions}: EditDocument) => {
   const fullTotal = total_scenes ?? scenes.length;
   const startIdx = scene_start_index ?? 0;
   return (
@@ -1251,6 +1256,7 @@ export const SyntheticVideo = ({scenes, sources, total_scenes, scene_start_index
           <SceneCard
             index={startIdx + index}
             isLast={startIdx + index === fullTotal - 1}
+            karaokeCaptions={karaoke_captions}
             scene={scene}
             sources={sources}
             total={fullTotal}
@@ -1274,6 +1280,7 @@ export const SyntheticVideo = ({scenes, sources, total_scenes, scene_start_index
           <SceneCard
             index={startIdx + index + 1}
             isLast={startIdx + index === fullTotal - 2}
+            karaokeCaptions={karaoke_captions}
             scene={scenes[index + 1]}
             sources={sources}
             total={fullTotal}

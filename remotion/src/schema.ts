@@ -31,6 +31,10 @@ export type EditDocument = {
   sources?: string[];
   total_scenes?: number;
   scene_start_index?: number;
+  // Styled captions (#9): when true, the render suppresses its plain
+  // burned-in subtitles because karaoke word-highlight captions are
+  // burned onto the final master instead.
+  karaoke_captions?: boolean;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
@@ -135,6 +139,7 @@ export const parseEditDocument = (value: unknown): EditDocument => {
     description: typeof value.description === 'string' ? value.description : undefined,
     created_at: typeof value.created_at === 'string' ? value.created_at : undefined,
     sources: Array.isArray(value.sources) ? value.sources as string[] : undefined,
+    karaoke_captions: value.karaoke_captions === true ? true : undefined,
   };
   const ids = new Set<string>();
 
