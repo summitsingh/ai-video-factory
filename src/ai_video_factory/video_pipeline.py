@@ -38,6 +38,7 @@ from ai_video_factory.narration import (
     trim_audio_start,
 )
 from ai_video_factory.qc import QcReport, evaluate_content_qc, evaluate_qc, write_qc_reports
+from ai_video_factory.qc_final import run_final_qc
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
@@ -2346,6 +2347,28 @@ def run_video_pipeline(
                     if key != "status"
                 },
             )
+
+            # Final render QC gate: hard-fail checks on the polished master
+            # (black frames, digital silence, audio peak, resolution,
+            # duration). Any failure flips the run status to "fail".
+            final_qc = run_final_qc(
+                job.master_path,
+                target_width=edit_doc_render.width,
+                target_height=edit_doc_render.height,
+                target_duration_seconds=(
+                    edit_doc_render.duration_frames / edit_doc_render.fps
+                ),
+                ffmpeg=str(_required_tool(tools, "ffmpeg")),
+                report_path=job.master_path.parent / "qc-report.json",
+            )
+            artifacts["qc_final_report"] = str(final_qc.report_path)
+            metadata["qc_final_status"] = final_qc.status
+            metadata["qc_final_checks"] = [
+                {"name": check.name, "passed": check.passed, "detail": check.detail}
+                for check in final_qc.checks
+            ]
+            if not final_qc.passed:
+                status = "fail"
 
         metadata["qc_status"] = "complete"
         metadata["qc_results"] = artifacts.get("qc_report", "not_found")
