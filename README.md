@@ -30,6 +30,16 @@ Give it a topic, get back a finished video package:
 9. **Packaging** - AI-picked thumbnail with title text, and YouTube
    metadata (titles, hook-first description, chapters, tags, sources).
 
+## Demo
+
+A 47-second excerpt from a real 90-second pipeline run (topic: "Europa's Hidden Ocean").
+Everything below was produced by the pipeline: researched script, stock footage,
+local TTS narration, music bed, karaoke captions, FFmpeg assembly.
+
+https://github.com/summitsingh/ai-video-factory/raw/main/assets/demo.mp4
+
+<video src="assets/demo.mp4" width="100%" controls></video>
+
 ## Quickstart
 
 Prerequisites: Python 3.12, [uv](https://docs.astral.sh/uv/), FFmpeg with
