@@ -13,3 +13,8 @@ output/
 logs/
 data/projects/
 data/system/
+
+# item11 LTX-2 backend (large, machine-local)
+.venv-ltx2/
+*-install.log
+model-download.log
