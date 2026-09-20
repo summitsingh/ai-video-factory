@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -393,6 +394,105 @@ def _ensure_clip_ready(src: Path, dst: Path, *, max_bytes: int = 80_000_000) -> 
     except (OSError, subprocess.TimeoutExpired):
         # Fall back to a verbatim copy so we never lose the asset entirely.
         shutil.copy2(src, dst)
+
+
+log = logging.getLogger(__name__)
+
+_DOTENV_LOADED = False
+
+
+def _load_repo_dotenv() -> None:
+    """Load KEY=VALUE pairs from the repo-root ``.env`` into ``os.environ``.
+
+    The stock-footage providers read ``PEXELS_API_KEY`` / ``PIXABAY_API_KEY``
+    from the environment, but the pipeline never loaded the repo ``.env``
+    before. Do it here with the stdlib only (python-dotenv is not a
+    dependency). Existing environment variables always win; the file is read
+    at most once per process.
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    env_path = Path(__file__).resolve().parents[2] / '.env'
+    try:
+        raw = env_path.read_text(encoding='utf-8')
+    except OSError:
+        return
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, _, value = line.partition('=')
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        if (
+            key
+            and key not in os.environ
+            and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)
+        ):
+            os.environ[key] = value
+
+
+def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
+    """Fetch one stock-footage clip per scene that still has no clip.
+
+    Step 4.4a of the visual stage: after the NASA pass, try the free stock
+    providers (Pexels -> Pixabay -> NASA) for every normal content scene
+    whose ``scene-NN/`` dir has no ``*clip*.mp4`` yet. A successful fetch is
+    copied into the scene dir as ``stock-clip.mp4`` so the existing
+    ``attach_scene_assets`` / QC / AI-visual fallbacks pick it up unchanged.
+
+    Returns the StockAsset records (with ``path`` rewritten to the per-scene
+    copy) so the caller can append them to the run attribution log.
+    Providers without API keys are skipped; a total miss returns an empty
+    list and the pipeline behaves exactly as before.
+    """
+    _load_repo_dotenv()
+    from ai_video_factory.stock_providers import StockFootageProvider
+
+    provider = StockFootageProvider()
+    assets: list = []
+    fps = edit.fps if edit.fps else 24
+    for scene in edit.scenes:
+        if not str(scene.id).startswith('scene-'):
+            continue
+        try:
+            idx = int(str(scene.id).split('-', 1)[1])
+        except ValueError:
+            continue
+        scene_dir = assets_dir / f'scene-{idx:02d}'
+        if scene_dir.is_dir() and next(scene_dir.glob('*clip*.mp4'), None):
+            # Already has a clip (e.g. from the NASA pass); stock footage is
+            # the fallback, never the override.
+            continue
+        description = (
+            getattr(scene, 'visual_direction', None)
+            or scene.visual
+            or scene.title
+        )
+        try:
+            asset = provider.fetch_clip(
+                description,
+                min_duration_sec=max(1.0, scene.duration_frames / fps),
+            )
+        except Exception as error:  # noqa: BLE001 - per-scene miss, not fatal
+            log.debug(
+                'stock fetch failed for %s: %s',
+                scene.id, sanitize_diagnostic(error),
+            )
+            continue
+        if asset is None:
+            continue
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        dst = scene_dir / 'stock-clip.mp4'
+        shutil.copy2(asset.path, dst)
+        asset.path = str(dst)
+        assets.append(asset)
+        log.info('stock clip for %s -> %s', scene.id, asset.title)
+    return assets
 
 
 def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocument:
@@ -1702,6 +1802,24 @@ def run_video_pipeline(
             except Exception as error:  # noqa: BLE001 - best-effort; keep title cards on failure
                 metadata["nasa_assets"] = {"error": sanitize_diagnostic(error)}
                 assets_dir_used = None
+        # Step 4.4a: Stock footage (Pexels / Pixabay / NASA, free tiers).
+        # For scenes still without a clip after the NASA pass, fetch one
+        # real stock clip per scene; copy it into the scene's assets dir and
+        # log attribution. Scenes with no stock match fall through to the
+        # existing attach / QC / AI-visual fallbacks unchanged.
+        if assets_dir_used is not None:
+            try:
+                from ai_video_factory.stock_media import write_attribution_log
+
+                stock_assets = _populate_stock_clips(edit_doc, Path(assets_dir_used))
+                metadata['stock_clips'] = len(stock_assets)
+                if stock_assets:
+                    attribution_path = write_attribution_log(
+                        stock_assets, job_dir / 'attribution.json'
+                    )
+                    artifacts['attribution'] = str(attribution_path)
+            except Exception as error:  # noqa: BLE001 - best-effort; fallbacks unchanged
+                metadata['stock_clips'] = {'error': sanitize_diagnostic(error)}
         if assets_dir_used is not None:
             edit_doc = attach_scene_assets(edit_doc, assets_dir_used)
             save_edit(edit_doc, job.edit_path)
