@@ -60,18 +60,19 @@ def _load_font_bold(size: int) -> Any:
     return _load_font(size)
 
 
-def _truncate_text(text: str, max_chars: int = 6) -> str:
+def _truncate_text(text: str, max_words: int = 6) -> str:
     """YouTube thumbnails read best with very short copy.
 
-    Collapse whitespace and cap the length so text stays large and legible.
+    Collapse whitespace and cap the word count so text stays large and
+    legible. An ellipsis is only appended when words were actually cut;
+    short hooks pass through untouched (a previous char-length check
+    wrongly appended "…" to hooks like "BEYOND EARTH").
     """
     collapsed = re.sub(r"\s+", " ", text).strip()
-    if len(collapsed) <= max_chars:
-        return collapsed.upper()
-    # Prefer word-boundary truncation, then hard-cut as a last resort.
     words = collapsed.split(" ")
-    truncated = " ".join(words[:max_chars])
-    return (truncated + "…").upper() if len(collapsed) > max_chars else collapsed.upper()
+    if len(words) <= max_words:
+        return collapsed.upper()
+    return (" ".join(words[:max_words]) + "…").upper()
 
 
 def _generate_hook(
@@ -217,15 +218,67 @@ def _score_visual_richness(frame_path: Path) -> float:
         return 0.0
 
 
+def _score_brightness(frame_path: Path) -> float:
+    """Score a frame for overall brightness (mean luminance), 0.0 to 1.0.
+
+    Thumbnails need to pop at feed size; very dark frames disappear, so
+    brightness is a positive signal (kept in check by the other scorers).
+    """
+    try:
+        from PIL import Image as _Image
+
+        import statistics
+
+        gray = _Image.open(frame_path).convert("L").resize((120, 68))
+        mean = statistics.fmean(gray.tobytes())
+        return max(0.0, min(1.0, mean / 255.0))
+    except Exception:
+        return 0.5
+
+
+def _score_contrast(frame_path: Path) -> float:
+    """Score a frame for tonal contrast (luminance std-dev), 0.0 to 1.0.
+
+    High-contrast frames read as more striking at thumbnail size.
+    """
+    try:
+        from PIL import Image as _Image
+
+        import statistics
+
+        gray = _Image.open(frame_path).convert("L").resize((120, 68))
+        stdev = statistics.pstdev(gray.tobytes())
+        # A std-dev of ~64 is already very punchy; normalize against that.
+        return max(0.0, min(1.0, stdev / 64.0))
+    except Exception:
+        return 0.5
+
+
+def _score_frame(frame_path: Path) -> float:
+    """Combined frame-selection score: vivid + bright + contrasty + clean.
+
+    Visual richness stays the strongest signal (the most reliable
+    "interesting" cue); brightness and contrast pick frames that pop at
+    small sizes; cleanliness steers away from frames with burned-in
+    caption text so the headline has a calm stage.
+    """
+    return (
+        0.40 * _score_visual_richness(frame_path)
+        + 0.20 * _score_brightness(frame_path)
+        + 0.20 * _score_contrast(frame_path)
+        + 0.20 * _score_cleanliness(frame_path)
+    )
+
+
 def _extract_iconic_frame(
     master: Path, frame_path: Path, *, fps: int = 30
 ) -> bool:
     """Extract the most visually rich frame from ``master``.
 
-    ffmpeg extracts one frame every ~2 seconds across the whole video (avoiding
-    intro/outro title cards by starting a few seconds in); we then score each
-    candidate for visual richness (color variety + saturation) and pick the most
-    vivid one, so the thumbnail background looks interesting rather than flat.
+    ffmpeg extracts one frame every ~2 seconds across the whole video; we then
+    score each candidate with :func:`_score_frame` (visual richness +
+    brightness + contrast + freedom from burned-in text) and pick the most
+    striking one, so the thumbnail background pops at feed size.
 
     For content that is entirely dark slides with burned-in text there may be no
     "clean" frame to find, so we optimize for vividness instead and rely on a
@@ -253,7 +306,7 @@ def _extract_iconic_frame(
         if not candidates:
             return False
         # Pick the most visually rich candidate.
-        best = max(candidates, key=_score_visual_richness)
+        best = max(candidates, key=_score_frame)
         shutil.copyfile(best, frame_path)
         return True
     except Exception:
@@ -388,7 +441,7 @@ def _composite_title(
     draw = ImageDraw.Draw(frame)
     width, height = frame.size
 
-    hook = _truncate_text(title, max_chars=6)
+    hook = _truncate_text(title, max_words=6)
     if not hook:
         return frame
 
@@ -430,6 +483,7 @@ def build_thumbnails(
     target_size: tuple[int, int] = (1280, 720),
     power_words: set[str] | list[str] | None = None,
     text_overlays: list[str] | None = None,
+    primary_copy: Path | None = None,
 ) -> dict[str, Path]:
     """Generate ``count`` thumbnail variants from ``master``.
 
@@ -438,7 +492,10 @@ def build_thumbnails(
     to ``target_size`` (default YouTube 16:9, 1280x720). ``power_words``
     overrides the default hook vocabulary for per-topic theming. ``text_overlays``
     optionally supplies per-variant overlay copy (e.g. from packaging briefs);
-    when provided it replaces the auto-generated hook.
+    when provided it replaces the auto-generated hook. ``primary_copy``, when
+    given, also writes the canonical primary thumbnail (white bold type with
+    black stroke/shadow, lower-third placement) to that path - the pipeline
+    uses it for the run's ``thumbnail.jpg``.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -488,6 +545,26 @@ def build_thumbnails(
         out_path = output_dir / f"thumbnail-{i + 1}.jpg"
         variant.save(out_path, quality=92)
         thumbnails[f"thumbnail_{i + 1}"] = out_path
+
+    # Primary thumbnail: the canonical 1280x720 thumbnail.jpg every video
+    # run must produce. Same striking base frame as the variants, but with
+    # white bold type (black stroke + drop shadow) in the lower third - the
+    # highest-contrast, most literal reading of the YouTube thumbnail spec.
+    if primary_copy is not None:
+        primary_overlay = hook
+        if text_overlays and text_overlays[0].strip():
+            primary_overlay = text_overlays[0].strip()
+        primary_path = Path(primary_copy)
+        primary_path.parent.mkdir(parents=True, exist_ok=True)
+        primary = _composite_title(
+            _apply_scrim(_normalize_frame(base, target_size), strength=0.55),
+            primary_overlay,
+            accent="#ffffff",
+            placement="bottom",
+            target_size=target_size,
+        )
+        primary.save(primary_path, quality=92)
+        thumbnails["thumbnail"] = primary_path
 
     # Write a small manifest describing the variants.
     manifest_path = output_dir / "thumbnails.json"

@@ -2147,7 +2147,11 @@ def run_video_pipeline(
                 count=3,
                 power_words=theme.thumbnail_power_words,
                 text_overlays=overlays,
+                # Every video run must produce a canonical 1280x720
+                # thumbnail.jpg in the run's output dir (#6).
+                primary_copy=output_dir / "thumbnail.jpg",
             )
+            artifacts["thumbnail"] = str(thumb_artifacts["thumbnail"])
             artifacts["thumbnail_1"] = str(thumb_artifacts["thumbnail_1"])
             artifacts["thumbnail_2"] = str(thumb_artifacts["thumbnail_2"])
             artifacts["thumbnail_3"] = str(thumb_artifacts["thumbnail_3"])
