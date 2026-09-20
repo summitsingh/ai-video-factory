@@ -90,7 +90,7 @@ gpu = "max"
 parallel = 1
 ttl_seconds = 3600
 minimum_available_memory_gib = 40
-models_directory = "/home/summit/.lmstudio/models"
+models_directory = "~/.lmstudio/models"
 ```
 
 Implement `InferenceConfig` with `ConfigDict(strict=True, extra="forbid")`,

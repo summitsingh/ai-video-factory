@@ -9,5 +9,7 @@ gpu = "max"
 parallel = 1
 ttl_seconds = 3600
 minimum_available_memory_gib = 40
-models_directory = "/home/summit/.lmstudio/models"
-server_config_path = "/home/summit/.lmstudio/.internal/http-server-config.json"
+# Example LM Studio install paths; edit to match your machine. A leading ~
+# is expanded to your home directory by the config loader.
+models_directory = "~/.lmstudio/models"
+server_config_path = "~/.lmstudio/.internal/http-server-config.json"

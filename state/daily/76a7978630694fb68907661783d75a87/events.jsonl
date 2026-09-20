@@ -1,3 +1,0 @@
-{"timestamp":"2026-09-14T21:51:28.759706+00:00","run_id":"76a7978630694fb68907661783d75a87","stage":"daily","event":"run_started","fields":{"status":"running"}}
-{"timestamp":"2026-09-14T21:52:25.538092+00:00","run_id":"76a7978630694fb68907661783d75a87","stage":"daily","event":"run_failed","fields":{"error":"no verified facts available to build a candidate"}}
-{"timestamp":"2026-09-14T21:52:25.538196+00:00","run_id":"76a7978630694fb68907661783d75a87","stage":"daily","event":"run_failed","fields":{"reason":"no verified facts available to build a candidate"}}

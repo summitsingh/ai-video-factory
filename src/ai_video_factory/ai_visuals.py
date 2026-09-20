@@ -34,11 +34,9 @@ HEIGHT = 720
 
 # Diffusion unlock: SDXL-Turbo, few-step model that fits an iGPU.
 DIFFUSION_MODEL_ID = "stabilityai/sdxl-turbo"
+_REPO_ROOT = Path(__file__).resolve().parents[2]  # src/ai_video_factory/ -> repo root
 DIFFUSION_MODEL_DIR = Path(
-    os.environ.get(
-        "AI_VISUALS_MODEL_DIR",
-        "/home/summit/ai-video-factory/models/sdxl-turbo",
-    )
+    os.environ.get("AI_VISUALS_MODEL_DIR", _REPO_ROOT / "models" / "sdxl-turbo")
 )
 
 _THEMES: dict[str, dict] = {

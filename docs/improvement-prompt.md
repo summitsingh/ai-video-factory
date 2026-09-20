@@ -7,7 +7,7 @@ video generation workflow toward production-grade YouTube documentaries.
 
 **ITERATIVE IMPROVEMENT PROMPT FOR AI VIDEO FACTORY**
 
-Context: This is an AI Video Factory repo at /home/summit/ai-video-factory. It
+Context: This is an AI Video Factory repo at ~/ai-video-factory. It
 generates local YouTube documentaries using Remotion (compositions in
 remotion/src/SyntheticVideo.tsx), FFmpeg, a Python pipeline
 (src/ai_video_factory/video_pipeline.py), Piper TTS for narration, and stock

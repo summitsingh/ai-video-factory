@@ -62,6 +62,9 @@ class InferenceConfig(BaseModel):
             or "#" in self.base_url
         ):
             raise ValueError("base_url must be http://127.0.0.1:1234/v1 without credentials")
+        # A leading ~ is expanded so example configs stay portable.
+        self.models_directory = str(Path(self.models_directory).expanduser())
+        self.server_config_path = str(Path(self.server_config_path).expanduser())
         if not Path(self.models_directory).is_absolute():
             raise ValueError("models_directory must be absolute")
         if not Path(self.server_config_path).is_absolute():

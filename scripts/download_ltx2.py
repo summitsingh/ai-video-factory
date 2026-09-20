@@ -19,10 +19,13 @@ Usage:  python scripts/download_ltx2.py
 Env:    LTX2_MODEL_DIR overrides the default target dir.
 """
 import os
+from pathlib import Path
+
 from huggingface_hub import snapshot_download
 
 MODEL_DIR = os.environ.get(
-    "LTX2_MODEL_DIR", "/home/summit/avf-work/item11-ltx2/models/LTX-2"
+    "LTX2_MODEL_DIR",
+    str(Path(__file__).resolve().parents[1] / "models" / "LTX-2"),
 )
 
 d = snapshot_download(

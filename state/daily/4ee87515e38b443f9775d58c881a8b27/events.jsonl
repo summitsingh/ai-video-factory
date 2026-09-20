@@ -1,3 +1,0 @@
-{"timestamp":"2026-09-11T16:58:52.418602+00:00","run_id":"4ee87515e38b443f9775d58c881a8b27","stage":"daily","event":"run_started","fields":{"status":"running"}}
-{"timestamp":"2026-09-11T16:59:40.397670+00:00","run_id":"4ee87515e38b443f9775d58c881a8b27","stage":"daily","event":"run_failed","fields":{"error":"research failed: production extractor produced a malformed output line; refusing to promote non-conforming output as verified facts"}}
-{"timestamp":"2026-09-11T16:59:40.397917+00:00","run_id":"4ee87515e38b443f9775d58c881a8b27","stage":"daily","event":"run_failed","fields":{"reason":"research failed: production extractor produced a malformed output line; refusing to promote non-conforming output as verified facts"}}

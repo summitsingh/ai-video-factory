@@ -1,3 +1,0 @@
-{"timestamp":"2026-09-14T22:16:57.739075+00:00","run_id":"ee69db9d86814dbeb93cae57c8c860dd","stage":"daily","event":"run_started","fields":{"status":"running"}}
-{"timestamp":"2026-09-14T22:20:40.871609+00:00","run_id":"ee69db9d86814dbeb93cae57c8c860dd","stage":"daily","event":"run_failed","fields":{"error":"measured runtime 1329s exceeds the 1200s maximum"}}
-{"timestamp":"2026-09-14T22:20:40.872726+00:00","run_id":"ee69db9d86814dbeb93cae57c8c860dd","stage":"daily","event":"run_failed","fields":{"reason":"measured runtime 1329s exceeds the 1200s maximum"}}

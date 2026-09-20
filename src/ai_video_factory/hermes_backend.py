@@ -22,7 +22,10 @@ from ai_video_factory.sanitization import sanitize_diagnostic
 
 _COMMAND_TIMEOUT_SECONDS = 15.0
 _MAX_OUTPUT_BYTES = 64 * 1024
-HERMES_EXECUTABLE_PATH = "/home/summit/.local/bin/hermes"
+HERMES_EXECUTABLE_PATH = os.environ.get(
+    "HERMES_EXECUTABLE_PATH",
+    shutil.which("hermes") or str(Path.home() / ".local" / "bin" / "hermes"),
+)
 _HERMES_PATH = Path(HERMES_EXECUTABLE_PATH)
 _VERSION = re.compile(
     r"^Hermes Agent v(?P<version>\d+\.\d+\.\d+) \([^\n]+\) · upstream "

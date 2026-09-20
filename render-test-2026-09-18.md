@@ -1,10 +1,10 @@
-# Workstation render test, 2026-09-18 (summit-amd)
+# Workstation render test, 2026-09-18 (reference workstation)
 
 ## Verdict: smoke test FAILED deterministically at script generation. Long-form NOT attempted (gated on smoke pass, correctly).
 
 ## Failure
 - Command: `python -m ai_video_factory.cli video-pipeline "The Fermi Paradox" --duration 90 --output data/projects/smoke-fermi --json`
-- Run dir: `/home/summit/ai-video-factory/data/projects/the-fermi-paradox/runs/00ef0bf281314ed98f4741999797b9c5/` (research.json only, no script.json)
+- Run dir: `~/ai-video-factory/data/projects/the-fermi-paradox/runs/00ef0bf281314ed98f4741999797b9c5/` (research.json only, no script.json)
 - Error: `ScriptGenerationError: model output contained no JSON object` (fail-loud worked, no placeholder video)
 - Root cause: loaded LM Studio model `tiel-coder-35b-a3b-mtp` is a reasoning model. With the full script prompt at max_tokens=2048 it burns the budget in `reasoning_content` and hits `finish_reason=length` with empty/brace-free `message.content`. Pipeline reads only `message.content` (`script_generator.py:157`, `longform.py:218`).
 - Reproduced 2x independently (full CLI run + direct `generate_script_with_lm_studio` call). With a simplified prompt the model emitted valid JSON start (`{"title": "Where Is Everybody? The Fermi Paradox Explained"...}`) but still truncated at 2048 tokens.
@@ -21,8 +21,8 @@
 - Fail-loud contract: run marked failed, no silent fallback.
 
 ## Environment fixes (no pipeline code touched)
-- `/home/summit/run-smoke.sh`: removed `set -u` (silently killed nvm, the real cause of earlier instant exits); added `PYTHONUNBUFFERED=1`.
-- Runner: `/home/summit/run-smoke.sh`; log: `/home/summit/smoke-fermi.log`.
+- `~/run-smoke.sh`: removed `set -u` (silently killed nvm, the real cause of earlier instant exits); added `PYTHONUNBUFFERED=1`.
+- Runner: `~/run-smoke.sh`; log: `~/smoke-fermi.log`.
 
 ## LM Studio model inventory (remote)
 - Loaded: `tiel-coder-35b-a3b-mtp` (reasoning model, the problem).

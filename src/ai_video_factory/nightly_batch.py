@@ -1,6 +1,6 @@
 """Overnight batch: research topics, render drafts, fill a morning review queue.
 
-Runs unattended on summit-amd: picks fresh trending topics, generates one
+Runs unattended overnight: picks fresh trending topics, generates one
 script per topic, renders DRAFT masters only, and files everything in
 ``data/review_queue/<date>/queue.json`` for human approval. Nothing here
 publishes or uploads.

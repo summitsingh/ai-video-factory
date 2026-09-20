@@ -1,107 +1,129 @@
 # AI Video Factory
 
-Phase 1 is a local-only, deterministic synthetic-video workflow. Phase 2A adds
-a controlled LM Studio boundary for one already-installed Qwen model. Neither
-workflow downloads models or media, accesses credentials, publishes content,
-installs system software, changes runtimes, or changes device drivers.
+Turn a topic into a long-form, documentary-style video: researched and
+citation-verified script, storyboard, visuals, voiceover, topic-matched music,
+karaoke captions, transitions, QC, thumbnail, and YouTube metadata. Built for
+20-30 minute videos, running on your own machine.
 
-## Clean-checkout bootstrap
+## What it does
 
-Prerequisites are Python 3.12 through `uv`, Node 22 with npm, FFmpeg/ffprobe,
-and an already-installed Chrome or Chromium executable. From the repository
-root:
+Give it a topic, get back a finished video package:
 
-```sh
-uv sync --dev --locked
-cd remotion
-npm ci
-cd ..
-export REMOTION_CHROME_EXECUTABLE=/absolute/path/to/google-chrome
-```
+1. **Research** - gathers sources for the topic and verifies every citation
+   URL actually resolves (HTTP 200), failing loudly on placeholders.
+2. **Script** - generates a multi-beat documentary script with a cold-open
+   hook, then enforces the target duration (extends underweight beats,
+   ~150 wpm) so a 25-minute target really is 25 minutes.
+3. **Visuals** - per-scene routing: stock footage (Pexels, Pixabay, NASA),
+   local LTX-2 AI hero clips for impossible shots, cinematic AI stills,
+   procedural fallbacks. Real footage is preferred over synthetic.
+4. **Voiceover** - full narration via local TTS.
+5. **Music** - a topic-matched ambient bed (cosmic, mystery, epic, calm,
+   tech) fetched from royalty-free sources, ducked under narration and
+   loudness-normalized.
+6. **Captions** - karaoke-style word-highlight captions burned in, plus
+   SRT/VTT exports for YouTube.
+7. **Assembly** - FFmpeg xfade dissolves between scenes, final mix at
+   -16 LUFS.
+8. **QC gate** - automated checks fail the run on dark frames, digital
+   silence, low audio, wrong resolution, or runtime drift.
+9. **Packaging** - AI-picked thumbnail with title text, and YouTube
+   metadata (titles, hook-first description, chapters, tags, sources).
 
-`uv sync` and `npm ci` may contact their package registries on a new machine;
-they do not download models, media, or a browser. If the browser is discoverable
-as `google-chrome`, `google-chrome-stable`, `chromium`, or `chromium-browser`,
-the environment variable may be omitted. Run all commands below from the
-repository root and keep any `.env` local and untracked.
+## Quickstart
 
-## Operator commands
-
-```sh
-uv run ai-video-factory doctor
-uv run ai-video-factory benchmark
-uv run ai-video-factory test-pipeline --json
-```
-
-The test pipeline renders the checked-in 1280x720, 30 fps fixture with
-Remotion, muxes a silent 48 kHz stereo AAC track, runs ffprobe plus a complete
-FFmpeg decode, and writes the resulting MP4 and QC reports beneath
-`data/projects/synthetic/runs/`. Generated run data is intentionally ignored
-by Git. Completed stages are reused only after their input/tool fingerprints
-and recorded artifact digests still match.
-
-The `doctor` command emits the current JSON machine report. The checked-in
-`system_report.md` is the separate human-readable bootstrap audit; `doctor`
-does not rewrite it.
-
-## Local inference lifecycle
-
-Run the following commands separately and in order from the repository root.
-Record the loaded identifiers from both `lms ps --json` calls and require the
-unrelated before and after sets to match exactly.
+Prerequisites: Python 3.12, [uv](https://docs.astral.sh/uv/), FFmpeg with
+ffprobe, and an OpenAI-compatible chat completions endpoint for script
+writing (LM Studio locally, llama-server, or any hosted API).
 
 ```sh
-uv run ai-video-factory inference doctor
-uv run ai-video-factory inference estimate
-lms ps --json
-uv run ai-video-factory inference start
-uv run ai-video-factory inference status
-uv run ai-video-factory inference benchmark
-uv run ai-video-factory doctor
-uv run ai-video-factory benchmark
-uv run ai-video-factory test-pipeline --json
-uv run ai-video-factory inference stop
-uv run ai-video-factory inference status
-lms ps --json
+git clone https://github.com/summitsingh/ai-video-factory.git
+cd ai-video-factory
+uv sync
+cp .env.example .env   # add free Pexels/Pixabay API keys if you want stock footage
 ```
 
-Every `inference` command emits exactly one versioned JSON document. A passing
-result exits `0`; `fail` and `not_ready` both exit `2`. The final inference
-status is therefore expected to exit `2` with a sanitized `not_ready` document
-after a successful stop confirms that the configured model is absent.
+Run a long-form video (25 minutes, science documentary format):
 
-`inference doctor`, `status`, and both `lms ps` calls are read-only.
-`inference estimate` uses LM Studio's estimate-only mode and applies the 40 GiB
-available-memory gate without loading a model. `inference start` may start only
-the `127.0.0.1:1234` server and loads only the existing Qwen model as
-`avf-qwen36-executor`. `inference benchmark` makes three loopback requests and
-may read/hash the existing model for provenance; it writes only ignored report
-and run-state data beneath `data/`. The generated primary-model digest cache is
-kept only beneath ignored `data/system/model-digests/`; model files and
-companions are never written. `inference stop` unloads only the stable
-identifier and never stops the shared server or unloads another model.
+```sh
+uv run ai-video-factory video-pipeline "The Fermi Paradox" \
+  --longform \
+  --duration-minutes 25 \
+  --format science_doc \
+  --llm-url http://localhost:1234/v1/chat/completions \
+  --output data/projects/fermi-paradox
+```
 
-Every discovery snapshot resolves the canonical executable and records its
-authoritative CLI commit, requires exactly one selected Vulkan-or-AMD-ROCm AVX2
-runtime plus a matching positive AMD accelerator survey, and—whenever the
-server is running—checks `server_config_path` for port `1234`, interface
-`127.0.0.1`, and disabled CORS. Residency is accepted only when the alias,
-inventory model key and contained path, package size, context length, and
-parallelism all match. An alias collision fails closed, including for stop, so
-the factory cannot unload a different model. Loopback HTTP ignores ambient
-proxy settings and never follows redirects or exposes HTTP error bodies.
+Short-form (90 seconds) is the default when `--longform` is omitted.
+Format presets: `business_autopsy`, `systems_explainer`,
+`history_reconstruction`, `mystery_deep_dive`, `science_doc`,
+`armchair_true_crime`, `horror_anthology`.
 
-If an inference step or probe fails, immediately run the targeted
-`uv run ai-video-factory inference stop`, verify with `lms ps --json` that
-`avf-qwen36-executor` is absent and unrelated identifiers are unchanged, and do
-not treat the host as ready for Phase 2B. Phase 2B may consume only a passing,
-provenance-verified capability report for the stable loopback identifier.
+Other useful commands:
 
-At render time, an explicit local browser path prevents Remotion from
-automatically downloading a browser, and the checked-in composition contains
-no remote assets. Chrome is not process-level egress sandboxed, so this is not
-an operating-system offline guarantee.
+```sh
+uv run ai-video-factory test-pipeline --json   # smoke test on the checked-in fixture
+uv run ai-video-factory doctor                 # machine report
+uv run ai-video-factory nightly-batch          # unattended trending-topic run
+```
 
-Future Hermes orchestration may use only the documented CLI commands and their
-JSON responses; Hermes is not installed or configured by Phase 2A. See
-[the Hermes command contract](docs/hermes-command-contract.md).
+## Configuration
+
+Everything is configured through `.env` (see `.env.example`) and CLI flags.
+No credentials are ever committed; `.env` is gitignored.
+
+| Variable | Purpose |
+|---|---|
+| `PEXELS_API_KEY` / `PIXABAY_API_KEY` | Stock footage search (free tiers) |
+| `MUSIC_BED_PATH` | Your own royalty-free bed track (optional override) |
+| `FREESOUND_API_KEY` | Extra music provider (optional) |
+| `AVF_KARAOKE_CAPTIONS` | `0` disables burned-in karaoke captions |
+| `LTX2_MODEL_DIR` / `LTX2_VENV` | Local LTX-2 hero-clip backend paths |
+| `AI_VISUALS_MODEL_DIR` | SDXL-Turbo checkpoint dir for AI stills |
+
+Local LM Studio inference can be managed with
+`ai-video-factory inference doctor|start|status|stop`
+(see `config/inference.toml`).
+
+## Architecture
+
+```
+topic
+  -> research (research.py, source_verifier.py)
+  -> script (script_generator.py, duration_enforcer.py)
+  -> storyboard / edit doc (video_pipeline.py)
+  -> visuals per scene (stock_media.py, hero_video.py, ai_visuals.py)
+  -> narration (narration.py)
+  -> music bed (music_bed.py, music_providers.py)
+  -> captions (subtitle_export.py)
+  -> assembly + xfade (pipeline.py, production.py)
+  -> QC gate (qc_final.py)
+  -> thumbnail + metadata (thumbnail.py, yt_metadata.py)
+```
+
+State is content-addressed under `state/` and run outputs under
+`data/projects/`; both are gitignored and recreated at runtime. Completed
+stages are reused only when input and tool fingerprints still match.
+
+## Optional: LTX-2 hero clips
+
+For custom "impossible" shots, a local
+[LTX-2](https://huggingface.co/Lightricks/LTX-2) backend generates short
+clips on your GPU. It needs a ROCm/CUDA torch build and ~100 GB of model
+weights. See `docs/ltx2-setup-notes.md` and `scripts/download_ltx2.py`.
+This is optional; the pipeline works fully without it.
+
+## Roadmap
+
+- Whisper forced alignment for exact word-level caption timing
+- Crossfaded music loops and more mood profiles
+- Cloud clip backends (Veo/Sora) as optional providers
+- Multi-language narration
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -177,8 +177,8 @@ batch reuses that lock (see sketch above), so the cron entry is a plain
 daily trigger:
 
 ```cron
-# summit-amd, Asia/Kolkata. Research + drafts overnight, review queue by morning.
-0 2 * * *  cd /home/summit/ai-video-factory && .venv/bin/ai-video-factory nightly run --data-root data >> /home/summit/ai-video-factory/data/nightly.log 2>&1
+# reference workstation, Asia/Kolkata. Research + drafts overnight, review queue by morning.
+0 2 * * *  cd ~/ai-video-factory && .venv/bin/ai-video-factory nightly run --data-root data >> ~/ai-video-factory/data/nightly.log 2>&1
 ```
 
 02:00 IST is 20:30 UTC previous day; the Vulkan llama-server on :8080 must
@@ -224,13 +224,13 @@ it); the edit docs carry scene selection and timing only.
 
 # ai_visuals: AI-generated visuals for asset gaps
 
-## Capability verdict (summit-amd, checked 2026-09-18)
+## Capability verdict (reference workstation, checked 2026-09-18)
 
 **Active today: procedural.** No diffusion stack exists on the workstation:
 
 - No `torch`, no `diffusers`, no `transformers` in any Python env
 - No Stable Diffusion / SDXL / Flux checkpoints anywhere on disk
-  (`find /home/summit -maxdepth 4` for `*stable-diffusion*`, `*sdxl*`,
+  (`find ~ -maxdepth 4` for `*stable-diffusion*`, `*sdxl*`,
   `*comfyui*`, `*flux*` found nothing usable; only a ComfyUI skill doc
   under `~/.hermes`, not installed)
 - `models/` holds TTS models only
@@ -285,7 +285,7 @@ Runtime cost of the procedural path is under a second per scene.
 
 ## Unlocking the diffusion path (not done)
 
-Exact steps on summit-amd:
+Exact steps on reference workstation:
 
 1. Python deps (workstation venv):
    `pip install torch --index-url https://download.pytorch.org/whl/rocm6.3`
@@ -296,7 +296,7 @@ Exact steps on summit-amd:
 2. Model: `stabilityai/sdxl-turbo` (~6.9 GB, fp16 safetensors, 4-step
    inference, the fastest quality option for an iGPU).
    `huggingface-cli download stabilityai/sdxl-turbo --include "*.safetensors" --include "*.json" --include "*.txt"`
-   into `/home/summit/ai-video-factory/models/sdxl-turbo/`
+   into `~/ai-video-factory/models/sdxl-turbo/`
    (or set `AI_VISUALS_MODEL_DIR` to another location).
 3. No code change needed: `generate_scene_visual` auto-detects torch +
    diffusers + the checkpoint and switches `ACTIVE_BACKEND` to
@@ -306,7 +306,7 @@ Exact steps on summit-amd:
    (~6.9 GB, 25-30 steps, several minutes per image).
 
 Runtime deps the parent should add to `pyproject.toml` when wiring the
-hook: `numpy`, `pillow` (already present on summit-amd; installed in the
+hook: `numpy`, `pillow` (already present on reference workstation; installed in the
 local venv for tests only).
 
 ## Tests

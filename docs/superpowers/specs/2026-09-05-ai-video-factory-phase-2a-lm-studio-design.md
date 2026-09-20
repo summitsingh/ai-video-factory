@@ -11,7 +11,7 @@ contract that Hermes will call in Phase 2B.
 
 ## Confirmed host state
 
-- LM Studio CLI is installed at `/home/summit/.lmstudio/bin/lms`.
+- LM Studio CLI is installed at `~/.lmstudio/bin/lms`.
 - The local server uses `127.0.0.1:1234` and exposes OpenAI-compatible APIs.
 - The newest installed LM Studio engine is
   `llama.cpp-linux-x86_64-amd-rocm-avx2@2.31.2`; older installed versions are

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Dry-run test for ITEM 1: stock provider wiring (Pexels/Pixabay/NASA).
 
-Usage (from the repo root of the item1-stock clone):
+Usage (from the repo root):
     STOCK_CACHE_DIR=/tmp/stock-test-cache \
-    /home/summit/ai-video-factory/.venv/bin/python \
+    .venv/bin/python \
     scripts/test_stock_wiring.py
 
 Exercises:

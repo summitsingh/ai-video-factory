@@ -1,3 +1,0 @@
-{"timestamp":"2026-09-14T21:10:32.412049+00:00","run_id":"a9021aac919c4ad3a181433fe55a7fcb","stage":"daily","event":"run_started","fields":{"status":"running"}}
-{"timestamp":"2026-09-14T21:11:29.788644+00:00","run_id":"a9021aac919c4ad3a181433fe55a7fcb","stage":"daily","event":"run_failed","fields":{"error":"research failed: timed out"}}
-{"timestamp":"2026-09-14T21:11:29.788891+00:00","run_id":"a9021aac919c4ad3a181433fe55a7fcb","stage":"daily","event":"run_failed","fields":{"reason":"research failed: timed out"}}

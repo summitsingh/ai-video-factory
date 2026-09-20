@@ -19,5 +19,13 @@ data/system/
 *-install.log
 model-download.log
 
-# Curated music beds: large and machine-local (ATTRIBUTION.md stays tracked).
+# Curated music beds are large and machine-local; attribution stays tracked.
 assets/music/*.mp3
+
+# machine-generated run state (recreated at runtime)
+state/
+runs/
+
+# downloaded music beds (recreated via music providers; keep ATTRIBUTION.md)
+assets/music/*.wav
+assets/music/*.flac

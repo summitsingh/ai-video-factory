@@ -12,11 +12,11 @@ imports torch/diffusers itself; generation is delegated to a worker script
 (``scripts/generate_ltx2.py``) executed with the backend venv's python, so
 machines without the backend get a clear error instead of an ImportError.
 
-SETUP (verified 2026-09-20 on summit-amd, Strix Halo gfx1151, ROCm 7.2.4)
+SETUP (verified 2026-09-20 on reference hardware: AMD Strix Halo gfx1151, ROCm 7.2.4)
 -----------------------------------------------------------------------
 1. Create a python3.12 venv (NOT the repo venv, NOT system python 3.14)::
 
-     python3.12 -m venv /home/summit/avf-work/item11-ltx2/.venv-ltx2
+     python3.12 -m venv .venv-ltx2   # under the repo root (gitignored)
 
 2. Install TheRock nightly torch for gfx1151 (self-contained wheel, installs
    its own ROCm 7.13 runtime into the venv, does not touch /opt/rocm)::
@@ -47,12 +47,12 @@ SETUP (verified 2026-09-20 on summit-amd, Strix Halo gfx1151, ROCm 7.2.4)
 
 MODEL LOCATION
 --------------
-Default: ``/home/summit/avf-work/item11-ltx2/models/LTX-2`` (override with
-``LTX2_MODEL_DIR``). Backend venv: ``/home/summit/avf-work/item11-ltx2/.venv-ltx2``
-(override with ``LTX2_VENV``). Test clips: ``/home/summit/avf-work/item11-ltx2-tests/``
-(override with ``HERO_CLIP_DIR``) - deliberately OUTSIDE the repo.
+Default: ``models/LTX-2`` under the repo root (override with ``LTX2_MODEL_DIR``).
+Backend venv: ``.venv-ltx2`` under the repo root (override with ``LTX2_VENV``).
+Test clips: ``output/hero-clips/`` under the repo root (override with
+``HERO_CLIP_DIR``); ``output/`` is gitignored so clips never get committed.
 
-MEASURED PERFORMANCE (summit-amd, 2026-09-20)
+MEASURED PERFORMANCE (reference hardware, 2026-09-20)
 --------------------------------------------
 TBD - filled in after the first successful runs. Prior research estimate:
 ~7-12 min per 720p 8s clip.
@@ -86,10 +86,10 @@ log = logging.getLogger(__name__)
 _HERE = Path(__file__).resolve()
 _REPO_ROOT = _HERE.parents[2]  # src/ai_video_factory/hero_video.py -> repo root
 
-BACKEND_VENV = Path(os.environ.get("LTX2_VENV", "/home/summit/avf-work/item11-ltx2/.venv-ltx2"))
-MODEL_DIR = Path(os.environ.get("LTX2_MODEL_DIR", "/home/summit/avf-work/item11-ltx2/models/LTX-2"))
+BACKEND_VENV = Path(os.environ.get("LTX2_VENV", _REPO_ROOT / ".venv-ltx2"))
+MODEL_DIR = Path(os.environ.get("LTX2_MODEL_DIR", _REPO_ROOT / "models" / "LTX-2"))
 WORKER = _REPO_ROOT / "scripts" / "generate_ltx2.py"
-OUTPUT_DIR = Path(os.environ.get("HERO_CLIP_DIR", "/home/summit/avf-work/item11-ltx2-tests"))
+OUTPUT_DIR = Path(os.environ.get("HERO_CLIP_DIR", _REPO_ROOT / "output" / "hero-clips"))
 
 FPS = 24.0
 DEFAULT_STEPS = int(os.environ.get("LTX2_STEPS", "40"))

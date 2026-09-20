@@ -250,7 +250,7 @@ def run_process(argv: tuple[str, ...], *, timeout: float) -> ProcessResult:
     return _bounded_result(completed)
 ```
 
-Resolve `/home/summit/.local/bin/hermes` through `shutil.which`, require a
+Resolve `~/.local/bin/hermes` through `shutil.which`, require a
 canonical absolute regular executable, and retain its canonical path in the
 snapshot. Never include subprocess environment contents.
 
@@ -699,7 +699,7 @@ hermes --version
 hermes config get model.provider
 hermes config get model.default
 hermes config get model.base_url
-/home/summit/.lmstudio/bin/lms ps --json
+~/.lmstudio/bin/lms ps --json
 uv run ai-video-factory inference doctor
 ```
 
@@ -756,7 +756,7 @@ model, change provider configuration, or invoke another cloud route.
 
 ```bash
 uv run ai-video-factory inference stop
-/home/summit/.lmstudio/bin/lms ps --json
+~/.lmstudio/bin/lms ps --json
 uv run ai-video-factory doctor
 uv run ai-video-factory benchmark
 uv run ai-video-factory test-pipeline --json

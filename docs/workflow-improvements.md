@@ -32,7 +32,7 @@ quality gap is found. Status: done / in-progress / planned.
 12. **Multi-output** (D) - one script -> 25-min long-form + 90s short +
     vertical shorts.
 13. **Nightly batch** (D) - overnight research -> draft renders -> morning
-    review queue on summit-amd.
+    review queue on reference workstation.
 
 ## Done (2026-09-18, format-driven rebuild)
 

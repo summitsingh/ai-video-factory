@@ -54,7 +54,7 @@ for this exact host is confirmed.
 
 | Item | Audited state |
 |---|---|
-| CLI | canonical `/home/summit/.lmstudio/bin/lms`; authoritative commit `07b7252` |
+| CLI | canonical `~/.lmstudio/bin/lms`; authoritative commit `07b7252` |
 | Bundled runtime families | AMD ROCm AVX2 is installed through `2.31.2`; Vulkan AVX2 is installed through `2.33.0` and was selected during the passing capability run; no runtime selection or update was performed |
 | Server boundary | OpenAI-compatible API bound only to `127.0.0.1:1234` (`http://127.0.0.1:1234/v1`); persisted config safety fields are port `1234`, `networkInterface` `127.0.0.1`, and CORS disabled |
 | Bundled survey | 85.67 GiB GPU-accessible memory and 122.69 GiB system RAM |
