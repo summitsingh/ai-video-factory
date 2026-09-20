@@ -1536,6 +1536,23 @@ def run_video_pipeline(
         job.title = script.title
         metadata["script_status"] = "complete"
 
+        # Item 4c: placeholder guard. No placeholder citation URL
+        # (example.com, lorem, ...) may ever reach the final render: fail
+        # the run loud instead of publishing a video with fake sources.
+        # The longform generator already verified + guarded its sources;
+        # this covers worker-supplied and short-path scripts too.
+        from ai_video_factory.source_verifier import (
+            guard_no_placeholders,
+            verify_sources,
+        )
+
+        guard_no_placeholders(script.sources)
+        if longform_script is None:
+            # Item 4a: live-check citation URLs on the short/worker paths
+            # too (the longform generator already verified its own):
+            # HTTP HEAD with GET fallback, must return 200, else dropped.
+            script.sources = verify_sources(script.sources).live
+
         # Step 2b: YouTube packaging (titles, thumbnail briefs, description).
         # Deterministic and LLM-free; the chosen title flows downstream.
         try:
@@ -1578,6 +1595,29 @@ def run_video_pipeline(
             metadata["chosen_title"] = chosen_title
         except Exception as error:
             metadata["packaging_status"] = f"skipped: {error}"
+
+        # Step 2c: YouTube metadata (titles, description, tags, chapters).
+        # Deterministic and LLM-free; chapters derive from the script's beat
+        # boundaries. Saved to the run dir as metadata.json + metadata.md
+        # for the upload step.
+        try:
+            from ai_video_factory.yt_metadata import (
+                generate_metadata,
+                save_metadata,
+            )
+
+            meta_source = longform_script if longform_script is not None else script
+            yt_metadata = generate_metadata(
+                meta_source,
+                topic=job.topic,
+                summary=description or "",
+            )
+            meta_paths = save_metadata(job_dir, yt_metadata)
+            artifacts["metadata_json"] = str(meta_paths["json"])
+            artifacts["metadata_md"] = str(meta_paths["md"])
+            metadata["youtube_metadata_status"] = "complete"
+        except Exception as error:
+            metadata["youtube_metadata_status"] = f"skipped: {error}"
 
         # Step 3: Create storyboard/edit document
         metadata["edit_status"] = "in_progress"

@@ -111,7 +111,7 @@ def test_format_script_end_to_end():
     script = generate_longform_script(
         topic="BlackBerry",
         description="rise and fall",
-        source_url="https://example.com",
+        source_url="https://www.nasa.gov", verify_source_urls=False,
         target_minutes=25.0,
         chat_fn=_fake_chat_factory(targets),
         format_key="business_autopsy",
