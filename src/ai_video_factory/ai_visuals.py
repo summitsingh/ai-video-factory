@@ -292,6 +292,22 @@ def render_procedural(
             canvas[max(0, y - 3):y + 4, max(0, x - 3):x + 4] += np.array(
                 [40, 200, 220], dtype=np.float32) * 0.5
 
+    # Cinematic depth: layered terrain silhouettes (Higgsfield-style foreground/midground/background)
+    yy2, xx2 = np.mgrid[0:height, 0:width].astype(np.float32)
+    for layer in range(3):
+        base_y = height * (0.72 + layer * 0.10)
+        amp = height * (0.08 - layer * 0.02)
+        freq = 0.008 + layer * 0.004
+        phase = rng.uniform(0, 6.28)
+        ridge = base_y + amp * np.sin(xx2 * freq + phase) + amp * 0.5 * np.sin(xx2 * freq * 2.7 + phase * 1.3)
+        mask = (yy2 > ridge).astype(np.float32)
+        shade = 12 + layer * 18
+        canvas = canvas * (1 - mask[..., None]*0.7) + shade * mask[..., None]*0.7
+    # Directional key light from upper-left
+    light_x, light_y = width * 0.25, height * 0.15
+    dist_light = np.sqrt((xx2 - light_x) ** 2 + (yy2 - light_y) ** 2)
+    light_falloff = np.exp(-dist_light / (width * 0.9))
+    canvas += light_falloff[..., None] * np.array([255, 230, 190], dtype=np.float32)[None, None, :] * 0.15
     _add_vignette(canvas)
     _add_grain(canvas, rng)
     np.clip(canvas, 0, 255, out=canvas)
