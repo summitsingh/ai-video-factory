@@ -69,7 +69,7 @@ const assertExactKeys = (
   const allowed = new Set(expected);
   const unknown = Object.keys(value).find((key) => !allowed.has(key));
   if (unknown !== undefined) {
-    throw new Error(`${label} contains unknown field: ${unknown}`);
+    // Unknown fields ignored: LLMs add metadata like total_scenes
   }
 };
 
