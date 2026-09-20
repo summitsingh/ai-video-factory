@@ -25,9 +25,11 @@ def make_fake_chat():
         user = next(
             message["content"]
             for message in reversed(messages)
-            if re.search(r"About (\d+) words", message["content"])
+            if re.search(r"(?:About|AT LEAST) (\d+)", message["content"])
         )
-        word_target = int(re.search(r"About (\d+) words", user).group(1))
+        word_target = int(
+            re.search(r"(?:About|AT LEAST) (\d+)", user).group(1)
+        )
         scene_count = int(re.search(r"Exactly (\d+) scenes", user).group(1))
         per_scene = max(45, word_target // scene_count)
         scenes = [
@@ -57,7 +59,7 @@ def test_generate_longform_script_success():
     script = generate_longform_script(
         "Water on Mars",
         "Where Martian water is and why it matters",
-        "https://example.com",
+        "https://www.nasa.gov", verify_source_urls=False,
         target_minutes=20.0,
         chat_fn=make_fake_chat(),
     )
@@ -69,9 +71,9 @@ def test_generate_longform_script_success():
 
 def test_generate_longform_script_rejects_out_of_range():
     with pytest.raises(LongformError, match="between 20 and 30"):
-        generate_longform_script("T", "D", "https://example.com", target_minutes=10.0)
+        generate_longform_script("T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=10.0)
     with pytest.raises(LongformError, match="between 20 and 30"):
-        generate_longform_script("T", "D", "https://example.com", target_minutes=45.0)
+        generate_longform_script("T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=45.0)
 
 
 def test_generate_longform_thin_beat_fails():
@@ -82,7 +84,7 @@ def test_generate_longform_thin_beat_fails():
 
     with pytest.raises(LongformError, match="too thin"):
         generate_longform_script(
-            "T", "D", "https://example.com", target_minutes=20.0, chat_fn=thin_chat
+            "T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=20.0, chat_fn=thin_chat
         )
 
 
@@ -92,7 +94,7 @@ def test_generate_longform_malformed_json_fails():
 
     with pytest.raises(LongformError, match="no JSON object"):
         generate_longform_script(
-            "T", "D", "https://example.com", target_minutes=20.0, chat_fn=bad_chat
+            "T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=20.0, chat_fn=bad_chat
         )
 
 
@@ -102,14 +104,14 @@ def test_generate_longform_chat_error_fails():
 
     with pytest.raises(LongformError, match="generation failed"):
         generate_longform_script(
-            "T", "D", "https://example.com", target_minutes=20.0, chat_fn=boom_chat
+            "T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=20.0, chat_fn=boom_chat
         )
 
 
 def test_generate_longform_writes_output(tmp_path):
     output = tmp_path / "script.json"
     script = generate_longform_script(
-        "T", "D", "https://example.com",
+        "T", "D", "https://www.nasa.gov", verify_source_urls=False,
         target_minutes=20.0, chat_fn=make_fake_chat(), output_path=output,
     )
     assert output.is_file()
@@ -120,7 +122,7 @@ def test_generate_longform_writes_output(tmp_path):
 
 def _script_20min():
     return generate_longform_script(
-        "Water on Mars", "Where it is", "https://example.com",
+        "Water on Mars", "Where it is", "https://www.nasa.gov", verify_source_urls=False,
         target_minutes=20.0, chat_fn=make_fake_chat(),
     )
 
@@ -173,7 +175,7 @@ def test_generate_longform_retries_empty_thinking_output():
         return good(messages, max_tokens)
 
     script = generate_longform_script(
-        "T", "D", "https://example.com", target_minutes=20.0, chat_fn=flaky_chat
+        "T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=20.0, chat_fn=flaky_chat
     )
     assert len(script.beats) == 7
     assert len(calls) == 8  # seven beats, first beat retried once
@@ -192,7 +194,7 @@ def test_generate_longform_retries_truncated_json():
         return good(messages, max_tokens)
 
     script = generate_longform_script(
-        "T", "D", "https://example.com", target_minutes=20.0, chat_fn=trunc_chat
+        "T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=20.0, chat_fn=trunc_chat
     )
     assert len(script.beats) == 7
     assert len(calls) == 8
@@ -204,7 +206,7 @@ def test_generate_longform_retry_exhaustion_fails_loud():
 
     with pytest.raises(LongformError, match="after 2 attempts"):
         generate_longform_script(
-            "T", "D", "https://example.com", target_minutes=20.0, chat_fn=empty_chat
+            "T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=20.0, chat_fn=empty_chat
         )
 
 
@@ -230,9 +232,41 @@ def test_generate_longform_feeds_back_validation_error():
         return good(messages, max_tokens)
 
     script = generate_longform_script(
-        "T", "D", "https://example.com", target_minutes=20.0, chat_fn=thin_then_good
+        "T", "D", "https://www.nasa.gov", verify_source_urls=False, target_minutes=20.0, chat_fn=thin_then_good
     )
     assert len(script.beats) == 7
     assert len(seen) == 8  # seven beats, first beat retried once
     assert "rejected for this reason" in seen[1][-1]["content"]
     assert "too thin" in seen[1][-1]["content"]
+
+
+def test_cold_open_prompt_carries_hook_rules():
+    """Item 5: the first beat's prompt must engineer the retention hook."""
+    from ai_video_factory.longform import (
+        COLD_OPEN_HOOK_RULES,
+        LONGFORM_BEATS,
+        _beat_user_prompt,
+    )
+
+    cold_open = next(s for s in LONGFORM_BEATS if s.key == "cold_open")
+    prompt = _beat_user_prompt(
+        spec=cold_open, bible="bible", word_target=150,
+        scene_target=2, previous_beats=[],
+    )
+    # Hook rules are injected for the cold open only.
+    assert "COLD-OPEN HOOK RULES" in prompt
+    assert "in this video" in prompt  # named as a banned phrase
+    assert "unanswered question" in prompt
+    assert "never revealing it" in prompt
+
+    other = next(s for s in LONGFORM_BEATS if s.key != "cold_open")
+    other_prompt = _beat_user_prompt(
+        spec=other, bible="bible", word_target=600,
+        scene_target=4, previous_beats=[],
+    )
+    assert "COLD-OPEN HOOK RULES" not in other_prompt
+
+    # The beat spec itself bans throat-clearing and demands the tease.
+    assert "No throat-clearing" in cold_open.purpose
+    assert "named" in cold_open.purpose and "promise" in cold_open.purpose
+    assert "open loop" in cold_open.retention

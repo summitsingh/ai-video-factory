@@ -65,12 +65,21 @@ LONGFORM_BEATS: tuple[BeatSpec, ...] = (
         label="COLD OPEN",
         fraction=0.04,
         purpose=(
-            "Hook the viewer in the first 30 seconds. Open on the most "
-            "visually striking or emotionally charged moment of the story, "
-            "state the stakes plainly, and promise the payoff without giving "
-            "it away."
+            "Cold open: the first 30 seconds decide whether anyone keeps "
+            "watching. Open mid-mystery on the single most unsettling fact "
+            "of the story, posed as an unanswered question the viewer cannot "
+            "resolve on their own. No throat-clearing: never say 'in this "
+            "video', 'welcome back', or introduce the channel or topic. Drop "
+            "the viewer into the paradox in the first two sentences, then "
+            "tease the single best revelation coming later as a named "
+            "promise, never revealing it."
         ),
-        retention="Plant one open loop: a question the video will answer in the climax.",
+        retention=(
+            "End the cold open on a hard open loop: one unanswered question "
+            "plus a named-but-unrevealed payoff ('the signal that changed "
+            "everything') that only the climax resolves. The viewer must "
+            "feel they cannot leave before the answer."
+        ),
     ),
     BeatSpec(
         key="act1_setup",
@@ -182,6 +191,18 @@ def beat_word_target(spec: BeatSpec, target_minutes: float) -> int:
     return round(target_minutes * WORDS_PER_MINUTE * spec.fraction)
 
 
+COLD_OPEN_HOOK_RULES = """COLD-OPEN HOOK RULES (the first 30 seconds decide retention):
+- Open mid-mystery: the first two sentences drop the viewer straight into the paradox as an \
+unanswered question. No throat-clearing: NEVER write "in this video", "welcome back", "today \
+we're going to", or any channel/topic introduction.
+- Pose the central paradox as a question the viewer cannot answer alone; make the silence or \
+absence feel personal and unsettling, not academic.
+- Tease the single best revelation coming later by naming it as a promise ("by the end, you'll \
+see the signal that changed everything") without revealing it.
+- The first scene's narration must work as a standalone 30-second hook: tension up, curiosity \
+open, zero setup."""
+
+
 LONGFORM_SYSTEM_PROMPT = """You are an award-winning documentary scriptwriter. You write narration for long-form \
 YouTube documentaries in a cinematic, confident voice: short declarative sentences, vivid concrete detail, \
 zero filler. Every scene you write must earn its place.
@@ -209,6 +230,9 @@ def _beat_user_prompt(
             + "\n".join(f"- {title}" for title in previous_beats)
             + "\nDo not repeat these scenes. Build on them.\n"
         )
+    hook_rules = ""
+    if spec.key == "cold_open":
+        hook_rules = f"\n{COLD_OPEN_HOOK_RULES}\n"
     return f"""Series bible:
 {bible}
 
@@ -216,7 +240,7 @@ Now write the "{spec.label}" beat ({spec.key}).
 
 Purpose: {spec.purpose}
 Retention device: {spec.retention}
-
+{hook_rules}
 Requirements:
 - CRITICAL: Write AT LEAST {word_target} words of narration total across the beat. Do not write less.
 - Exactly {scene_target} scenes.
@@ -411,6 +435,8 @@ class LongformScript:
     sources: list[str] = field(default_factory=list)
     generated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     format_key: str | None = None
+    source_verification: dict[str, Any] | None = None
+    enforcement: dict[str, Any] | None = None
 
     @property
     def total_words(self) -> int:
@@ -436,6 +462,8 @@ class LongformScript:
                 "sources": self.sources,
                 "generated_at": self.generated_at,
                 "format_key": self.format_key,
+                "source_verification": self.source_verification,
+                "enforcement": self.enforcement,
                 "beats": [
                     {
                         "key": beat.spec.key,
@@ -537,6 +565,7 @@ def generate_longform_script(
     chat_fn: Callable[[list[dict[str, str]], int], str] | None = None,
     output_path: Path | None = None,
     format_key: str | None = None,
+    verify_source_urls: bool = True,
 ) -> LongformScript:
     """Generate a long-form documentary script beat by beat.
 
@@ -544,9 +573,18 @@ def generate_longform_script(
     bible, so the model sustains coherence across thousands of words.
     Pass ``format_key`` (see ``ai_video_factory.formats``) to use a winning
     YouTube format's beat structure, hook plan, and narration register.
+
+    After assembly the script passes through source verification (Fermi
+    topics get credible seed sources; placeholder URLs fail loud; dead URLs
+    are dropped) and duration enforcement (underweight beats are extended
+    via the LLM beat path until within 5% of the target runtime).
+
+    Set ``verify_source_urls=False`` to skip the live HTTP checks (tests,
+    offline runs). The placeholder guard always runs.
+
     Raises ``LongformError`` when any beat is missing, malformed, or too
-    far from its word target, and when the assembled script misses the
-    target duration by more than 15%.
+    far from its word target, and ``SourceVerificationError`` when a
+    placeholder citation URL is detected.
     """
     if not (MIN_LONGFORM_MINUTES <= target_minutes <= MAX_LONGFORM_MINUTES):
         raise LongformError(
@@ -602,6 +640,36 @@ def generate_longform_script(
         _validate_beat(spec, scenes, word_target)
         script.beats.append(LongformBeat(spec=spec, scenes=scenes))
         previous_titles.extend(scene.title for scene in scenes)
+
+    # Item 4: sources. Seed credible Fermi Paradox sources for Fermi topics,
+    # fail loud on placeholder URLs, then drop dead URLs (HTTP HEAD with GET
+    # fallback; must return 200). Sources are checked before the duration
+    # loop so no LLM budget is spent on a script that would fail anyway.
+    from ai_video_factory import source_verifier as _source_verifier
+
+    if _source_verifier.is_fermi_topic(topic):
+        script.sources = list(
+            dict.fromkeys(
+                [*(script.sources or []), *_source_verifier.seed_fermi_sources()]
+            )
+        )
+    _source_verifier.guard_no_placeholders(script.sources)
+    if verify_source_urls:
+        verification = _source_verifier.verify_sources(script.sources)
+        script.sources = verification.live
+        script.source_verification = {
+            "live": verification.live,
+            "dead": verification.dead,
+            "checked_at": verification.checked_at,
+        }
+
+    # Item 3: duration enforcement. Extend the most underweight beats via
+    # the LLM beat-generation path (appending new scenes) until the script
+    # is within 5% of the target runtime; fails loud after 3 iterations.
+    from ai_video_factory.duration_enforcer import enforce_duration
+
+    enforcement_report = enforce_duration(script, target_minutes, chat, bible=bible)
+    script.enforcement = enforcement_report.to_dict()
 
     target_words = target_minutes * WORDS_PER_MINUTE
     if abs(script.total_words - target_words) / target_words > 0.25:
@@ -705,4 +773,6 @@ def longform_script_from_dict(data: dict[str, Any]) -> LongformScript:
         beats=beats,
         sources=list(data.get("sources", [])),
         generated_at=str(data.get("generated_at", "")),
+        source_verification=data.get("source_verification"),
+        enforcement=data.get("enforcement"),
     )
