@@ -36,9 +36,8 @@ A 47-second excerpt from a real 90-second pipeline run (topic: "Europa's Hidden 
 Everything below was produced by the pipeline: researched script, stock footage,
 local TTS narration, music bed, karaoke captions, FFmpeg assembly.
 
-https://github.com/summitsingh/ai-video-factory/raw/main/assets/demo.mp4
-
-<video src="assets/demo.mp4" width="100%" controls></video>
+Demo #2 (real pipeline output): https://youtu.be/XrlqRv2bInQ
+Demo #1 (AI-generated teaser): https://youtu.be/CASvWRXd3jg
 
 ## Quickstart
 
