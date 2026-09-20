@@ -664,7 +664,7 @@ def _run_final_qc(
     repeated_shots = video_repeated_shot_count(candidate.master_path)
 
     total_scenes = len([s for s in edit.scenes if s.kind == "normal"]) or 1
-    title_cards = len([s for s in edit.scenes if s.on_screen_text])
+    title_cards = len([s for s in edit.scenes if s.act])
 
     gate_results = [
         evaluate_audio(

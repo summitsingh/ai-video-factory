@@ -26,7 +26,7 @@ from uuid import uuid4
 
 import fcntl
 
-from ai_video_factory.edit_schema import EditDocument, EditScene, load_edit, save_edit
+from ai_video_factory.edit_schema import EditDocument, EditScene, load_edit, save_edit, scene_asset_slots
 from ai_video_factory.lm_studio import LmStudioError
 from ai_video_factory.media_probe import MediaProbeError, probe_media
 from ai_video_factory.narration import (
@@ -66,6 +66,7 @@ from ai_video_factory.thumbnail import build_thumbnails, validate_thumbnails
 from ai_video_factory.script_generator import ScriptGenerationError, ScriptOutput, generate_script
 from ai_video_factory.longform import (
     DEFAULT_LONGFORM_MINUTES,
+    WORDS_PER_MINUTE,
     LongformError,
     LongformScript,
     _lm_studio_chat,
@@ -356,8 +357,16 @@ def cache_assets_for_remotion(
             except OSError:
                 pass
 
-    for idx, scene_dir in enumerate(sorted(assets_dir.glob("scene-*"))):
+    for scene_dir in sorted(assets_dir.glob("scene-*")):
         if not scene_dir.is_dir():
+            continue
+        try:
+            # Use the directory's own slot index (scene-NN -> N), not an
+            # enumeration counter: attach_scene_assets names files by slot,
+            # and a missing slot dir must not shift later scenes onto the
+            # wrong public filename.
+            idx = int(scene_dir.name.split("-", 1)[1])
+        except (ValueError, IndexError):
             continue
         # Copy clips using a scene-specific name so each scene resolves to its
         # own media file (see attach_scene_assets).
@@ -472,13 +481,12 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
 
     provider = StockFootageProvider()
     assets: list = []
+    slots = scene_asset_slots(edit.scenes)
     fps = edit.fps if edit.fps else 24
     for scene in edit.scenes:
-        if not str(scene.id).startswith('scene-'):
-            continue
-        try:
-            idx = int(str(scene.id).split('-', 1)[1])
-        except ValueError:
+        idx = slots.get(str(scene.id))
+        if idx is None:
+            # Intro/outro or non-content scene: no per-scene assets.
             continue
         scene_dir = assets_dir / f'scene-{idx:02d}'
         if scene_dir.is_dir() and next(scene_dir.glob('*clip*.mp4'), None):
@@ -496,7 +504,7 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
                 min_duration_sec=max(1.0, scene.duration_frames / fps),
             )
         except Exception as error:  # noqa: BLE001 - per-scene miss, not fatal
-            log.debug(
+            log.warning(
                 'stock fetch failed for %s: %s',
                 scene.id, sanitize_diagnostic(error),
             )
@@ -509,6 +517,11 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
         asset.path = str(dst)
         assets.append(asset)
         log.info('stock clip for %s -> %s', scene.id, asset.title)
+    if not assets and slots:
+        log.warning(
+            'stock fetch: 0 clips fetched for %d normal scenes; '
+            'falling back to AI stills / procedural visuals', len(slots),
+        )
     return assets
 
 
@@ -529,41 +542,38 @@ def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocu
     if not assets_dir.is_dir():
         return edit
     scenes: list[EditScene] = []
+    slots = scene_asset_slots(edit.scenes)
     for scene in edit.scenes:
         update: dict[str, Any] = {}
         # Only normal content scenes have per-scene asset directories.
-        if scene.id.startswith("scene-"):
-            try:
-                idx = int(scene.id.split("-", 1)[1])
-            except ValueError:
-                idx = None
-            if idx is not None:
-                scene_dir = assets_dir / f"scene-{idx:02d}"
-                if scene_dir.is_dir():
-                    clips = sorted(scene_dir.glob("*clip*.mp4"))
-                    images = sorted(
-                        [p for p in scene_dir.iterdir()
-                         if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
-                         and p.is_file()
-                         # Prefer downloaded stock over generated fallback:
-                         # generated.png sorts first alphabetically and would
-                         # shadow a good NASA asset.
-                         and p.name != "generated.png"]
-                    )
-                    # Use a scene-specific filename so each scene resolves to
-                    # its own media file in Remotion's public/ directory.
-                    # Rename the file now so QC (which runs after attach) can
-                    # find it at the canonical path.
-                    if clips:
-                        clip_name = f"scene-{idx:02d}-clip{clips[0].suffix}"
-                        if clips[0].name != clip_name:
-                            clips[0].rename(scene_dir / clip_name)
-                        update["clip"] = clip_name
-                    if images:
-                        image_name = f"scene-{idx:02d}-image{images[0].suffix}"
-                        if images[0].name != image_name:
-                            images[0].rename(scene_dir / image_name)
-                        update["image"] = image_name
+        idx = slots.get(scene.id)
+        if idx is not None:
+            scene_dir = assets_dir / f"scene-{idx:02d}"
+            if scene_dir.is_dir():
+                clips = sorted(scene_dir.glob("*clip*.mp4"))
+                images = sorted(
+                    [p for p in scene_dir.iterdir()
+                     if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+                     and p.is_file()
+                     # Prefer downloaded stock over generated fallback:
+                     # generated.png sorts first alphabetically and would
+                     # shadow a good NASA asset.
+                     and p.name != "generated.png"]
+                )
+                # Use a scene-specific filename so each scene resolves to
+                # its own media file in Remotion's public/ directory.
+                # Rename the file now so QC (which runs after attach) can
+                # find it at the canonical path.
+                if clips:
+                    clip_name = f"scene-{idx:02d}-clip{clips[0].suffix}"
+                    if clips[0].name != clip_name:
+                        clips[0].rename(scene_dir / clip_name)
+                    update["clip"] = clip_name
+                if images:
+                    image_name = f"scene-{idx:02d}-image{images[0].suffix}"
+                    if images[0].name != image_name:
+                        images[0].rename(scene_dir / image_name)
+                    update["image"] = image_name
         scenes.append(scene.model_copy(update=update) if update else scene)
     return edit.model_copy(update={"scenes": scenes})
 
@@ -1528,6 +1538,82 @@ def _status(result: Mapping[str, Any]) -> Literal["pass", "fail"]:
     return result.get("status", "fail")
 
 
+def _failed_qc_check_names(report_path: Path | None) -> list[str]:
+    """Names of failed checks in a written QC report (best-effort)."""
+    if report_path is None:
+        return []
+    try:
+        payload = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - missing/corrupt report must not hide QC failure
+        return []
+    checks = payload.get("checks") if isinstance(payload, dict) else None
+    if not isinstance(checks, list):
+        return []
+    return [
+        str(check.get("name"))
+        for check in checks
+        if isinstance(check, dict) and not check.get("passed") and check.get("name")
+    ]
+
+
+def _settle_qc_run(
+    state_store: RunStore,
+    qc_run: Any,
+    *,
+    status: str,
+    result: Mapping[str, Any],
+    final_qc: Any,
+    report_path: Path | None,
+) -> Any:
+    """Complete or fail the video-qc run based on the QC outcome.
+
+    A failing QC marks the run failed -- never completed -- and the failure
+    is logged loudly. (Fermi v2 logged run_completed with QC artifacts
+    showing status "fail" because the run was completed before final QC ran.)
+    Returns the settled run manifest.
+    """
+    if status == "fail":
+        failed_checks = _failed_qc_check_names(report_path) + [
+            check.name for check in final_qc.checks if not check.passed
+        ]
+        message = "final QC failed on the polished master: " + (
+            ", ".join(failed_checks) if failed_checks else "unknown checks"
+        )
+        log.error("QC GATE: %s -- marking video-qc run failed", message)
+        print(f"QC FAILED: {message}", flush=True)
+        return state_store.fail(qc_run.run_id, message)
+    return state_store.complete(
+        qc_run.run_id,
+        {"status": status, **result},
+        expected_artifacts={
+            key: Path(value) for key, value in result.items() if key != "status"
+        },
+    )
+
+
+def _verify_longform_duration(
+    script: LongformScript, target_minutes: float, *, tolerance: float = 0.05
+) -> None:
+    """Fail-closed duration gate for a long-form script about to be rendered.
+
+    Fresh scripts already passed ``enforce_duration`` (which raises when it
+    cannot reach the target), so this is a no-op for them. Resumed scripts
+    serialized before duration enforcement existed -- or worker scripts that
+    never saw it -- are verified here instead of silently rendering short,
+    as Fermi v2 did (22:31 vs the 25-minute target).
+    """
+    target_words = target_minutes * WORDS_PER_MINUTE
+    shortfall = target_words - script.total_words
+    if shortfall > target_words * tolerance:
+        raise PipelineCommandError(
+            f"longform script is {script.estimated_minutes:.1f} min "
+            f"({script.total_words} words) vs {target_minutes:.0f}-minute target: "
+            f"{shortfall / target_words * 100:.1f}% short. Regenerate the script "
+            "(delete the video-script state for this output) so duration "
+            "enforcement can extend it to the target."
+        )
+
+
 # ========== Main Pipeline Function ==========
 
 def _resolve_run_dirs(root: Path, output_path: Path) -> tuple[Path, Path, str]:
@@ -1750,6 +1836,12 @@ def run_video_pipeline(
                     {"script": str(job.script_path), "origin": "local_model_longform"},
                     expected_artifacts={"script": job.script_path},
                 )
+            # Duration gate: never render a long-form script that is more
+            # than 5% short of the target. Fresh scripts already passed
+            # enforce_duration; this catches resumed scripts serialized
+            # before enforcement existed (Fermi v2: 22:31 vs 25:00 target).
+            _verify_longform_duration(longform_script, target_duration_minutes)
+            metadata["script_duration_verified"] = True
             script = ScriptOutput(
                 title=longform_script.title,
                 narration="\n\n".join(
@@ -2060,6 +2152,12 @@ def run_video_pipeline(
             metadata["assets_attached"] = sum(
                 1 for s in edit_doc.scenes if s.clip or s.image
             )
+            if metadata["assets_attached"] == 0 and scene_asset_slots(edit_doc.scenes):
+                log.error(
+                    "visual pipeline: 0 scenes have any clip/image after the "
+                    "NASA and stock passes; the render will be procedural "
+                    "backgrounds only"
+                )
 
             # Step 4.4b: Asset QC + memory + AI-visual fallback. Verify every
             # attached asset (black frames, slates, dimensions); record
@@ -2080,6 +2178,7 @@ def run_video_pipeline(
                 rejected = 0
                 generated = 0
                 assets_root = Path(assets_dir_used)
+                asset_slots = scene_asset_slots(edit_doc.scenes)
                 for scene in edit_doc.scenes:
                     for kind, asset_path in (("clip", scene.clip), ("image", scene.image)):
                         if not asset_path:
@@ -2124,19 +2223,15 @@ def run_video_pipeline(
                                 scene.clip = None
                             else:
                                 scene.image = None
-                    if not scene.clip and not scene.image and scene.id.startswith("scene-"):
-                        try:
-                            idx = int(scene.id.split("-", 1)[1])
-                        except ValueError:
-                            idx = None
-                        if idx is not None:
-                            scene_dir = assets_root / f"scene-{idx:02d}"
-                            scene_dir.mkdir(parents=True, exist_ok=True)
-                            out = scene_dir / "generated.png"
-                            generate_scene_visual(
-                                scene.visual, scene.narration, out
-                            )
-                            generated += 1
+                    fallback_idx = asset_slots.get(scene.id)
+                    if not scene.clip and not scene.image and fallback_idx is not None:
+                        scene_dir = assets_root / f"scene-{fallback_idx:02d}"
+                        scene_dir.mkdir(parents=True, exist_ok=True)
+                        out = scene_dir / "generated.png"
+                        generate_scene_visual(
+                            scene.visual, scene.narration, out
+                        )
+                        generated += 1
                 # Re-attach so generated stills get public-relative filenames.
                 edit_doc = attach_scene_assets(edit_doc, assets_dir_used)
                 save_edit(edit_doc, job.edit_path)
@@ -2620,6 +2715,17 @@ def run_video_pipeline(
             artifacts["qc_report"] = result.get("report", "")
             artifacts["qc_report_markdown"] = result.get("report_markdown", "")
             job.qc_report_path = Path(result["report"]) if result.get("report") else None
+            if status == "fail":
+                # Fail-closed for legacy runs whose QC failed but was still
+                # recorded as completed: never proceed on a failed QC.
+                message = (
+                    "resumed video-qc run previously failed QC; refusing to "
+                    "proceed. Clear the video-qc state for this output and "
+                    "re-run so QC executes again."
+                )
+                log.error("QC GATE: %s", message)
+                print(f"QC FAILED: {message}", flush=True)
+                raise PipelineCommandError(message)
         else:
             state_store.event(qc_run.run_id, "qc_started", {"master": str(job.master_path)})
             content_qc: QcReport | None = None
@@ -2640,25 +2746,21 @@ def run_video_pipeline(
             artifacts["qc_report_markdown"] = result.get("report_markdown", "")
             job.qc_report_path = Path(result.get("report", "")) if result.get("report") else None
 
-            qc_run = state_store.complete(
-                qc_run.run_id,
-                {"status": status, **result},
-                expected_artifacts={
-                    key: Path(value)
-                    for key, value in result.items()
-                    if key != "status"
-                },
-            )
-
             # Final render QC gate: hard-fail checks on the polished master
             # (black frames, digital silence, audio peak, resolution,
-            # duration). Any failure flips the run status to "fail".
+            # duration). The duration target is the promised runtime (e.g.
+            # 25 minutes), not the edit document's own duration: comparing
+            # the master against the edit doc only proves self-consistency,
+            # which is how the 22:31 Fermi v2 master passed its duration
+            # check despite missing the 25-minute target by 10%.
             final_qc = run_final_qc(
                 job.master_path,
                 target_width=edit_doc_render.width,
                 target_height=edit_doc_render.height,
                 target_duration_seconds=(
-                    edit_doc_render.duration_frames / edit_doc_render.fps
+                    target_duration_minutes * 60.0
+                    if longform
+                    else edit_doc_render.duration_frames / edit_doc_render.fps
                 ),
                 ffmpeg=str(_required_tool(tools, "ffmpeg")),
                 report_path=job.master_path.parent / "qc-report.json",
@@ -2671,6 +2773,19 @@ def run_video_pipeline(
             ]
             if not final_qc.passed:
                 status = "fail"
+
+            # The QC result gates completion: a failing QC marks the run
+            # failed, never completed. Previously the run was completed
+            # before final QC ran, so Fermi v2 logged run_completed with QC
+            # artifacts showing status "fail".
+            qc_run = _settle_qc_run(
+                state_store,
+                qc_run,
+                status=status,
+                result=result,
+                final_qc=final_qc,
+                report_path=job.qc_report_path,
+            )
 
         metadata["qc_status"] = "complete"
         metadata["qc_results"] = artifacts.get("qc_report", "not_found")

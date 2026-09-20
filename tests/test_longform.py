@@ -13,6 +13,7 @@ from ai_video_factory.longform import (
     beat_word_target,
     generate_longform_script,
     longform_to_edit_document,
+    longform_script_from_dict,
 )
 
 
@@ -270,3 +271,84 @@ def test_cold_open_prompt_carries_hook_rules():
     assert "No throat-clearing" in cold_open.purpose
     assert "named" in cold_open.purpose and "promise" in cold_open.purpose
     assert "open loop" in cold_open.retention
+
+
+def _saved_script_dict(extra_beats):
+    """A serialized script dict shaped like script.json, with extra beats."""
+
+    def _beat(key, label, words):
+        return {
+            "key": key,
+            "label": label,
+            "words": words,
+            "scenes": [
+                {
+                    "title": f"{key} scene",
+                    "narration": " ".join(["word"] * words),
+                    "visual_direction": "Slow push-in",
+                    "lower_third": "Mars, 2026" if key == "cold_open" else None,
+                }
+            ],
+        }
+
+    return {
+        "title": "Fermi Paradox",
+        "description": "Where is everybody?",
+        "topic": "The Fermi Paradox",
+        "target_minutes": 25.0,
+        "total_words": 240,
+        "estimated_minutes": 1.6,
+        "sources": ["https://www.nasa.gov"],
+        "generated_at": "2026-09-20T10:00:00",
+        "format_key": "deep_dive",
+        "source_verification": None,
+        "enforcement": None,
+        "beats": [
+            _beat("cold_open", "COLD OPEN", 150),
+            *(_beat(key, label, words) for key, label, words in extra_beats),
+        ],
+    }
+
+
+def test_from_dict_tolerates_unknown_encore_beat_key():
+    """Regression: a fresh process must load saved scripts containing an
+    ``encore`` beat. The duration enforcer registers its synthetic encore
+    spec only in the process that appends it, so run-resume in a new
+    process used to raise ``LongformError: unknown beat key``."""
+    script = longform_script_from_dict(_saved_script_dict([("encore", "ENCORE", 90)]))
+    assert len(script.beats) == 2
+    encore = script.beats[-1]
+    assert encore.spec.key == "encore"
+    assert encore.spec.label == "ENCORE"
+    assert [scene.title for scene in encore.scenes] == ["encore scene"]
+    assert encore.scenes[0].lower_third is None
+    # Known fields round-trip.
+    assert script.title == "Fermi Paradox"
+    assert script.description == "Where is everybody?"
+    assert script.topic == "The Fermi Paradox"
+    assert script.target_minutes == 25.0
+    assert script.sources == ["https://www.nasa.gov"]
+    assert script.generated_at == "2026-09-20T10:00:00"
+    assert script.source_verification is None
+    assert script.enforcement is None
+    assert script.total_words == 240
+    # Serialization is unchanged: the encore beat keeps its key and label.
+    reserialized = json.loads(script.to_json())
+    assert reserialized["beats"][-1]["key"] == "encore"
+    assert reserialized["beats"][-1]["label"] == "ENCORE"
+
+
+def test_from_dict_tolerates_any_unknown_beat_key():
+    """Any unexpected beat key (e.g. beats built by a format preset this
+    process never registered) is accepted, not rejected."""
+    script = longform_script_from_dict(
+        _saved_script_dict([("discovery", "DISCOVERY", 90)])
+    )
+    beat = script.beats[-1]
+    assert beat.spec.key == "discovery"
+    assert beat.spec.label == "DISCOVERY"
+    assert beat.scenes[0].narration.split() == ["word"] * 90
+    # A second load of the same dict reuses the registered spec.
+    again = longform_script_from_dict(_saved_script_dict([("discovery", "DISCOVERY", 90)]))
+    assert again.beats[-1].spec.key == "discovery"
+    assert again.beats[-1].spec.label == "DISCOVERY"

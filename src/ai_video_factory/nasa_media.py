@@ -7,6 +7,7 @@ the source page URL.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import urllib.parse
@@ -15,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ai_video_factory.stock_media import StockAsset, StockMediaError, download_asset
+
+log = logging.getLogger(__name__)
 
 _NASA_SEARCH = "https://images-api.nasa.gov/search"
 _NASA_ASSETS = "https://images-assets.nasa.gov"
@@ -309,8 +312,8 @@ def populate_assets_from_nasa(
 ) -> dict[str, int]:
     """Download NASA public-domain assets into per-scene folders.
 
-    Each normal content scene (``scene-0``, ``scene-1``, ...) is matched to a
-    ``scene-NN/`` directory beneath ``assets_dir`` and populated by searching
+    Each normal content scene is matched to a ``scene-NN/`` directory beneath
+    ``assets_dir`` (positional slot from ``scene_asset_slots``) and populated by searching
     NASA for that scene's visual direction first (concrete on-screen nouns),
     falling back to the scene title. Intro/outro scenes are skipped. Records
     that look like press conferences or ceremonies are skipped, and stills
@@ -321,20 +324,19 @@ def populate_assets_from_nasa(
     This is best-effort: network failures, empty queries, or missing media are
     logged and skipped so a single bad scene never aborts the whole render.
     """
-    from ai_video_factory.edit_schema import EditScene  # local import to avoid cycles
+    from ai_video_factory.edit_schema import EditScene, scene_asset_slots  # local import to avoid cycles
 
     assets_dir = Path(assets_dir)
     summary: dict[str, int] = {"scenes": 0, "images": 0, "clips": 0}
     lock = threading.Lock()
+    slots = scene_asset_slots(edit_doc.scenes)
 
     def _populate_scene(scene) -> tuple[int, int, int]:
         if not isinstance(scene, EditScene):
             return (0, 0, 0)
-        if not str(getattr(scene, "id", "")).startswith("scene-"):
-            return (0, 0, 0)
-        try:
-            idx = int(str(getattr(scene, "id", "")).split("-", 1)[1])
-        except (ValueError, IndexError):
+        idx = slots.get(str(getattr(scene, "id", "")))
+        if idx is None:
+            # Intro/outro or non-content scene: no per-scene assets.
             return (0, 0, 0)
         title = str(getattr(scene, "title", "") or "").strip()
         if not title:
@@ -362,7 +364,10 @@ def populate_assets_from_nasa(
                     query = candidate
                     break
         except Exception as error:  # noqa: BLE001 - best-effort per scene
-            print(f"[nasa] scene-{idx} failed: {error}")
+            log.warning(
+                "nasa populate failed for scene %s: %s",
+                getattr(scene, "id", "?"), error,
+            )
             return (0, 0, 0)
         if assets:
             return (
@@ -381,4 +386,10 @@ def populate_assets_from_nasa(
                 summary["scenes"] += s_count
                 summary["images"] += i_count
                 summary["clips"] += c_count
+    if summary["scenes"] == 0 and slots:
+        log.warning(
+            "populate_assets_from_nasa: 0 of %d normal scenes got any NASA "
+            "assets; visuals will fall back to later stages",
+            len(slots),
+        )
     return summary

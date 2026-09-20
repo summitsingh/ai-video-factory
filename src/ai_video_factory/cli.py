@@ -823,5 +823,87 @@ def shorts_cmd(
         raise typer.Exit(code=2)
 
 
+@app.command("daily")
+def daily(
+    topic: str | None = typer.Option(None, "--topic", "-t", help="Fixed topic to research (skips trend discovery)"),
+    source_url: list[str] = typer.Option(
+        None,
+        "--source-url",
+        "-u",
+        help="Authoritative source URL(s) grounding topic-override research "
+             "(repeatable). Fetched through the hardened HTTPS content path and "
+             "required for a grounded live pilot; empty for trend-driven discovery.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what a run would do; no network or rendering"),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Resume completed production stages from a prior run"),
+    json_output: bool = typer.Option(False, "--json", help="Output result as JSON"),
+) -> None:
+    """Run the daily production job (operator-scheduled, local only).
+
+    Discovers a trending topic, researches it with verified facts, builds a
+    15-20 minute documentary candidate, runs final QC on real artifacts, and
+    produces an upload-ready package pending explicit human approval. No system
+    cron or service is created; schedule this command yourself.
+
+    With ``--topic`` plus one or more ``--source-url``, research is grounded in
+    the supplied authoritative content (fetched through the hardened path), the
+    active local model is resolved from LM Studio at runtime, and NASA Image &
+    Video Library assets are acquired only after passing the item-level rights
+    gate. Nothing is uploaded, published, or scheduled; the run stops with an
+    approval package pending explicit human approval.
+    """
+    from ai_video_factory.daily_job import JobConfig, run_daily_job
+
+    try:
+        project_root = Path(__file__).resolve().parents[2]
+        config = JobConfig(dry_run=dry_run, research_source_urls=list(source_url or []))
+        if topic:
+            config.topic_override = topic
+        # Grounded live production (topic + source URLs): resolve the active local
+        # model from LM Studio at runtime (fail closed if unavailable), fetch each
+        # source through the hardened HTTPS path, and acquire NASA Image & Video
+        # Library assets cleared by the item-level rights gate. dry_run stays fully
+        # offline; trend-driven runs keep their existing defaults.
+        if not dry_run and config.topic_override:
+            from ai_video_factory.production import make_production_asset_transport
+            from ai_video_factory.research_pipeline import (
+                make_production_extractor,
+                make_secure_http_transport,
+            )
+
+            inference_cfg = load_inference_config(_PROJECT_ROOT / "config" / "inference.toml")
+            config.content_fetcher = make_secure_http_transport()
+            config.production_extractor = make_production_extractor(
+                endpoint_url=f"{inference_cfg.base_url}/chat/completions",
+            )
+            config.asset_transport = make_production_asset_transport()
+        # Real production renderer (Kokoro narration + headless Remotion master).
+        # Constructed here so a live non-dry-run can render; dry_run short-circuits
+        # before the engine is used, and daily_job refuses to build without one.
+        from ai_video_factory.production import RemotionKokoroRenderEngine
+        result = run_daily_job(
+            project_root, config=config, engine=RemotionKokoroRenderEngine()
+        )
+    except Exception as error:
+        from ai_video_factory.sanitization import sanitize_diagnostic
+
+        typer.echo(sanitize_diagnostic(error), err=True)
+        raise typer.Exit(code=2)
+
+    if json_output:
+        typer.echo(json.dumps(result.to_dict(), indent=2))
+    else:
+        typer.echo(f"Run ID: {result.run_id or '(dry-run)'}")
+        typer.echo(f"Status: {result.status}")
+        typer.echo(f"Topic: {result.topic}")
+        if result.gates_passed and result.approval_path:
+            typer.echo(f"Approval package: {result.approval_path}")
+        elif result.failure_reason:
+            typer.echo(f"Failed: {result.failure_reason}")
+
+    if result.status != "completed":
+        raise typer.Exit(code=2)
+
+
 if __name__ == "__main__":
     app()

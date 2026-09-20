@@ -750,11 +750,25 @@ def longform_script_from_dict(data: dict[str, Any]) -> LongformScript:
     """Rebuild a LongformScript from its serialized JSON form (run resume)."""
     beats: list[LongformBeat] = []
     for beat_data in data.get("beats", []):
-        spec = _BEAT_SPECS_BY_KEY.get(str(beat_data.get("key", "")))
+        key = str(beat_data.get("key", ""))
+        spec = _BEAT_SPECS_BY_KEY.get(key)
         if spec is None:
-            raise LongformError(
-                f"unknown beat key in saved script: {beat_data.get('key')!r}"
+            # Tolerate saved scripts whose beat specs are not registered in
+            # this process: format presets build their own specs at
+            # generation time, and the duration enforcer registers its
+            # synthetic "encore" spec only when it appends the beat in the
+            # same run. Rebuild a minimal spec from the serialized fields
+            # (label is persisted in the JSON) so an old run can resume
+            # instead of failing loud on a key this process never saw.
+            label = beat_data.get("label") or key.replace("_", " ").upper()
+            spec = BeatSpec(
+                key=key,
+                label=str(label),
+                fraction=0.0,
+                purpose="",
+                retention="",
             )
+            _BEAT_SPECS_BY_KEY[key] = spec
         scenes = [
             LongformScene(
                 title=str(item.get("title", "")),

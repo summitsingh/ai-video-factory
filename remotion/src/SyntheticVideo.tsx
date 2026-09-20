@@ -470,9 +470,13 @@ const SceneCard = ({
     extrapolateRight: 'clamp',
   });
   // Transient-text envelope: all captions/labels/title cards fade in briefly,
-  // hold ~2s, then clear so only the footage remains on screen.
+  // hold ~2s, then clear so only the footage remains on screen. On act-card
+  // scenes the envelope is delayed until the act card has fully faded: the
+  // card and the caption layers otherwise share the same 84-frame window,
+  // stacking the act label, full-paragraph lower third, and subtitle on top
+  // of each other (Fermi v2 chapter cards at ~10:30 and ~18:30).
   const textOpacity = opacityEnvelope(
-    frame,
+    scene.act ? frame - ACT_CARD_TOTAL_FRAMES : frame,
     TEXT_IN_FRAMES,
     TEXT_HOLD_FRAMES,
     TEXT_OUT_FRAMES,
@@ -1186,6 +1190,10 @@ const CinematicLowerThird = ({
 const ACT_CARD_IN_FRAMES = 12;
 const ACT_CARD_HOLD_FRAMES = 48;
 const ACT_CARD_OUT_FRAMES = 24;
+// Full act-card window: the caption layers must stay hidden for exactly this
+// long on act-card scenes so they never collide with the card.
+const ACT_CARD_TOTAL_FRAMES =
+  ACT_CARD_IN_FRAMES + ACT_CARD_HOLD_FRAMES + ACT_CARD_OUT_FRAMES;
 
 // Act title card: a brief full-frame centered card marking a new act
 // (e.g. "ACT II"). Fades in over ~12 frames, holds ~48, fades out over ~24
