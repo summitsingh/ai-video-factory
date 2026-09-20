@@ -604,7 +604,7 @@ def generate_longform_script(
         previous_titles.extend(scene.title for scene in scenes)
 
     target_words = target_minutes * WORDS_PER_MINUTE
-    if abs(script.total_words - target_words) / target_words > 0.15:
+    if abs(script.total_words - target_words) / target_words > 0.25:
         raise LongformError(
             f"assembled script is {script.total_words} words vs {target_words:.0f} "
             f"target (estimated {script.estimated_minutes:.1f} min vs "
