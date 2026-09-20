@@ -38,6 +38,15 @@ from ai_video_factory.narration import (
     synthesize_to_wav,
     trim_audio_start,
 )
+from ai_video_factory.music_bed import (
+    FINAL_MIX_TARGET_I,
+    FINAL_MIX_TARGET_LRA,
+    FINAL_MIX_TARGET_TP,
+    duck_filter,
+    loudnorm_dual_pass,
+    prepare_music_bed,
+    resolve_music_track,
+)
 from ai_video_factory.qc import QcReport, evaluate_content_qc, evaluate_qc, write_qc_reports
 from ai_video_factory.qc_final import run_final_qc
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
@@ -1072,8 +1081,10 @@ def _mux_narration_audio(
     transient effects (whooshes/drones) at scene boundaries. A room-tone bed,
     when provided, sits underneath everything as a continuous low ambient floor
     so there are no dead-silence gaps between narration segments (#2). The final
-    mix is loudness-normalized to EBU R128 / YouTube (~-16 LUFS, -2 dBTP) so
-    output stays consistent and competitive in level. The result is padded to
+    mix is loudness-normalized with dual-pass EBU R128 / YouTube (~-16 LUFS,
+    -2 dBTP, single-pass fallback) so output stays consistent and
+    competitive in level. The music bed is expected pre-normalized (see
+    the music_bed module) and enters the duck stage at unity gain. The result is padded to
     match the video length, which governs output duration via -shortest.
 
     ffmpeg filter semantics: ``sidechaincompress`` takes [signal][sidechain],
@@ -1090,7 +1101,6 @@ def _mux_narration_audio(
 
     # Build input list and filter chain based on which tracks are available.
     inputs: list[str] = ["-i", str(source)]  # video (may have audio stream)
-    map_args: list[str] = ["-map", "0:v"]
     narr_idx: int | None = None
     music_idx: int | None = None
     sfx_idx: int | None = None
@@ -1121,14 +1131,10 @@ def _mux_narration_audio(
     if narr_idx is not None:
         voice_inputs: list[str] = [f"[{narr_idx}:a]"]
         if music_idx is not None:
-            # Duck the music using narration as the sidechain trigger. When
-            # narration is loud, compress (lower) the music; when quiet, music
-            # returns to its base volume.
+            # Duck the pre-normalized bed (unity gain) under narration via
+            # sidechain compression; it returns to full level in gaps.
             filter_parts.append(
-                f"[{music_idx}:a]volume=0.25[music_base];"
-                f"[music_base][{narr_idx}:a]"
-                "sidechaincompress=threshold=0.03:ratio=15:attack=20:release=250,"
-                "acompressor=threshold=0.02:ratio=4[music_ducked]"
+                duck_filter(f"{music_idx}:a", f"{narr_idx}:a", "music_ducked")
             )
             voice_inputs.append("[music_ducked]")
         if tone_idx is not None:
@@ -1148,7 +1154,8 @@ def _mux_narration_audio(
         # No narration: mix the available beds together at low volume.
         bed_inputs: list[str] = []
         if music_idx is not None:
-            filter_parts.append(f"[{music_idx}:a]volume=0.25[music_base]")
+            # Pre-normalized bed: unity gain (was 0.25 for the old raw drone).
+            filter_parts.append(f"[{music_idx}:a]volume=1.0[music_base]")
             bed_inputs.append("[music_base]")
         if tone_idx is not None:
             filter_parts.append(f"[{tone_idx}:a]volume=0.15[tone_base]")
@@ -1180,23 +1187,61 @@ def _mux_narration_audio(
         # Relabel the pad without a filter (anull is a no-op audio passthrough).
         filter_parts.append("[voice_music]anull[mix]")
 
-    # Step 3: loudness normalization to a consistent broadcast level.
-    filter_parts.append(
-        "[mix]loudnorm=I=-16:TP=-2:LRA=7,aresample=48000[aout]"
-    )
+    # Step 3: render the ducked mix to a temp WAV (no loudnorm yet).
+    filter_parts.append("[mix]aresample=48000,aformat=channel_layouts=stereo[mixout]")
+    mix_wav = destination.parent / "mixdown.wav"
+    norm_wav = destination.parent / "mixdown.norm.wav"
+    mux_timeout = max(300, int((duration_seconds or 90) * 4))
 
-    map_args += ["-map", "[aout]"]
-    argv = [ffmpeg_bin, "-y", *inputs, "-filter_complex", ";".join(filter_parts),
-            *map_args, "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-ar", "48000", "-ac", "2", "-shortest", str(destination)]
-
+    mix_argv: list[str] = [
+        ffmpeg_bin, "-y", *inputs,
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[mixout]",
+        "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
+    ]
+    if duration_seconds:
+        mix_argv += ["-t", f"{duration_seconds:.3f}"]
+    mix_argv.append(str(mix_wav))
     _run_command(
-        tuple(argv),
+        tuple(mix_argv),
         cwd=destination.parent,
-        name="FFmpeg narration + music mux",
-        timeout=max(300, int((duration_seconds or 90) * 4)),
+        name="FFmpeg audio mixdown",
+        timeout=mux_timeout,
         retries=1,
     )
+
+    # Step 4: dual-pass loudness normalization of the complete mix to
+    # EBU R128 / YouTube (-16 LUFS, -2 dBTP, 7 LU). loudnorm_dual_pass falls
+    # back to single-pass if the measurement parse fails.
+    loudnorm_dual_pass(
+        mix_wav,
+        norm_wav,
+        ffmpeg=ffmpeg_bin,
+        target_i=FINAL_MIX_TARGET_I,
+        target_tp=FINAL_MIX_TARGET_TP,
+        target_lra=FINAL_MIX_TARGET_LRA,
+        timeout=mux_timeout,
+        cwd=destination.parent,
+    )
+
+    # Step 5: mux the normalized mix with the video (video stream copied).
+    _run_command(
+        (
+            ffmpeg_bin, "-y",
+            "-i", str(source),
+            "-i", str(norm_wav),
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-ar", "48000", "-ac", "2",
+            "-shortest", str(destination),
+        ),
+        cwd=destination.parent,
+        name="FFmpeg narration + music mux",
+        timeout=mux_timeout,
+        retries=1,
+    )
+    for temp_wav in (mix_wav, norm_wav):
+        temp_wav.unlink(missing_ok=True)
 
 
 def _synthesize_narration_track(
@@ -2313,17 +2358,41 @@ def run_video_pipeline(
                         metadata["tts_voice"] = tts_info.get("tts_voice", "unknown")
                     else:
                         metadata["narration_status"] = "silent_fallback"
-                    # Generate a subtle ambient music bed and duck it under
-                    # narration.
+                    # Background music bed (#8): prefer a real royalty-free
+                    # track (MUSIC_BED_PATH env var), falling back to the
+                    # procedural ambient drone. Either source is fitted to
+                    # the full video duration and loudness-normalized here
+                    # so the mux can duck it under narration at a known
+                    # level. (Pixabay music search is not available with
+                    # this API key; see the music_bed module docstring.)
                     duration_seconds = (
                         edit_doc_render.duration_frames / edit_doc_render.fps
                     )
-                    music_track = _generate_music_bed(
+                    audio_ffmpeg = _required_tool(tools, "ffmpeg")
+                    music_source = resolve_music_track()
+                    if music_source is None:
+                        _generate_music_bed(
+                            duration_seconds,
+                            audio_dir / "music_drone.wav",
+                            ffmpeg=audio_ffmpeg,
+                        )
+                        music_source = audio_dir / "music_drone.wav"
+                        metadata["music_status"] = "procedural_fallback"
+                        metadata["music_note"] = (
+                            "No MUSIC_BED_PATH set; used the procedural "
+                            "ambient drone. Set MUSIC_BED_PATH to a "
+                            "royalty-free track for a real music bed."
+                        )
+                    else:
+                        metadata["music_status"] = "complete"
+                    metadata["music_source"] = str(music_source)
+                    music_track = prepare_music_bed(
+                        music_source,
                         duration_seconds,
                         audio_dir / "music.wav",
-                        ffmpeg=_required_tool(tools, "ffmpeg"),
+                        ffmpeg=audio_ffmpeg,
+                        timeout=max(300, int(duration_seconds * 4)),
                     )
-                    metadata["music_status"] = "complete"
                     # Generate a sound-design track (whooshes/drones at scene
                     # boundaries) to complement narration and music (#4).
                     sfx_track = _generate_sfx_track(
