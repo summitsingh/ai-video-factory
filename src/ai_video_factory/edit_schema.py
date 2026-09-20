@@ -64,6 +64,10 @@ class EditDocument(BaseModel):
     # preserve the full-video scene numbering for on-screen chapter cards.
     total_scenes: int | None = None
     scene_start_index: int | None = None
+    # Styled captions (#9): when True, the Remotion render suppresses its
+    # plain burned-in subtitles because karaoke word-highlight captions are
+    # burned onto the final master instead.
+    karaoke_captions: bool = False
 
     @field_validator("schema_version", mode="before")
     @classmethod

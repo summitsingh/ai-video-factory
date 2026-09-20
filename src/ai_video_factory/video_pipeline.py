@@ -43,7 +43,12 @@ from ai_video_factory.qc_final import run_final_qc
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
-from ai_video_factory.subtitle_export import subtitle_provenance, write_subtitles
+from ai_video_factory.subtitle_export import (
+    burn_karaoke_captions,
+    subtitle_provenance,
+    write_ass_karaoke,
+    write_subtitles,
+)
 from ai_video_factory.nasa_media import populate_assets_from_nasa
 from ai_video_factory.theme import SPACE_THEME, ThemeConfig
 from ai_video_factory.thumbnail import build_thumbnails, validate_thumbnails
@@ -595,6 +600,7 @@ def _finish_chunk(edit: EditDocument, scenes: list[EditScene], total_scenes: int
         created_at=edit.created_at,
         total_scenes=total_scenes,
         scene_start_index=scene_start_index,
+        karaoke_captions=edit.karaoke_captions,
     )
 
 
@@ -1369,6 +1375,20 @@ def _run_command(
     raise PipelineCommandError(last_error or f"{name} failed")
 
 
+def _karaoke_captions_enabled() -> bool:
+    """Whether styled karaoke captions replace plain burned-in subtitles (#9).
+
+    On by default: the Remotion render suppresses its plain subtitles (via
+    the ``karaoke_captions`` edit-doc flag) and the pipeline burns a
+    karaoke word-highlight ASS onto the final master instead. Set
+    ``AVF_KARAOKE_CAPTIONS=0`` to keep the legacy plain-subtitle burn-in.
+    """
+    return (
+        os.environ.get("AVF_KARAOKE_CAPTIONS", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+
+
 def _polish_master(
     source: Path,
     destination: Path,
@@ -2119,6 +2139,14 @@ def run_video_pipeline(
         except Exception as error:  # noqa: BLE001 - subtitles are best-effort
             metadata["subtitle_status"] = f"failed: {sanitize_diagnostic(error)}"
 
+        # Karaoke captions (#9): flag the edit doc so the Remotion render
+        # suppresses its plain burned-in subtitles; the styled word-highlight
+        # ASS is burned onto the final master instead (step 4c below).
+        if _karaoke_captions_enabled() and not edit_doc.karaoke_captions:
+            edit_doc = edit_doc.model_copy(update={"karaoke_captions": True})
+            save_edit(edit_doc, job.edit_path)
+            metadata["karaoke_captions"] = "remotion-plain-suppressed"
+
         # Step 4: Render video with Remotion
         metadata["render_status"] = "in_progress"
         tools = _collect_pipeline_toolchain()
@@ -2343,6 +2371,7 @@ def run_video_pipeline(
             mux_inputs = {
                 "video_sha256": _sha256(temporary_path),
                 "draft": draft,
+                "karaoke_captions": _karaoke_captions_enabled(),
             }
             for label, track in (
                 ("narration", narration_track),
@@ -2388,6 +2417,40 @@ def run_video_pipeline(
                     )
                     shutil.move(str(polished_path), str(run_master))
                     metadata["polish_status"] = "complete"
+                    # Karaoke captions (#9, best-effort): burn the styled
+                    # word-highlight ASS onto the polished master via a
+                    # post-render ffmpeg pass. Runs inside the mux stage so
+                    # a resumed mux already has karaoke burned in (no double
+                    # burn); a failure here must not fail the render.
+                    if _karaoke_captions_enabled():
+                        try:
+                            karaoke_overrides = {
+                                scene.id: narration
+                                for scene in edit_doc.scenes
+                                if scene.narration
+                                for narration in [scene.narration.strip()]
+                                if narration
+                            }
+                            ass_artifacts = write_ass_karaoke(
+                                edit_doc,
+                                output_dir,
+                                base_name="subtitles",
+                                narration_overrides=karaoke_overrides or None,
+                            )
+                            karaoke_tmp = mux_dir / "master.karaoke.mp4"
+                            burn_karaoke_captions(
+                                run_master,
+                                ass_artifacts["ass"],
+                                karaoke_tmp,
+                                ffmpeg=_required_tool(tools, "ffmpeg"),
+                            )
+                            shutil.move(str(karaoke_tmp), str(run_master))
+                            artifacts["karaoke_ass"] = str(ass_artifacts["ass"])
+                            metadata["karaoke_status"] = "complete"
+                        except Exception as error:  # noqa: BLE001 - karaoke is best-effort
+                            metadata["karaoke_status"] = (
+                                f"failed: {sanitize_diagnostic(error)}"
+                            )
                     temporary_path.unlink(missing_ok=True)
                 except Exception as error:
                     state_store.fail(mux_run.run_id, error)
@@ -2432,7 +2495,11 @@ def run_video_pipeline(
                 count=3,
                 power_words=theme.thumbnail_power_words,
                 text_overlays=overlays,
+                # Every video run must produce a canonical 1280x720
+                # thumbnail.jpg in the run's output dir (#6).
+                primary_copy=output_dir / "thumbnail.jpg",
             )
+            artifacts["thumbnail"] = str(thumb_artifacts["thumbnail"])
             artifacts["thumbnail_1"] = str(thumb_artifacts["thumbnail_1"])
             artifacts["thumbnail_2"] = str(thumb_artifacts["thumbnail_2"])
             artifacts["thumbnail_3"] = str(thumb_artifacts["thumbnail_3"])
