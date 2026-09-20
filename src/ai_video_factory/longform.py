@@ -260,7 +260,7 @@ def _lm_studio_chat(
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.1 if json_mode else temperature,
+        "temperature": 0.7 if json_mode else temperature,
         "stream": False,
     }
     # JSON mode constrains the model to output valid JSON only.
