@@ -43,7 +43,9 @@ from ai_video_factory.music_bed import (
     FINAL_MIX_TARGET_LRA,
     FINAL_MIX_TARGET_TP,
     duck_filter,
+    is_library_track,
     loudnorm_dual_pass,
+    mood_for_topic,
     prepare_music_bed,
     resolve_music_track,
 )
@@ -2358,9 +2360,11 @@ def run_video_pipeline(
                         metadata["tts_voice"] = tts_info.get("tts_voice", "unknown")
                     else:
                         metadata["narration_status"] = "silent_fallback"
-                    # Background music bed (#8): prefer a real royalty-free
-                    # track (MUSIC_BED_PATH env var), falling back to the
-                    # procedural ambient drone. Either source is fitted to
+                    # Background music bed (#8): fallback chain in
+                    # resolve_music_track - local mood library for the topic,
+                    # then MUSIC_BED_PATH, then network providers
+                    # (IA/Openverse/Freesound, cached), then the procedural
+                    # ambient drone. Either source is fitted to
                     # the full video duration and loudness-normalized here
                     # so the mux can duck it under narration at a known
                     # level. (Pixabay music search is not available with
@@ -2369,7 +2373,7 @@ def run_video_pipeline(
                         edit_doc_render.duration_frames / edit_doc_render.fps
                     )
                     audio_ffmpeg = _required_tool(tools, "ffmpeg")
-                    music_source = resolve_music_track()
+                    music_source = resolve_music_track(topic=job.topic)
                     if music_source is None:
                         _generate_music_bed(
                             duration_seconds,
@@ -2379,13 +2383,17 @@ def run_video_pipeline(
                         music_source = audio_dir / "music_drone.wav"
                         metadata["music_status"] = "procedural_fallback"
                         metadata["music_note"] = (
-                            "No MUSIC_BED_PATH set; used the procedural "
-                            "ambient drone. Set MUSIC_BED_PATH to a "
-                            "royalty-free track for a real music bed."
+                            "No track resolved from the mood "
+                            "library, MUSIC_BED_PATH, or network providers; "
+                            "used the procedural ambient drone."
                         )
                     else:
                         metadata["music_status"] = "complete"
                     metadata["music_source"] = str(music_source)
+                    metadata["music_mood"] = (
+                        is_library_track(music_source)
+                        or mood_for_topic(job.topic)
+                    )
                     music_track = prepare_music_bed(
                         music_source,
                         duration_seconds,

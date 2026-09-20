@@ -7,12 +7,15 @@ with sidechain compression, and loudness-normalizes the complete final mix
 
 Track sourcing
 --------------
-The pipeline prefers a real, licensed music track supplied by the operator.
 Resolution order in :func:`resolve_music_track`:
 
-1. an explicit ``music_bed_path`` argument, then
+1. the curated local mood library ``assets/music/<mood>-bed.mp3``
+   (``mood`` argument, else :func:`mood_for_topic` on the video topic), then
 2. the ``MUSIC_BED_PATH`` environment variable pointing at an audio file
-   (mp3/wav/ogg/m4a/flac).
+   (mp3/wav/ogg/m4a/flac) - explicit operator override, then
+3. network providers via :mod:`ai_video_factory.music_providers`
+   (Internet Archive -> Openverse -> Freesound), cached under
+   ``data/cache/music/`` so repeats never re-download.
 
 If no track resolves, the caller falls back to the procedural ambient drone
 (``video_pipeline._generate_music_bed``) so the mix never goes out silent;
@@ -64,6 +67,105 @@ from ai_video_factory.sanitization import sanitize_diagnostic
 # Name of the environment variable carrying the operator-supplied music file.
 MUSIC_BED_PATH_ENV = "MUSIC_BED_PATH"
 
+# Optional override for the curated mood-library directory.
+MUSIC_BED_DIR_ENV = "MUSIC_BED_DIR"
+
+# Optional override for the network-provider download cache.
+MUSIC_CACHE_DIR_ENV = "MUSIC_CACHE_DIR"
+
+# Curated royalty-free mood library. Every track is CC-BY 4.0, commercial
+# YouTube use OK with attribution in the video description - see
+# assets/music/ATTRIBUTION.md. The MP3s are gitignored; each machine
+# re-downloads them (or they arrive via the network fallback below).
+MOOD_TRACKS: dict[str, str] = {
+    "cosmic": "cosmic-bed.mp3",    # 'Decoherence' - Scott Buckley
+    "mystery": "mystery-bed.mp3",  # 'Intervention' - Scott Buckley
+    "epic": "epic-bed.mp3",        # 'Emergent' - Scott Buckley
+    "calm": "calm-bed.mp3",        # 'Ephemera' - Scott Buckley
+    "tech": "tech-bed.mp3",        # 'Machina' - Scott Buckley
+}
+
+# Fallback mood when the topic matches no keyword.
+DEFAULT_MOOD = "calm"
+
+# (mood, keywords) in priority order. Keywords become case-insensitive
+# word-prefix regexes, so "astronom" hits "astronomy"/"astronomical".
+# FULL_WORD_KEYWORDS need a trailing boundary too, so "ai" never matches
+# inside "said"/"mountain" and "war" never matches "warm"/"warning".
+_MOOD_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("cosmic", ("space", "cosmos", "universe", "galaxy", "nasa", "astronom",
+                "planet", "exoplanet", "alien", "fermi", "black hole",
+                "nebula", "cosmolog", "astrophys", "telescope", "stars")),
+    ("mystery", ("myster", "unsolved", "secret", "conspiracy", "paradox",
+                 "disappear", "cold case", "detective", "crime", "enigma",
+                 "cover-up", "coverup", "thriller")),
+    ("epic", ("histor", "ancient", "rome", "roman", "egypt", "empire",
+              "civiliz", "medieval", "viking", "battle", "legend", "myth",
+              "kingdom", "sparta", "world war", "warfare", "gladiator")),
+    ("tech", ("artificial intelligence", "ai", "tech", "future", "robot",
+              "computer", "quantum", "digital", "cyber", "software", "neural",
+              "silicon", "machine", "startup", "internet")),
+    ("calm", ("nature", "ocean", "forest", "wildlife", "mountain", "river",
+              "meditat", "mindful", "garden")),
+]
+_FULL_WORD_KEYWORDS = frozenset({"ai", "war", "star", "mars"})
+
+
+def _keyword_pattern(keyword: str) -> str:
+    pattern = r"\b" + re.escape(keyword)
+    if keyword in _FULL_WORD_KEYWORDS:
+        pattern += r"\b"
+    return pattern
+
+
+def mood_for_topic(topic: str | None) -> str:
+    """Pick a music mood for a documentary topic via keyword matching."""
+    text = (topic or "").lower()
+    for mood, keywords in _MOOD_KEYWORDS:
+        for keyword in keywords:
+            if re.search(_keyword_pattern(keyword), text):
+                return mood
+    return DEFAULT_MOOD
+
+
+def music_library_dir() -> Path:
+    """Directory holding the curated mood-library tracks."""
+    override = os.environ.get(MUSIC_BED_DIR_ENV, "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[2] / "assets" / "music"
+
+
+def music_cache_dir(cache_dir: str | Path | None = None) -> Path:
+    """Directory for network-provider downloads (already gitignored)."""
+    if cache_dir:
+        return Path(cache_dir)
+    override = os.environ.get(MUSIC_CACHE_DIR_ENV, "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[2] / "data" / "cache" / "music"
+
+
+def library_track_for_mood(mood: str) -> Path | None:
+    """Return the local library track for *mood*, or None if missing."""
+    filename = MOOD_TRACKS.get((mood or "").strip().lower())
+    if not filename:
+        return None
+    candidate = music_library_dir() / filename
+    return candidate if candidate.is_file() else None
+
+
+def is_library_track(path: str | Path) -> str | None:
+    """Return the mood if *path* is a track from the mood library."""
+    try:
+        name = Path(path).name
+    except Exception:
+        return None
+    for mood, filename in MOOD_TRACKS.items():
+        if filename == name:
+            return mood
+    return None
+
 # Integrated loudness target for the pre-normalized music bed. -23 LUFS keeps
 # the bed clearly audible in narration gaps while leaving headroom for the
 # final mix normalization and the ducking stage.
@@ -79,28 +181,69 @@ class MusicBedError(RuntimeError):
     """Raised when a music bed cannot be built."""
 
 
-def resolve_music_track(music_bed_path: str | Path | None = None) -> Path | None:
-    """Resolve the operator-supplied music track, if any.
+def resolve_music_track(
+    music_bed_path: str | Path | None = None,
+    *,
+    mood: str | None = None,
+    topic: str | None = None,
+    allow_network: bool = True,
+    cache_dir: str | Path | None = None,
+) -> Path | None:
+    """Resolve the music bed track for a run, walking the fallback chain.
 
-    Checks the explicit ``music_bed_path`` first, then the
-    ``MUSIC_BED_PATH`` environment variable. Returns the path when it points
-    at an existing file, otherwise ``None`` (caller falls back to the
-    procedural drone). A configured-but-missing path prints a warning and
-    also resolves to ``None`` rather than failing the whole pipeline run.
+    Order: explicit ``music_bed_path`` -> ``MUSIC_BED_PATH`` env var ->
+    local mood library (``mood``, else :func:`mood_for_topic` on ``topic``)
+    -> network providers (Internet Archive, Openverse, Freesound; results
+    cached under ``data/cache/music/``) -> ``None`` (the caller falls back
+    to the procedural drone).
+
+    A missing file or a failing provider logs a warning and moves to the
+    next source rather than failing the run. ``allow_network=False``
+    disables the network leg (offline runs, tests).
     """
-    candidates: list[Path] = []
+    from ai_video_factory import music_providers
+
+    wanted_mood = (mood or "").strip().lower()
+    if not wanted_mood and topic:
+        wanted_mood = mood_for_topic(topic)
+
+    def _note(source: str, path: Path, extra: str = "") -> Path:
+        print(f"[music_bed] source={source} mood={wanted_mood or '-'} "
+              f"path={path}" + (f" {extra}" if extra else ""))
+        return path
+
     if music_bed_path:
-        candidates.append(Path(music_bed_path))
+        candidate = Path(music_bed_path)
+        if candidate.is_file():
+            return _note("explicit", candidate)
+        print(f"[music_bed] WARNING: explicit track {candidate} missing; "
+              "continuing down the fallback chain.")
     env_path = os.environ.get(MUSIC_BED_PATH_ENV, "").strip()
     if env_path:
-        candidates.append(Path(env_path))
-    for candidate in candidates:
+        candidate = Path(env_path)
         if candidate.is_file():
-            return candidate
-        print(
-            f"[music_bed] WARNING: {MUSIC_BED_PATH_ENV}={candidate} does not "
-            "exist; falling back to the procedural music bed."
-        )
+            return _note("env", candidate)
+        print(f"[music_bed] WARNING: {MUSIC_BED_PATH_ENV}={candidate} "
+              "missing; continuing down the fallback chain.")
+    if wanted_mood:
+        track = library_track_for_mood(wanted_mood)
+        if track is not None:
+            return _note("library", track)
+        print(f"[music_bed] WARNING: no local track for mood "
+              f"'{wanted_mood}' in {music_library_dir()}; trying network.")
+    if wanted_mood and allow_network:
+        dest, provider_name, net_track = \
+            music_providers.fetch_from_providers(
+                wanted_mood,
+                cache_dir=music_cache_dir(cache_dir),
+            )
+        if dest is not None:
+            return _note(provider_name, dest,
+                         extra=f"title={net_track.title!r} "
+                               f"license={net_track.license}")
+    elif not allow_network:
+        print("[music_bed] network providers disabled "
+              "(allow_network=False).")
     return None
 
 
