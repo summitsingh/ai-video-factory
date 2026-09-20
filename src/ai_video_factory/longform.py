@@ -218,7 +218,7 @@ Purpose: {spec.purpose}
 Retention device: {spec.retention}
 
 Requirements:
-- About {word_target} words of narration total across the beat.
+- CRITICAL: Write AT LEAST {word_target} words of narration total across the beat. Do not write less.
 - Exactly {scene_target} scenes.
 - Each scene: a short title, narration (110-190 words), a visual_direction \
 describing what the viewer sees (archival footage, NASA imagery, data visualization, \
