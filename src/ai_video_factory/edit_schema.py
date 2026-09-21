@@ -16,7 +16,7 @@ class EditScene(BaseModel):
     from_frame: int = Field(ge=0)
     duration_frames: int = Field(gt=0)
     title: str = Field(min_length=1)
-    caption: str = Field(min_length=1)
+    caption: str = Field(default="", description="On-screen label; empty when narration drives captions")
     kind: Literal["normal", "intro", "outro"] = Field(default="normal")
     
     # Extended fields for rich content

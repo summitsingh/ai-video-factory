@@ -713,12 +713,16 @@ def longform_to_edit_document(
                 beat_index == total_beats - 1 and scene_index == len(beat.scenes) - 1
             )
             kind = "intro" if is_first_overall else "outro" if is_last_overall else "normal"
+            # Caption must stay empty here: the narration already drives
+            # karaoke/ASS captions, and copying it into caption breaks
+            # on-screen text (LowerThird cyan box, title-card paragraph).
+            # A short label can be set downstream if needed.
             edit_scene = EditScene(
                 id=f"{beat.spec.key}-{scene_index}",
                 from_frame=cursor,
                 duration_frames=duration_frames,
                 title=scene.title,
-                caption=scene.narration,
+                caption="",
                 kind=kind,  # type: ignore[arg-type]
                 visual=scene.visual_direction or None,
                 narration=scene.narration,
