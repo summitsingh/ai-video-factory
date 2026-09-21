@@ -166,7 +166,7 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
         />
         {/* Color grade over the footage for a consistent filmic look. */}
         {/* Brightness lift: space footage is inherently dark; boost to keep it visible. */}
-        <AbsoluteFill style={{filter: `${perSceneGrade(seed)} brightness(1.45) saturate(1.15)`}} />
+        <AbsoluteFill style={{filter: `${perSceneGrade(seed)} brightness(2.0) contrast(1.05) saturate(1.2)`}} />
       </AbsoluteFill>
     );
   }
