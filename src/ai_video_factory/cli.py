@@ -743,6 +743,7 @@ def nightly_batch(
 
     def script_fn(candidate: dict) -> dict:
         from ai_video_factory.longform import generate_longform_script
+        from ai_video_factory.longform import check_topic_adherence
         from pathlib import Path as _Path
         script = generate_longform_script(
             topic=candidate["title"],
@@ -751,6 +752,10 @@ def nightly_batch(
             target_minutes=target_minutes,
             format_key=format_key,
         )
+        # Fail loud before any render budget is spent when the narration
+        # drifts onto an unrelated story (Fermi v3 shipped JFK-assassination
+        # material across 24/26 scenes).
+        check_topic_adherence(script)
         return {"words": script.total_words, "title": script.title}
 
     def pipeline_fn(topic: dict, script: dict, draft: bool, **kwargs) -> dict:

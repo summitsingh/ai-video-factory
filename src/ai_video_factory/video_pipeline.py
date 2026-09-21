@@ -1736,6 +1736,17 @@ def run_video_pipeline(
                         format_key=format_key,
                         chat_fn=_chat_with_url,
                     )
+                    # Topic-adherence gate: fail loud before render when the
+                    # narration drifts onto an unrelated story. Plain-text
+                    # verdict call, so bypass the json_mode wrapper.
+                    from ai_video_factory.longform import check_topic_adherence
+                    from ai_video_factory.longform import _lm_studio_chat
+                    check_topic_adherence(
+                        longform_script,
+                        chat=lambda messages, max_tokens: _lm_studio_chat(
+                            messages, max_tokens, api_url=llm_url, json_mode=False
+                        ),
+                    )
                     state_store.heartbeat(script_run.run_id)
                 except Exception as error:
                     # Same fail-loud contract as the short path: a bad beat

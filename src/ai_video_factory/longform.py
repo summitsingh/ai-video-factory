@@ -802,3 +802,60 @@ def longform_script_from_dict(data: dict[str, Any]) -> LongformScript:
         source_verification=data.get("source_verification"),
         enforcement=data.get("enforcement"),
     )
+
+
+def check_topic_adherence(
+    script: LongformScript,
+    chat: Callable[[list[dict[str, str]], int], str] | None = None,
+) -> None:
+    """Fail loud when assembled narration drifts onto an unrelated story.
+
+    Guards the failure mode where the generator bleeds material from a
+    different topic (people, places, events that do not belong to this
+    documentary) into the narration across many scenes. Uses one extra LLM
+    judgement call over the concatenated narration; raises ``LongformError``
+    on contamination so the run aborts before any render budget is spent.
+
+    Pass ``chat`` to override the backend (tests, custom endpoints).
+    """
+    judge = chat or _lm_studio_chat
+    narration = "\n\n".join(
+        f"[{beat.spec.key}] {scene.title}: {scene.narration}"
+        for beat in script.beats
+        for scene in beat.scenes
+    )
+    prompt = (
+        f'Documentary topic: "{script.topic}". Angle: {script.description}\n\n'
+        "You are a strict script supervisor. Read the narration below and decide "
+        "whether every scene stays on the documentary topic, or whether material "
+        "from an UNRELATED story (different people, places, or events) has bled "
+        "into it. Incidental metaphors are fine; sustained off-topic passages "
+        "are not.\n\n"
+        "Start your reply with exactly one word: CLEAN or CONTAMINATED. "
+        "If CONTAMINATED, add one short sentence naming the intruding material.\n\n"
+        f"NARRATION:\n{narration[:12000]}"
+    )
+    try:
+        verdict = judge(
+            [
+                {"role": "system", "content": "You are a strict script supervisor."},
+                {"role": "user", "content": prompt},
+            ],
+            200,
+        )
+    except Exception as error:
+        raise LongformError(f"topic-adherence gate failed to run: {error}") from error
+    tokens = (verdict or "").strip().split()
+    first = tokens[0].upper().rstrip(".:,;!") if tokens else ""
+    if first == "CLEAN":
+        return
+    if first == "CONTAMINATED":
+        detail = (verdict or "").strip()[len("CONTAMINATED"):].strip(" :-")
+        raise LongformError(
+            f"topic-adherence gate: narration drifted off topic {script.topic!r}. "
+            f"{detail}"
+        )
+    raise LongformError(
+        "topic-adherence gate returned an unparseable verdict: "
+        f"{(verdict or '')[:80]!r}"
+    )
