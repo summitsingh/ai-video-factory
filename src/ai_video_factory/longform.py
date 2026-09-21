@@ -804,36 +804,44 @@ def longform_script_from_dict(data: dict[str, Any]) -> LongformScript:
     )
 
 
-def check_topic_adherence(
-    script: LongformScript,
-    chat: Callable[[list[dict[str, str]], int], str] | None = None,
+_TOPIC_CHUNK_CHARS = 4000
+
+
+def _narration_chunks(script: LongformScript) -> list[str]:
+    """Split the full narration into ~4000-char chunks on scene boundaries."""
+    chunks: list[str] = []
+    current = ""
+    for beat in script.beats:
+        for scene in beat.scenes:
+            block = f"[{beat.spec.key}] {scene.title}: {scene.narration}"
+            if current and len(current) + len(block) + 2 > _TOPIC_CHUNK_CHARS:
+                chunks.append(current)
+                current = ""
+            current = f"{current}\n\n{block}" if current else block
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _judge_narration_chunk(
+    judge: Callable[[list[dict[str, str]], int], str],
+    topic: str,
+    description: str,
+    chunk: str,
+    chunk_index: int,
+    chunk_total: int,
 ) -> None:
-    """Fail loud when assembled narration drifts onto an unrelated story.
-
-    Guards the failure mode where the generator bleeds material from a
-    different topic (people, places, events that do not belong to this
-    documentary) into the narration across many scenes. Uses one extra LLM
-    judgement call over the concatenated narration; raises ``LongformError``
-    on contamination so the run aborts before any render budget is spent.
-
-    Pass ``chat`` to override the backend (tests, custom endpoints).
-    """
-    judge = chat or _lm_studio_chat
-    narration = "\n\n".join(
-        f"[{beat.spec.key}] {scene.title}: {scene.narration}"
-        for beat in script.beats
-        for scene in beat.scenes
-    )
     prompt = (
-        f'Documentary topic: "{script.topic}". Angle: {script.description}\n\n'
-        "You are a strict script supervisor. Read the narration below and decide "
-        "whether every scene stays on the documentary topic, or whether material "
-        "from an UNRELATED story (different people, places, or events) has bled "
-        "into it. Incidental metaphors are fine; sustained off-topic passages "
-        "are not.\n\n"
+        f'Documentary topic: "{topic}". Angle: {description}\n\n'
+        "You are a strict script supervisor. Read the narration excerpt below "
+        "(it is part of a longer documentary script; judge ONLY what you see "
+        "here) and decide whether it stays on the documentary topic, or whether "
+        "material from an UNRELATED story (different people, places, or events) "
+        "has bled into it. Incidental metaphors are fine; sustained off-topic "
+        "passages are not.\n\n"
         "Start your reply with exactly one word: CLEAN or CONTAMINATED. "
         "If CONTAMINATED, add one short sentence naming the intruding material.\n\n"
-        f"NARRATION:\n{narration[:12000]}"
+        f"NARRATION (part {chunk_index + 1} of {chunk_total}):\n{chunk}"
     )
     try:
         verdict = judge(
@@ -841,7 +849,7 @@ def check_topic_adherence(
                 {"role": "system", "content": "You are a strict script supervisor."},
                 {"role": "user", "content": prompt},
             ],
-            200,
+            300,
         )
     except Exception as error:
         raise LongformError(f"topic-adherence gate failed to run: {error}") from error
@@ -852,10 +860,34 @@ def check_topic_adherence(
     if first == "CONTAMINATED":
         detail = (verdict or "").strip()[len("CONTAMINATED"):].strip(" :-")
         raise LongformError(
-            f"topic-adherence gate: narration drifted off topic {script.topic!r}. "
-            f"{detail}"
+            f"topic-adherence gate: narration drifted off topic {topic!r} "
+            f"(part {chunk_index + 1} of {chunk_total}). {detail}"
         )
     raise LongformError(
         "topic-adherence gate returned an unparseable verdict: "
         f"{(verdict or '')[:80]!r}"
     )
+
+
+def check_topic_adherence(
+    script: LongformScript,
+    chat: Callable[[list[dict[str, str]], int], str] | None = None,
+) -> None:
+    """Fail loud when assembled narration drifts onto an unrelated story.
+
+    Guards the failure mode where the generator bleeds material from a
+    different topic (people, places, events that do not belong to this
+    documentary) into the narration across many scenes. Judges the ENTIRE
+    narration in ~4000-character chunks so contamination buried deep in a
+    long script cannot hide past a single-prefix check; any contaminated
+    chunk raises ``LongformError`` before any render budget is spent.
+
+    Pass ``chat`` to override the backend (tests, custom endpoints).
+    """
+    judge = chat or _lm_studio_chat
+    chunks = _narration_chunks(script)
+    for index, chunk in enumerate(chunks):
+        _judge_narration_chunk(
+            judge, script.topic, script.description,
+            chunk, index, len(chunks),
+        )
