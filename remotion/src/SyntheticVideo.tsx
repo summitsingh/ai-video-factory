@@ -10,10 +10,15 @@ import {
 } from 'remotion';
 import type {EditDocument, EditScene} from './schema';
 
+// Procedural fallback backgrounds (used for media-less scenes such as the
+// intentional intro/outro title cards). Kept luminous on purpose: each
+// gradient carries a soft nebula radial glow and lifted mid-tones so these
+// frames stay well clear of the brightness QC gate instead of reading as
+// near-black.
 const BACKGROUNDS = [
-  'linear-gradient(135deg, #0e2a5c 0%, #0a0a24 100%)',
-  'linear-gradient(135deg, #5c0e2a 0%, #1a0a24 100%)',
-  'linear-gradient(135deg, #0e5c3d 0%, #0a1a24 100%)',
+  'radial-gradient(circle at 30% 25%, rgba(96,165,250,0.30) 0%, rgba(96,165,250,0) 62%), linear-gradient(135deg, #2e4f94 0%, #20204c 100%)',
+  'radial-gradient(circle at 70% 30%, rgba(244,114,182,0.26) 0%, rgba(244,114,182,0) 62%), linear-gradient(135deg, #94304f 0%, #3a204c 100%)',
+  'radial-gradient(circle at 50% 70%, rgba(52,211,153,0.24) 0%, rgba(52,211,153,0) 62%), linear-gradient(135deg, #2f8058 0%, #203448 100%)',
 ];
 
 // Per-scene color grade (#6): derive a small, deterministic variation on the
@@ -529,7 +534,7 @@ const SceneCard = ({
       <AbsoluteFill
         style={{
           background:
-            'radial-gradient(ellipse at center, transparent 45%, rgba(0,0,0,0.6) 100%)',
+            'radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.42) 100%)',
           pointerEvents: 'none',
         }}
       />

@@ -461,6 +461,22 @@ def _load_repo_dotenv() -> None:
             os.environ[key] = value
 
 
+def _asset_identity(disk_path: Path, slot_name: str) -> str:
+    """Stable blocklist key for an asset file.
+
+    Uses a SHA-256 content hash when the file exists so a rejected clip
+    never blocks a *different* file that later lands at the same scene
+    slot. Falls back to the slot filename when the file is missing.
+    """
+    try:
+        if disk_path.is_file():
+            digest = hashlib.sha256(disk_path.read_bytes()).hexdigest()
+            return f"sha256:{digest}"
+    except OSError:
+        pass
+    return slot_name
+
+
 def _rejection_reasons(check: dict) -> list:
     """Reasons for an asset-QC rejection, never empty.
 
@@ -579,14 +595,22 @@ def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocu
             scene_dir = assets_dir / f"scene-{idx:02d}"
             if scene_dir.is_dir():
                 clips = sorted(scene_dir.glob("*clip*.mp4"))
-                images = sorted(
+                stock_images = sorted(
                     [p for p in scene_dir.iterdir()
                      if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
                      and p.is_file()
-                     # Prefer downloaded stock over generated fallback:
+                     # Prefer downloaded stock over the generated fallback:
                      # generated.png sorts first alphabetically and would
                      # shadow a good stock asset.
                      and p.name != "generated.png"]
+                )
+                # Fall back to the AI-generated still when no stock image
+                # exists: it is bright and cinematic, unlike the dark
+                # procedural gradient the renderer uses for media-less
+                # scenes (which always fails the brightness QC gate).
+                generated_fallback = scene_dir / "generated.png"
+                images = stock_images or (
+                    [generated_fallback] if generated_fallback.is_file() else []
                 )
                 # Use a scene-specific filename so each scene resolves to
                 # its own media file in Remotion's public/ directory.
@@ -2076,10 +2100,20 @@ def run_video_pipeline(
                     except (OSError, json.JSONDecodeError):
                         providers_map = {}
                 for scene in edit_doc.scenes:
+                    scene_slot_idx = asset_slots.get(scene.id)
                     for kind, asset_path in (("clip", scene.clip), ("image", scene.image)):
                         if not asset_path:
                             continue
-                        asset_id = str(asset_path)
+                        # Resolve the on-disk path up front so the blocklist
+                        # key is a content hash, not the slot filename: a
+                        # rejected clip must never block a *different* file
+                        # that later lands at the same scene slot.
+                        disk_path = assets_root / asset_path
+                        if not disk_path.is_file():
+                            # Fall back to scanning the scene dir for the file.
+                            candidates = list(assets_root.glob(f"*/{asset_path}"))
+                            disk_path = candidates[0] if candidates else disk_path
+                        asset_id = _asset_identity(disk_path, str(asset_path))
                         if memory.is_blocked(asset_id):
                             rejected += 1
                             if kind == "clip":
@@ -2087,13 +2121,6 @@ def run_video_pipeline(
                             else:
                                 scene.image = None
                             continue
-                        # Resolve the on-disk path for QC: public-relative
-                        # names live in the per-scene assets dir.
-                        disk_path = assets_root / asset_path
-                        if not disk_path.is_file():
-                            # Fall back to scanning the scene dir for the file.
-                            candidates = list(assets_root.glob(f"*/{asset_path}"))
-                            disk_path = candidates[0] if candidates else disk_path
                         check = (
                             verify_video_asset(str(disk_path), qc_dir)
                             if kind == "clip"
@@ -2103,8 +2130,8 @@ def run_video_pipeline(
                         if not check.get("ok", False):
                             reasons = _rejection_reasons(check)
                             scene_dir_name = (
-                                f"scene-{fallback_idx:02d}"
-                                if fallback_idx is not None else ""
+                                f"scene-{scene_slot_idx:02d}"
+                                if scene_slot_idx is not None else ""
                             )
                             source = providers_map.get(scene_dir_name, "unknown")
                             memory.record_rejection(
@@ -2124,9 +2151,8 @@ def run_video_pipeline(
                                 scene.clip = None
                             else:
                                 scene.image = None
-                    fallback_idx = asset_slots.get(scene.id)
-                    if not scene.clip and not scene.image and fallback_idx is not None:
-                        scene_dir = assets_root / f"scene-{fallback_idx:02d}"
+                    if not scene.clip and not scene.image and scene_slot_idx is not None:
+                        scene_dir = assets_root / f"scene-{scene_slot_idx:02d}"
                         scene_dir.mkdir(parents=True, exist_ok=True)
                         out = scene_dir / "generated.png"
                         generate_scene_visual(
