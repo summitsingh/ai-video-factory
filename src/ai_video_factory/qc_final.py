@@ -37,6 +37,12 @@ SCHEMA_VERSION = 1
 BLACK_LUMA_THRESHOLD = 16.0
 BLACK_FRAME_RATIO_LIMIT = 0.15
 BLACK_SAMPLE_FPS = 1.0
+#: Brightest-1% pixel mean below which a low-luma frame counts as truly
+#: empty. Mirrors asset_qc.BLACK_CONTENT_THRESHOLD: separates empty black
+#: frames (missing/failed assets, the defect this gate exists to catch)
+#: from legitimate dark cinematography such as starfields and night
+#: scenes, which asset QC deliberately accepts.
+BLACK_CONTENT_THRESHOLD = 15.0
 SILENCE_NOISE_DB = -70.0
 SILENCE_MAX_SECONDS = 3.0
 AUDIO_PEAK_MIN_DBFS = -30.0
@@ -236,13 +242,20 @@ def check_black_frames(
     master: Path,
     exclude_windows: list[tuple[float, float]] | None = None,
 ) -> FinalQcCheck:
-    """Fail when >15% of ~1fps sampled frames are near-black (mean luma < 16).
+    """Fail when >15% of ~1fps sampled frames are truly empty.
 
     ``exclude_windows`` is a list of (start, end) seconds where dark frames
     are by design (intro/outro branded cards, act-card scrim windows - see
     :func:`black_frame_exclude_windows`). Samples inside those windows are
-    ignored so intended darkness never counts as a defect. Uniform black
-    frames across normal content scenes still fail.
+    ignored so intended darkness never counts as a defect.
+
+    A frame counts as empty only when BOTH its mean luma is below
+    BLACK_LUMA_THRESHOLD AND the mean of its brightest 1% of pixels is
+    below BLACK_CONTENT_THRESHOLD. Legitimate dark cinematography
+    (starfields, night skies, night-city footage) holds bright content and
+    never counts, matching asset QC's deliberate acceptance of such footage
+    (see asset_qc.BLACK_CONTENT_THRESHOLD). Genuinely empty frames from
+    missing or failed assets still fail, as before.
     """
     completed = subprocess.run(
         [
@@ -279,18 +292,24 @@ def check_black_frames(
         .reshape(num_frames, frame_bytes)
         .astype(float)
     )
-    mean_luma = frames.mean(axis=1)
     excluded = _excluded_sample_mask(num_frames, exclude_windows)
-    measured = mean_luma[~excluded]
-    if measured.size == 0:
+    measured_frames = frames[~excluded]
+    if measured_frames.shape[0] == 0:
         return FinalQcCheck(
             name="black-frames",
             passed=False,
             detail="no content frames outside excluded windows could be sampled",
             value=0,
         )
-    black = int((measured < BLACK_LUMA_THRESHOLD).sum())
-    ratio = black / measured.size
+    mean_luma = measured_frames.mean(axis=1)
+    top1_count = max(frame_bytes // 100, 1)
+    brightest1 = np.partition(
+        measured_frames, frame_bytes - top1_count, axis=1
+    )[:, frame_bytes - top1_count :].mean(axis=1)
+    black = int(
+        ((mean_luma < BLACK_LUMA_THRESHOLD) & (brightest1 < BLACK_CONTENT_THRESHOLD)).sum()
+    )
+    ratio = black / measured_frames.shape[0]
     excluded_note = (
         f"; {int(excluded.sum())} dark-by-design samples excluded"
         if exclude_windows
@@ -300,8 +319,8 @@ def check_black_frames(
         name="black-frames",
         passed=ratio <= BLACK_FRAME_RATIO_LIMIT,
         detail=(
-            f"{black}/{measured.size} content frames near-black "
-            f"(mean luma < {BLACK_LUMA_THRESHOLD:g}; ratio {ratio:.2%}, "
+            f"{black}/{measured_frames.shape[0]} content frames truly empty "
+            f"(mean luma < {BLACK_LUMA_THRESHOLD:g} with brightest-1% < {BLACK_CONTENT_THRESHOLD:g}; ratio {ratio:.2%}, "
             f"limit {BLACK_FRAME_RATIO_LIMIT:.0%}{excluded_note})"
         ),
         value=round(ratio, 4),

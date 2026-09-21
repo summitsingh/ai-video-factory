@@ -721,7 +721,15 @@ def longform_to_edit_document(
                 id=f"{beat.spec.key}-{scene_index}",
                 from_frame=cursor,
                 duration_frames=duration_frames,
-                title=scene.title,
+                # Branded bookend cards (intro title card, outro credits)
+                # must present the documentary title, never the beat's
+                # creative scene title (e.g. an intro card reading
+                # "Silent Night" instead of "The Fermi Paradox").
+                title=(
+                    script.title
+                    if (is_first_overall or is_last_overall)
+                    else scene.title
+                ),
                 caption="",
                 kind=kind,  # type: ignore[arg-type]
                 visual=scene.visual_direction or None,

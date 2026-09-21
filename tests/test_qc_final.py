@@ -263,3 +263,57 @@ def test_run_final_qc_accepts_exclude_windows(tmp_path: Path) -> None:
     black = next(c for c in report.checks if c.name == "black-frames")
     assert black.passed
     assert report.passed
+
+
+# ========== dark-cinematography vs truly-empty regression tests ==========
+
+def _make_starfield_master(path: Path, total_seconds: int = 12) -> None:
+    """Synthetic starfield: near-black frames that still hold bright content.
+
+    Mean luma stays well under BLACK_LUMA_THRESHOLD but the brightest 1%
+    of pixels are stars at full white, so this must NOT count as black.
+    """
+    import subprocess
+
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i",
+            f"color=c=black:size=320x240:rate=15:duration={total_seconds}",
+            "-f", "lavfi", "-i",
+            f"sine=frequency=440:duration={total_seconds}:sample_rate=48000",
+            "-vf",
+            "geq=lum='if(gt(random(0)*1000,992),255,lum(X,Y))'",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-shortest", str(path),
+        ],
+        check=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not on PATH")
+def test_check_black_frames_ignores_starfield_cinematography(
+    tmp_path: Path,
+) -> None:
+    from ai_video_factory.qc_final import check_black_frames
+
+    master = tmp_path / "starfield.mp4"
+    _make_starfield_master(master)
+    check = check_black_frames("ffmpeg", master)
+    assert check.passed
+    assert check.value == 0.0
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not on PATH")
+def test_check_black_frames_still_fails_truly_empty_frames(
+    tmp_path: Path,
+) -> None:
+    from ai_video_factory.qc_final import check_black_frames
+
+    master = tmp_path / "empty.mp4"
+    _make_mixed_master(master, black_seconds=12, total_seconds=12)
+    check = check_black_frames("ffmpeg", master)
+    assert not check.passed
+    assert check.value == 1.0

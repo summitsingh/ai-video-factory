@@ -352,3 +352,17 @@ def test_from_dict_tolerates_any_unknown_beat_key():
     again = longform_script_from_dict(_saved_script_dict([("discovery", "DISCOVERY", 90)]))
     assert again.beats[-1].spec.key == "discovery"
     assert again.beats[-1].spec.label == "DISCOVERY"
+
+
+def test_longform_bookend_cards_use_documentary_title():
+    script = _script_20min()
+    doc = longform_to_edit_document(script, fps=30)
+    # Branded bookend cards must present the documentary title, never the
+    # beat's creative scene title.
+    assert doc.scenes[0].kind == "intro"
+    assert doc.scenes[0].title == script.title
+    assert doc.scenes[-1].kind == "outro"
+    assert doc.scenes[-1].title == script.title
+    # Middle scenes keep their creative titles.
+    assert doc.scenes[1].title == script.beats[0].scenes[1].title
+    assert doc.scenes[1].title != script.title
