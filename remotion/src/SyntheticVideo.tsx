@@ -11,9 +11,9 @@ import {
 import type {EditDocument, EditScene} from './schema';
 
 const BACKGROUNDS = [
-  'linear-gradient(135deg, #071a3d 0%, #000000 100%)',
-  'linear-gradient(135deg, #3d071a 0%, #000000 100%)',
-  'linear-gradient(135deg, #073d2a 0%, #000000 100%)',
+  'linear-gradient(135deg, #0e2a5c 0%, #0a0a24 100%)',
+  'linear-gradient(135deg, #5c0e2a 0%, #1a0a24 100%)',
+  'linear-gradient(135deg, #0e5c3d 0%, #0a1a24 100%)',
 ];
 
 // Per-scene color grade (#6): derive a small, deterministic variation on the
@@ -166,7 +166,7 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
         />
         {/* Color grade over the footage for a consistent filmic look. */}
         <AbsoluteFill style={{filter: perSceneGrade(seed)}} />
-        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.55)'}} />
+        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.28)'}} />
       </AbsoluteFill>
     );
   }
@@ -211,7 +211,7 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
         />
         {/* Color grade over the still image for a consistent filmic look. */}
         <AbsoluteFill style={{filter: perSceneGrade(seed)}} />
-        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.55)'}} />
+        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.28)'}} />
       </AbsoluteFill>
     );
   }
@@ -524,7 +524,7 @@ const SceneCard = ({
       {/* Picture-in-picture inset (#5): secondary asset in a corner window */}
       {scene.pip && <PictureInPicture scene={scene} />}
       {/* Animated starfield for depth behind title cards */}
-      <StarField count={80} />
+      <StarField count={140} />
       {/* Cinematic vignette to focus the eye and add a filmic look */}
       <AbsoluteFill
         style={{
