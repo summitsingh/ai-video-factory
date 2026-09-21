@@ -385,7 +385,7 @@ def cache_assets_for_remotion(
 def _ensure_clip_ready(src: Path, dst: Path, *, max_bytes: int = 80_000_000) -> None:
     """Copy ``src`` to ``dst``, re-encoding oversized clips for browser playback.
 
-    NASA video files can be hundreds of MB at high bitrate/resolution; Chrome's
+    Stock video files can be hundreds of MB at high bitrate/resolution; Chrome's
     decoder struggles with those during a long looping render. If the source is
     already small enough we copy it verbatim, otherwise we re-encode to H.264 at
     720p with a modest bitrate so it decodes quickly and stays under ``max_bytes``.
@@ -1595,7 +1595,7 @@ def run_video_pipeline(
         script_path: Optional pre-made script JSON (worker output) used in
             place of LM Studio generation. Still copied to the job script path.
         theme: Optional per-topic theming (outro caption, thumbnail power
-            words, NASA stop words). Defaults to the built-in "space" theme,
+            words, theme stop words). Defaults to the built-in "space" theme,
             preserving the original behavior.
         trend_source: Which trend providers research may query: "reddit",
             "gnews", or "all" (default). Passed to research_trending_topics.
@@ -2035,7 +2035,7 @@ def run_video_pipeline(
             save_edit(edit_doc, job.edit_path)
         # Resolve the assets directory used to attach per-scene media. If the
         # caller did not supply one (--assets-dir), populate an internal
-        # directory from NASA's public-domain library so scenes get real footage
+        # directory from the free stock providers (Pexels/Pixabay) so scenes get real footage
         # by default. This reuses attach_scene_assets() unchanged; nothing is
         # uploaded or published here.
         assets_dir_used: Path | None = job.assets_dir
@@ -2078,7 +2078,7 @@ def run_video_pipeline(
             if metadata["assets_attached"] == 0 and scene_asset_slots(edit_doc.scenes):
                 log.error(
                     "visual pipeline: 0 scenes have any clip/image after the "
-                    "NASA and stock passes; the render will be procedural "
+                    "stock passes; the render will be procedural "
                     "backgrounds only"
                 )
 
