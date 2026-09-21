@@ -409,6 +409,7 @@ class StockFootageProvider:
             license_url=candidate.license_url,
             source_url=candidate.source_url,
             query=query,
+            provider=candidate.provider,
         )
 
     def fetch_clip(
