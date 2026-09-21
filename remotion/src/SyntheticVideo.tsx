@@ -165,8 +165,8 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
           style={{height: '100%', objectFit: 'cover', width: '100%'}}
         />
         {/* Color grade over the footage for a consistent filmic look. */}
-        <AbsoluteFill style={{filter: perSceneGrade(seed)}} />
-        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.28)'}} />
+        {/* Brightness lift: space footage is inherently dark; boost to keep it visible. */}
+        <AbsoluteFill style={{filter: `${perSceneGrade(seed)} brightness(1.45) saturate(1.15)`}} />
       </AbsoluteFill>
     );
   }
@@ -211,7 +211,7 @@ const SceneMedia = ({scene}: {scene: EditScene}) => {
         />
         {/* Color grade over the still image for a consistent filmic look. */}
         <AbsoluteFill style={{filter: perSceneGrade(seed)}} />
-        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.28)'}} />
+        <AbsoluteFill style={{backgroundColor: 'rgba(0, 0, 0, 0.15)'}} />
       </AbsoluteFill>
     );
   }
