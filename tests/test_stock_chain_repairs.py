@@ -1,5 +1,5 @@
 """Regression tests for the no-NASA stock chain, QC reason/source fixes,
-xfade duration accounting, and karaoke caption placement."""
+strict duration QC (hard-cut concat), and karaoke caption placement."""
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -47,23 +47,20 @@ def _decoded_media() -> MediaInfo:
     return replace(parse_ffprobe(payload), decode_succeeded=True)
 
 
-def test_duration_qc_accounts_for_xfade_overlap():
+def test_duration_qc_rejects_short_master_strictly():
+    # Hard-cut concat is duration-preserving, so the master must match the
+    # edit timeline exactly. A master shortened by the old xfade join
+    # overlap (19.2s on the 25-chunk Fermi v3 render) is a real defect: it
+    # would desync the edit-timeline narration, captions, and chapters.
+    # No overlap may be subtracted to make a short master pass.
     edit = load_edit(Path("fixtures/synthetic-edit.json"))
     edit_total = edit.duration_frames / edit.fps
-    # Master shortened by the known xfade join overlap (like the 19.2s gap
-    # on the 25-chunk Fermi v3 render) must fail without the accounting...
-    media = replace(_decoded_media(), duration_seconds=edit_total - 19.2)
+    short = replace(_decoded_media(), duration_seconds=edit_total - 19.2)
     failing = next(
-        check for check in evaluate_qc(media, edit).checks if check.name == "duration"
+        check for check in evaluate_qc(short, edit).checks if check.name == "duration"
     )
     assert failing.passed is False
-    # ...and pass once the overlap is declared.
-    passing = next(
-        check
-        for check in evaluate_qc(media, edit, transition_overlap_seconds=19.2).checks
-        if check.name == "duration"
-    )
-    assert passing.passed is True
+    assert "expected" in failing.detail and "got" in failing.detail
 
 
 def test_duration_qc_without_overlap_is_unchanged():

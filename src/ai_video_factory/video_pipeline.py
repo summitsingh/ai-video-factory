@@ -678,63 +678,47 @@ def _resolve_ffprobe(ffmpeg_bin: str) -> str:
     return "ffprobe"
 
 
-_XFADE_SECONDS = 0.8
-
-
 def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None = None) -> bool:
-    """Concatenate rendered chunk MP4s.
+    """Concatenate rendered chunk MP4s with duration-preserving hard cuts.
 
-    Prefers an xfade-based re-encode so transitions between chunks are smooth
-    cross-dissolves instead of hard cuts. Falls back to stream-copy concat if
-    the xfade path fails (e.g. codec incompatibility), preserving the original
-    behavior in that case.
+    Uses the ffmpeg concat demuxer with stream copy, so the master duration
+    is exactly the sum of the chunk durations (i.e. the edit-document
+    timeline). Cross-dissolve (xfade) joins were removed because each join
+    overlapped the timeline by 0.8s per join, shortening the master and
+    driving the edit-timeline narration track, karaoke captions, chapters,
+    and sidecar subtitles progressively out of sync (plus truncating the
+    narration tail via -shortest at mux).
 
-    Returns True when the xfade path degraded to hard-cut concat so the
-    caller can record it in run metadata instead of failing silently.
+    Returns False: there is no longer a degraded-transition mode to record.
+    The return value is kept so callers need no signature change.
     """
     destination = Path(destination).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = str(ffmpeg) if ffmpeg is not None else "ffmpeg"
 
-    # xfade transition duration in seconds (must be < shortest chunk duration).
-    xfadeseconds = _XFADE_SECONDS
-    n = len(chunks)
-
-    try:
-        _concat_with_xfade(chunks, destination, ffmpeg_bin, xfadeseconds)
-        return False
-    except PipelineCommandError as error:
-        # Fall back to stream-copy concat on any xfade failure, but say so
-        # loudly: a degraded transition must be visible, not silent.
-        print(
-            "WARNING: xfade chunk concat failed "
-            f"({sanitize_diagnostic(error)}); falling back to hard-cut "
-            "stream-copy concat",
-            file=sys.stderr,
-        )
-        filelist = destination.parent / "chunks.txt"
-        filelist.write_text(
-            "".join(f"file '{Path(c).resolve()}'\n" for c in chunks), encoding="utf-8"
-        )
-        _run_command(
-            (
-                ffmpeg_bin,
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(filelist),
-                "-c",
-                "copy",
-                str(destination),
-            ),
-            cwd=destination.parent,
-            name="FFmpeg chunk concat (fallback)",
-            timeout=600,
-        )
-        return True
+    filelist = destination.parent / "chunks.txt"
+    filelist.write_text(
+        "".join(f"file '{Path(c).resolve()}'\n" for c in chunks), encoding="utf-8"
+    )
+    _run_command(
+        (
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(filelist),
+            "-c",
+            "copy",
+            str(destination),
+        ),
+        cwd=destination.parent,
+        name="FFmpeg chunk concat (hard-cut, duration-preserving)",
+        timeout=600,
+    )
+    return False
 
 
 def _probe_chunk_streams(
@@ -815,157 +799,6 @@ def _probe_chunk_streams(
     return video_info, audio_info
 
 
-def _concat_with_xfade(
-    chunks: list[Path], destination: Path, ffmpeg_bin: str, xfadeseconds: float
-) -> None:
-    """Concatenate chunks using xfade cross-dissolves between each pair.
-
-    Every input is normalized inside the filter graph before the transitions:
-
-    * video: scaled to the first chunk's WxH, forced to its frame rate,
-      ``format=yuv420p``, and a common timebase (``settb=AVTB``). This is the
-      historical failure mode: inputs whose timebases or frame rates differ
-      (e.g. 1/15360 vs 1/12800) make xfade abort with "Error reinitializing
-      filters", which used to degrade the whole concat to hard cuts.
-    * audio: resampled to 48 kHz stereo and trimmed/padded to exactly the
-      chunk's video duration, so each acrossfade lands on the same timeline
-      as its video dissolve and A/V stay in sync across the whole concat.
-      Chunks with no audio stream get generated silence of matching duration.
-
-    Offsets are computed from probed *video stream* durations (not container
-    durations): transition ``i`` starts at ``merged_duration_so_far - d`` so
-    each dissolve overlaps the merged stream's tail with the next chunk's
-    head by exactly ``d`` seconds.
-    """
-    n = len(chunks)
-    if n == 1:
-        # Single chunk: just copy it.
-        shutil.copy2(chunks[0], destination)
-        return
-
-    probe_bin = _resolve_ffprobe(ffmpeg_bin)
-    videos: list[dict[str, Any]] = []
-    audios: list[dict[str, Any] | None] = []
-    for chunk in chunks:
-        video, audio = _probe_chunk_streams(probe_bin, chunk)
-        videos.append(video)
-        audios.append(audio)
-
-    durations = [float(v["duration"]) for v in videos]
-    if any(d <= 0 for d in durations):
-        raise PipelineCommandError("xfade duration probe failed")
-
-    # The transition must be strictly shorter than the shortest chunk or
-    # xfade/acrossfade reject it; clamp defensively instead of failing.
-    d = float(xfadeseconds)
-    if not d > 0:
-        raise PipelineCommandError("xfade transition duration must be positive")
-    min_duration = min(durations)
-    if d >= min_duration:
-        d = min_duration / 2.0
-        print(
-            f"WARNING: xfade transition clamped to {d:.3f}s "
-            f"(shortest chunk is {min_duration:.3f}s)",
-            file=sys.stderr,
-        )
-
-    target_w = int(videos[0]["width"] or 1280)
-    target_h = int(videos[0]["height"] or 720)
-    target_fps = str(videos[0]["fps"])
-
-    # Build inputs. Chunks missing an audio stream get a generated silence
-    # input so the acrossfade chain always has two audio sources per link.
-    inputs: list[str] = []
-    audio_input_index: list[int] = []
-    for i, chunk in enumerate(chunks):
-        inputs += ["-i", str(chunk)]
-        audio_input_index.append(i)
-    next_input = n
-    for i, (video, audio) in enumerate(zip(videos, audios)):
-        if audio is None:
-            inputs += [
-                "-f",
-                "lavfi",
-                "-i",
-                f"anullsrc=r=48000:cl=stereo:d={float(video['duration']):.3f}",
-            ]
-            audio_input_index[i] = next_input
-            next_input += 1
-
-    filters: list[str] = []
-    # Normalize video: same size, frame rate, pixel format, and timebase.
-    for i in range(n):
-        filters.append(
-            f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=disable,"
-            f"setsar=1,fps={target_fps},format=yuv420p,settb=AVTB[vn{i}]"
-        )
-    # Normalize audio: 48 kHz stereo, exactly the video chunk's duration.
-    for i in range(n):
-        ai = audio_input_index[i]
-        vdur = float(videos[i]["duration"])
-        filters.append(
-            f"[{ai}:a]aresample=48000,atrim=start=0:duration={vdur:.6f},"
-            f"apad=whole_dur={vdur:.6f},"
-            f"aformat=sample_fmts=fltp:channel_layouts=stereo[an{i}]"
-        )
-
-    # Video dissolves. Transition i overlaps the merged stream's tail with
-    # chunk i's head by d seconds: offset = merged_duration_so_far - d, and
-    # the merged duration grows by durations[i] - d.
-    prev = "vn0"
-    merged = durations[0]
-    for i in range(1, n):
-        offset = merged - d
-        filters.append(
-            f"[{prev}][vn{i}]xfade=transition=dissolve:duration={d:.6f}"
-            f":offset={offset:.6f}[vx{i}]"
-        )
-        prev = f"vx{i}"
-        merged += durations[i] - d
-
-    # Audio crossfades, chained pairwise like the video dissolves.
-    prev_a = "an0"
-    for i in range(1, n):
-        filters.append(f"[{prev_a}][an{i}]acrossfade=d={d:.6f}[ax{i}]")
-        prev_a = f"ax{i}"
-
-    argv = [
-        ffmpeg_bin,
-        "-y",
-        *inputs,
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        f"[{prev}]",
-        "-map",
-        f"[{prev_a}]",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "18",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        str(destination),
-    ]
-
-    _run_command(
-        tuple(argv),
-        cwd=destination.parent,
-        name="FFmpeg chunk concat (xfade)",
-        timeout=600,
-    )
-
-
 _CHUNK_MAX_FRAMES = 2700  # ~90s per chunk keeps headless Chrome stable
 _RENDER_TIMEOUT_SECONDS = 1200
 
@@ -983,10 +816,9 @@ def _render_chunked(
 ) -> tuple[bool, int]:
     """Render long compositions chunk by chunk, then concatenate.
 
-    Returns ``(degraded, n_chunks)``: True when the chunk concat degraded
-    from xfade cross-dissolves to hard cuts, plus the number of chunks, so
-    the caller can record them in run metadata and the duration QC can
-    subtract the known xfade overlap. ``on_chunk`` is called with
+    Returns ``(degraded, n_chunks)``: ``degraded`` is always False now that
+    chunk concat uses duration-preserving hard cuts (kept for metadata
+    compatibility), plus the number of chunks. ``on_chunk`` is called with
     (index, total) after each chunk renders so the caller can heartbeat
     long renders.
     """
@@ -2443,8 +2275,8 @@ def run_video_pipeline(
                                 render_run.run_id
                             ),
                         )
-                    # True when chunk concat fell back from xfade
-                    # cross-dissolves to hard cuts; False for single-chunk.
+                    # Always False: chunk concat uses duration-preserving
+                    # hard cuts (kept for metadata compatibility).
                     metadata["xfade_degraded"] = xfade_degraded
                     metadata["render_chunks"] = render_chunks
                 except Exception as error:
@@ -2788,19 +2620,14 @@ def run_video_pipeline(
                     artifacts=artifacts,
                     longform=True,
                 )
-            # Chunk-boundary crossfades overlap the timeline: each join
-            # shortens the master by _XFADE_SECONDS relative to the edit
-            # document. Account for it in the duration check (hard-cut
-            # fallback has no overlap).
-            render_chunks = int(metadata.get("render_chunks", 1) or 1)
-            xfade_overlaps = (
-                0 if (render_chunks <= 1 or metadata.get("xfade_degraded"))
-                else (render_chunks - 1) * _XFADE_SECONDS
-            )
+            # Chunk concat is duration-preserving hard cuts, so the master
+            # must match the edit-document timeline exactly. No overlap is
+            # subtracted: a short master is a real defect (it would desync
+            # the edit-timeline narration, captions, and chapters).
             result = _validate_master(
                 job.master_path, job.edit_path, tools=tools,
                 content_qc=content_qc,
-                transition_overlap_seconds=xfade_overlaps,
+                transition_overlap_seconds=0.0,
             )
             status = _status(result)
             artifacts["qc_report"] = result.get("report", "")

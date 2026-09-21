@@ -48,6 +48,9 @@ STATIC_SIMILARITY_THRESHOLD = 0.995
 
 #: OCR word count at/above which a frame is text-heavy (tesseract only).
 OCR_WORD_THRESHOLD = 8
+# Minimum confident OCR words that, combined with a text-heavy edge
+# signature, still rejects an obvious slate/lower-third.
+OCR_CORROBORATED_WORDS = 3
 
 #: Minimum acceptable still-image dimensions.
 MIN_IMAGE_WIDTH = 640
@@ -260,6 +263,16 @@ def _frame_problems(img: Image.Image) -> tuple[list[str], dict[str, float]]:
     if ocr_words is not None:
         scores["ocr_words"] = float(ocr_words)
         if ocr_words >= OCR_WORD_THRESHOLD:
+            reasons.append("heavy_text_overlay")
+        elif ocr_words >= OCR_CORROBORATED_WORDS and _looks_text_heavy(img, brightness):
+            # Corroborated slate/lower-third: OCR found several confident
+            # words AND the edge structure looks text-heavy. Either signal
+            # alone is unreliable (OCR misses stylized titles; the edge
+            # heuristic over-fires on clean natural footage), but together
+            # they catch obvious burned-in text without the false positives.
+            peak, concentration = _text_bands(img)
+            scores["text_edge_density"] = peak
+            scores["text_concentration"] = concentration
             reasons.append("heavy_text_overlay")
     elif _looks_text_heavy(img, brightness):
         peak, concentration = _text_bands(img)

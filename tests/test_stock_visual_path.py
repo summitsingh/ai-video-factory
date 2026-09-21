@@ -102,6 +102,7 @@ def test_populate_stock_clips_resolves_stock_for_beat_id_scenes(
                 license_url="https://example.invalid/license",
                 source_url="https://example.invalid/video",
                 query="galaxy",
+                provider="pexels",
             )
 
     monkeypatch.setattr(providers_module, "StockFootageProvider", FakeProvider)
@@ -114,10 +115,11 @@ def test_populate_stock_clips_resolves_stock_for_beat_id_scenes(
     assert len(assets) == 4
     assert len(calls) == 4
     for slot in range(4):
-        copied = assets_dir / f"scene-{slot:02d}" / "stock-clip.mp4"
+        # Provider-aware filename: the fake clip declares provider="pexels".
+        copied = assets_dir / f"scene-{slot:02d}" / "stock-clip-pexels.mp4"
         assert copied.is_file(), f"missing {copied}"
     # Asset paths are rewritten to the per-scene copies.
-    assert assets[0].path == str(assets_dir / "scene-00" / "stock-clip.mp4")
+    assert assets[0].path == str(assets_dir / "scene-00" / "stock-clip-pexels.mp4")
 
     # And attach binds them onto the beat-id scenes.
     attached = video_pipeline.attach_scene_assets(edit, assets_dir)
