@@ -1519,6 +1519,23 @@ def _resolve_effective_topic(job: VideoJob, research_result) -> TrendingTopic:
     )
 
 
+def _sanitize_caption_for_scene(caption: str | None, narration: str | None) -> str:
+    """Return a safe on-screen caption label.
+
+    The caption is rendered as a title-card subhead and lower third. It must
+    not duplicate the narration: historical scripts copied the full narration
+    into caption, which breaks on-screen text (LowerThird cyan box, title-card
+    paragraph). Returns "" when the caption matches the narration or is too
+    long to be a label; downstream captions then fall back to
+    narration-derived cues.
+    """
+    raw_caption = (caption or "").strip()
+    raw_narration = (narration or "").strip()
+    if not raw_caption or raw_caption == raw_narration or len(raw_caption) > 200:
+        return ""
+    return raw_caption
+
+
 def run_video_pipeline(
     project_root: Path,
     data_root: Path,
@@ -1932,12 +1949,15 @@ def run_video_pipeline(
                 pip_enabled = bool(scene_data.get("pip")) or (
                     bool(scene_data.get("clip")) and bool(scene_data.get("image"))
                 )
+                caption_text = _sanitize_caption_for_scene(
+                    scene_data.get("caption", ""), scene_data.get("narration", "")
+                )
                 scene = EditScene(
                     id=f"scene-{i}",
                     from_frame=cursor,
                     duration_frames=span,
                     title=scene_data.get("title", f"Scene {i+1}"),
-                    caption=scene_data.get("caption", ""),
+                    caption=caption_text,
                     visual=scene_data.get("visual"),
                     narration=scene_data.get("narration"),
                     subtitle=subtitle_text or None,

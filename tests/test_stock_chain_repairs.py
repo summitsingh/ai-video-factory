@@ -96,3 +96,14 @@ def test_karaoke_caption_margin_clears_lower_thirds():
     # Karaoke band raised (MarginV=120) so it clears burned-in source
     # lower-thirds, which sit in the bottom ~100px of the frame.
     assert ",2,40,40,120,1" in _ASS_HEADER
+
+def test_caption_sanitized_when_duplicating_narration():
+    """Caption must not duplicate the full narration (breaks on-screen text)."""
+    from ai_video_factory.video_pipeline import _sanitize_caption_for_scene
+
+    narration = "Why does the night sky remain mute? " * 20
+    assert _sanitize_caption_for_scene(narration, narration) == ""
+    assert _sanitize_caption_for_scene("x" * 250, narration) == ""
+    assert _sanitize_caption_for_scene("The Great Silence", narration) == "The Great Silence"
+    assert _sanitize_caption_for_scene("", narration) == ""
+    assert _sanitize_caption_for_scene(None, narration) == ""
