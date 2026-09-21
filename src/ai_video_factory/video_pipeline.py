@@ -50,7 +50,7 @@ from ai_video_factory.music_bed import (
     resolve_music_track,
 )
 from ai_video_factory.qc import QcReport, evaluate_content_qc, evaluate_qc, write_qc_reports
-from ai_video_factory.qc_final import run_final_qc
+from ai_video_factory.qc_final import black_frame_exclude_windows, run_final_qc
 from ai_video_factory.research import TrendingTopic, research_trending_topics, save_research_result
 from ai_video_factory.run_store import RunStore
 from ai_video_factory.sanitization import first_diagnostic_line, sanitize_diagnostic
@@ -60,7 +60,6 @@ from ai_video_factory.subtitle_export import (
     write_ass_karaoke,
     write_subtitles,
 )
-from ai_video_factory.nasa_media import populate_assets_from_nasa
 from ai_video_factory.theme import SPACE_THEME, ThemeConfig
 from ai_video_factory.thumbnail import build_thumbnails, validate_thumbnails
 from ai_video_factory.script_generator import ScriptGenerationError, ScriptOutput, generate_script
@@ -462,13 +461,31 @@ def _load_repo_dotenv() -> None:
             os.environ[key] = value
 
 
+def _rejection_reasons(check: dict) -> list:
+    """Reasons for an asset-QC rejection, never empty.
+
+    A rejection must never be recorded without a cause. When the verdict
+    carries no reasons, fall back to the raw scores so the true cause stays
+    diagnosable instead of a generic "qc_failed" mask.
+    """
+    reasons = list(check.get("reasons") or [])
+    if not reasons:
+        scores = check.get("scores") or {}
+        score_bits = ",".join(
+            f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}"
+            for k, v in scores.items()
+        )
+        reasons = [f"qc_failed_undiagnosed({score_bits})"]
+    return reasons
+
+
 def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
     """Fetch one stock-footage clip per scene that still has no clip.
 
-    Step 4.4a of the visual stage: after the NASA pass, try the free stock
-    providers (Pexels -> Pixabay -> NASA) for every normal content scene
-    whose ``scene-NN/`` dir has no ``*clip*.mp4`` yet. A successful fetch is
-    copied into the scene dir as ``stock-clip.mp4`` so the existing
+    Step 4.4a of the visual stage: try the free stock providers
+    (Pexels -> Pixabay) for every normal content scene whose ``scene-NN/``
+    dir has no ``*clip*.mp4`` yet. A successful fetch is copied into the
+    scene dir as ``stock-clip-<provider>.mp4`` so the existing
     ``attach_scene_assets`` / QC / AI-visual fallbacks pick it up unchanged.
 
     Returns the StockAsset records (with ``path`` rewritten to the per-scene
@@ -490,7 +507,7 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
             continue
         scene_dir = assets_dir / f'scene-{idx:02d}'
         if scene_dir.is_dir() and next(scene_dir.glob('*clip*.mp4'), None):
-            # Already has a clip (e.g. from the NASA pass); stock footage is
+            # Already has a clip (e.g. user-supplied); stock footage is
             # the fallback, never the override.
             continue
         description = (
@@ -512,7 +529,8 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
         if asset is None:
             continue
         scene_dir.mkdir(parents=True, exist_ok=True)
-        dst = scene_dir / 'stock-clip.mp4'
+        provider_name = getattr(asset, "provider", "unknown") or "unknown"
+        dst = scene_dir / f'stock-clip-{provider_name}.mp4'
         shutil.copy2(asset.path, dst)
         asset.path = str(dst)
         assets.append(asset)
@@ -522,6 +540,16 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
             'stock fetch: 0 clips fetched for %d normal scenes; '
             'falling back to AI stills / procedural visuals', len(slots),
         )
+    # Sidecar mapping scene dirs to the provider that supplied their clip,
+    # so asset QC can record the true source (and attach_scene_assets, which
+    # renames clips, runs before QC and would otherwise lose it).
+    providers_map: dict[str, str] = {}
+    for scene_dir in sorted(p for p in assets_dir.glob('scene-*') if p.is_dir()):
+        for clip in scene_dir.glob('stock-clip-*.mp4'):
+            tag = clip.stem[len('stock-clip-'):]
+            providers_map[scene_dir.name] = tag or 'unknown'
+    (assets_dir / 'stock-providers.json').write_text(
+        json.dumps(providers_map, indent=2), encoding='utf-8')
     return assets
 
 
@@ -557,7 +585,7 @@ def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocu
                      and p.is_file()
                      # Prefer downloaded stock over generated fallback:
                      # generated.png sorts first alphabetically and would
-                     # shadow a good NASA asset.
+                     # shadow a good stock asset.
                      and p.name != "generated.png"]
                 )
                 # Use a scene-specific filename so each scene resolves to
@@ -650,6 +678,9 @@ def _resolve_ffprobe(ffmpeg_bin: str) -> str:
     return "ffprobe"
 
 
+_XFADE_SECONDS = 0.8
+
+
 def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None = None) -> bool:
     """Concatenate rendered chunk MP4s.
 
@@ -666,7 +697,7 @@ def _concat_chunks(chunks: list[Path], destination: Path, *, ffmpeg: Path | None
     ffmpeg_bin = str(ffmpeg) if ffmpeg is not None else "ffmpeg"
 
     # xfade transition duration in seconds (must be < shortest chunk duration).
-    xfadeseconds = 0.8
+    xfadeseconds = _XFADE_SECONDS
     n = len(chunks)
 
     try:
@@ -949,13 +980,15 @@ def _render_chunked(
     npm: Path,
     ffmpeg: Path,
     on_chunk: Callable[[int, int], None] | None = None,
-) -> bool:
+) -> tuple[bool, int]:
     """Render long compositions chunk by chunk, then concatenate.
 
-    Returns True when the chunk concat degraded from xfade cross-dissolves
-    to hard cuts, so the caller can record it in run metadata. ``on_chunk``
-    is called with (index, total) after each chunk renders so the caller can
-    heartbeat long renders.
+    Returns ``(degraded, n_chunks)``: True when the chunk concat degraded
+    from xfade cross-dissolves to hard cuts, plus the number of chunks, so
+    the caller can record them in run metadata and the duration QC can
+    subtract the known xfade overlap. ``on_chunk`` is called with
+    (index, total) after each chunk renders so the caller can heartbeat
+    long renders.
     """
     edit = load_edit(edit_path)
     chunks = _chunk_edit(edit, _CHUNK_MAX_FRAMES)
@@ -964,7 +997,7 @@ def _render_chunked(
             project_root, edit_path, output,
             browser=browser, npm=npm, timeout=_RENDER_TIMEOUT_SECONDS,
         )
-        return False
+        return False, 1
     chunk_dir = run_directory / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[Path] = []
@@ -979,7 +1012,8 @@ def _render_chunked(
         rendered.append(chunk_out)
         if on_chunk is not None:
             on_chunk(i + 1, len(chunks))
-    return _concat_chunks(rendered, output, ffmpeg=ffmpeg)
+    degraded = _concat_chunks(rendered, output, ffmpeg=ffmpeg)
+    return degraded, len(chunks)
 
 
 def _render_with_remotion(
@@ -1496,13 +1530,17 @@ def _validate_master(
     *,
     tools: Mapping[str, Mapping[str, Any]] | None = None,
     content_qc: QcReport | None = None,
+    transition_overlap_seconds: float = 0.0,
 ) -> dict[str, str]:
     media = (
         probe_media(master_path, _media_runner(tools))
         if tools is not None
         else probe_media(master_path)
     )
-    report = evaluate_qc(media, load_edit(fixture))
+    report = evaluate_qc(
+        media, load_edit(fixture),
+        transition_overlap_seconds=transition_overlap_seconds,
+    )
     if content_qc is not None:
         report.checks.extend(content_qc.checks)
         if content_qc.status == "fail":
@@ -2115,24 +2153,22 @@ def run_video_pipeline(
         # uploaded or published here.
         assets_dir_used: Path | None = job.assets_dir
         if assets_dir_used is None:
-            internal_assets = job_dir / "nasa_assets"
-            try:
-                nasa_summary = populate_assets_from_nasa(
-                    edit_doc, internal_assets, stop_words=theme.nasa_stop_words
-                )
-                metadata["nasa_assets"] = nasa_summary
-                # Assign to job.assets_dir so the render phase copies these
-                # assets into Remotion's public directory (see below).
-                job.assets_dir = internal_assets
-                assets_dir_used = internal_assets
-            except Exception as error:  # noqa: BLE001 - best-effort; keep title cards on failure
-                metadata["nasa_assets"] = {"error": sanitize_diagnostic(error)}
-                assets_dir_used = None
-        # Step 4.4a: Stock footage (Pexels / Pixabay / NASA, free tiers).
-        # For scenes still without a clip after the NASA pass, fetch one
-        # real stock clip per scene; copy it into the scene's assets dir and
-        # log attribution. Scenes with no stock match fall through to the
-        # existing attach / QC / AI-visual fallbacks unchanged.
+            # No --assets-dir: stage per-scene stock clips (Pexels/Pixabay)
+            # into an internal directory. _populate_stock_clips fills the
+            # scene-NN/ dirs just below; scenes with no stock match keep the
+            # generated-still / procedural fallbacks.
+            internal_assets = job_dir / "stock_assets"
+            internal_assets.mkdir(parents=True, exist_ok=True)
+            # Assign to job.assets_dir so the render phase copies these
+            # assets into Remotion's public directory (see below).
+            job.assets_dir = internal_assets
+            assets_dir_used = internal_assets
+            metadata["stock_assets"] = {"dir": str(internal_assets)}
+        # Step 4.4a: Stock footage (Pexels / Pixabay, free tiers).
+        # Fetch one real stock clip per scene; copy it into the scene's
+        # assets dir and log attribution. Scenes with no stock match fall
+        # through to the existing attach / QC / AI-visual fallbacks
+        # unchanged.
         if assets_dir_used is not None:
             try:
                 from ai_video_factory.stock_media import write_attribution_log
@@ -2179,6 +2215,14 @@ def run_video_pipeline(
                 generated = 0
                 assets_root = Path(assets_dir_used)
                 asset_slots = scene_asset_slots(edit_doc.scenes)
+                providers_path = assets_root / "stock-providers.json"
+                providers_map: dict[str, str] = {}
+                if providers_path.is_file():
+                    try:
+                        providers_map = json.loads(
+                            providers_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        providers_map = {}
                 for scene in edit_doc.scenes:
                     for kind, asset_path in (("clip", scene.clip), ("image", scene.image)):
                         if not asset_path:
@@ -2205,11 +2249,16 @@ def run_video_pipeline(
                         )
                         # Verdict shape: {"ok": bool, "reasons": [str], "scores": {...}}.
                         if not check.get("ok", False):
-                            reasons = check.get("reasons") or ["qc_failed"]
+                            reasons = _rejection_reasons(check)
+                            scene_dir_name = (
+                                f"scene-{fallback_idx:02d}"
+                                if fallback_idx is not None else ""
+                            )
+                            source = providers_map.get(scene_dir_name, "unknown")
                             memory.record_rejection(
                                 asset_id,
                                 ",".join(reasons),
-                                source="nasa",
+                                source=source,
                             )
                             rejected += 1
                             # Remove the rejected file so re-attach cannot
@@ -2382,7 +2431,7 @@ def run_video_pipeline(
                             cache_assets_for_remotion(
                                 Path(job.assets_dir), remotion_public
                             )
-                        xfade_degraded = _render_chunked(
+                        xfade_degraded, render_chunks = _render_chunked(
                             root,
                             fixture_path,
                             temporary_path,
@@ -2397,6 +2446,7 @@ def run_video_pipeline(
                     # True when chunk concat fell back from xfade
                     # cross-dissolves to hard cuts; False for single-chunk.
                     metadata["xfade_degraded"] = xfade_degraded
+                    metadata["render_chunks"] = render_chunks
                 except Exception as error:
                     state_store.fail(render_run.run_id, error)
                     raise
@@ -2738,8 +2788,19 @@ def run_video_pipeline(
                     artifacts=artifacts,
                     longform=True,
                 )
+            # Chunk-boundary crossfades overlap the timeline: each join
+            # shortens the master by _XFADE_SECONDS relative to the edit
+            # document. Account for it in the duration check (hard-cut
+            # fallback has no overlap).
+            render_chunks = int(metadata.get("render_chunks", 1) or 1)
+            xfade_overlaps = (
+                0 if (render_chunks <= 1 or metadata.get("xfade_degraded"))
+                else (render_chunks - 1) * _XFADE_SECONDS
+            )
             result = _validate_master(
-                job.master_path, job.edit_path, tools=tools, content_qc=content_qc
+                job.master_path, job.edit_path, tools=tools,
+                content_qc=content_qc,
+                transition_overlap_seconds=xfade_overlaps,
             )
             status = _status(result)
             artifacts["qc_report"] = result.get("report", "")
@@ -2764,6 +2825,11 @@ def run_video_pipeline(
                 ),
                 ffmpeg=str(_required_tool(tools, "ffmpeg")),
                 report_path=job.master_path.parent / "qc-report.json",
+                # Dark-by-design segments (intro/outro branded cards, the
+                # act-card scrim window) must not count toward the
+                # near-black gate; a dark branded outro alone can trip the
+                # 15% limit on an otherwise clean master.
+                exclude_windows=black_frame_exclude_windows(edit_doc_render),
             )
             artifacts["qc_final_report"] = str(final_qc.report_path)
             metadata["qc_final_status"] = final_qc.status

@@ -300,7 +300,7 @@ YCbCr Matrix: TV.709
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Karaoke,DejaVu Sans,64,&H0000D7FF,&H00FFFFFF,&H80000000,&H96000000,-1,0,0,0,100,100,0,0,4,2,1,2,40,40,56,1
+Style: Karaoke,DejaVu Sans,64,&H0000D7FF,&H00FFFFFF,&H80000000,&H96000000,-1,0,0,0,100,100,0,0,4,2,1,2,40,40,120,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -367,6 +367,34 @@ def _ass_dialogue(
     )
 
 
+# Act-card caption delay (frames), mirroring the Remotion renderer's
+# ACT_CARD_TOTAL_FRAMES (ACT_CARD_IN_FRAMES + ACT_CARD_HOLD_FRAMES +
+# ACT_CARD_OUT_FRAMES = 12 + 48 + 24) in SyntheticVideo.tsx: on scenes
+# that carry an act label, the caption envelope starts only after the
+# full card window so captions never collide with the card. The karaoke
+# ASS burn must apply the same delay, otherwise a caption shows at the
+# bottom while the card is still up.
+ACT_CARD_TOTAL_FRAMES = 84
+
+
+def _cues_after_act_card(
+    cues: list[tuple[float, float, str]], boundary: float
+) -> list[tuple[float, float, str]]:
+    """Move caption cues out of the act-card window.
+
+    Cues ending at or before ``boundary`` are dropped; a cue straddling
+    the boundary keeps its end but starts at the boundary, so the karaoke
+    sweep still finishes on time (word timings are estimates anyway) and
+    nothing is visible while the card is up.
+    """
+    adjusted: list[tuple[float, float, str]] = []
+    for start, end, text in cues:
+        if end <= boundary:
+            continue
+        adjusted.append((max(start, boundary), end, text))
+    return adjusted
+
+
 def build_ass_karaoke(
     doc: EditDocument, narration_overrides: dict[str, str] | None = None
 ) -> str:
@@ -380,12 +408,19 @@ def build_ass_karaoke(
 
     Word timings are estimated by :func:`distribute_word_timings` - see the
     module docstring. Intro/outro scenes are skipped, matching the SRT.
+    Scenes carrying an act label get the same 84-frame caption delay as the
+    Remotion renderer: no karaoke cue starts before the act card has faded.
     """
     lines = [_ASS_HEADER.rstrip("\n")]
     for scene in doc.scenes:
         if scene.kind == "intro" or scene.kind == "outro":
             continue
-        for cue_start, cue_end, text in scene_cues(scene, doc.fps, narration_overrides)[0]:
+        cues = scene_cues(scene, doc.fps, narration_overrides)[0]
+        if scene.act:
+            scene_start = _frame_to_seconds(scene.from_frame, doc.fps)
+            boundary = scene_start + ACT_CARD_TOTAL_FRAMES / doc.fps
+            cues = _cues_after_act_card(cues, boundary)
+        for cue_start, cue_end, text in cues:
             word_cues = distribute_word_timings(text, cue_start, cue_end)
             if not word_cues:
                 continue

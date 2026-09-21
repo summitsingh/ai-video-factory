@@ -45,6 +45,7 @@ from ai_video_factory.edit_schema import (
     seconds_to_frames,
 )
 from ai_video_factory.narration import mix_scenes_to_track
+from ai_video_factory.qc_final import black_frame_exclude_windows
 from ai_video_factory.research_pipeline import ResearchResult
 from ai_video_factory.sanitization import sanitize_diagnostic
 
@@ -152,8 +153,39 @@ def audio_duration_seconds(wav: Path) -> float | None:
         return None
 
 
-def video_black_ratio(mp4: Path) -> float:
-    """Fraction of the runtime covered by black-detect events (real)."""
+def _subtract_windows(
+    windows: list[tuple[float, float]], exclusions: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Remove exclusion ranges from (start, end) windows."""
+    result: list[tuple[float, float]] = []
+    for start, end in windows:
+        segments = [(start, end)]
+        for xs, xe in exclusions:
+            remaining = []
+            for a, b in segments:
+                if xe <= a or xs >= b:
+                    remaining.append((a, b))
+                    continue
+                if xs > a:
+                    remaining.append((a, xs))
+                if xe < b:
+                    remaining.append((xe, b))
+            segments = remaining
+        result.extend(segments)
+    return result
+
+
+def video_black_ratio(
+    mp4: Path, exclude_windows: list[tuple[float, float]] | None = None
+) -> float:
+    """Fraction of the measured runtime covered by black-detect events (real).
+
+    ``exclude_windows`` is a list of (start, end) seconds where dark frames
+    are by design (intro/outro branded cards, act-card scrim windows):
+    black-detect time inside those windows is ignored and the windows are
+    removed from the denominator, so intended darkness never counts as a
+    defect. Uniform black frames across normal content scenes still count.
+    """
     mp4 = Path(mp4)
     completed = _run(
         ("ffmpeg", "-y", "-i", str(mp4), "-vf", "blackdetect=pix_th=0.05", "-f", "null", "-"),
@@ -164,7 +196,11 @@ def video_black_ratio(mp4: Path) -> float:
     # blackdetect writes its diagnostics to stderr; capture the start/end times.
     starts = [float(m) for m in re.findall(r"black_start:\s*([0-9.eE+-]+)", completed.stderr)]
     ends = [float(m) for m in re.findall(r"black_end:\s*([0-9.eE+-]+)", completed.stderr)]
-    total_black = sum(max(0.0, e - s) for s, e in zip(starts, ends)) if starts and ends else 0.0
+    black_windows = list(zip(starts, ends))
+    exclusions = list(exclude_windows or [])
+    excluded_total = sum(max(0.0, e - s) for s, e in exclusions)
+    black_windows = _subtract_windows(black_windows, exclusions)
+    total_black = sum(max(0.0, e - s) for s, e in black_windows)
 
     # Total runtime from ffprobe so the ratio reflects actual coverage.
     probe = _run(("ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -174,7 +210,10 @@ def video_black_ratio(mp4: Path) -> float:
     except Exception:  # noqa: BLE001 - fall back to the black window if unavailable
         total = max(total_black, 1.0)
 
-    return min(1.0, total_black / max(1.0, total))
+    measured_total = max(0.0, total - excluded_total)
+    if measured_total <= 0:
+        return 0.0
+    return min(1.0, total_black / measured_total)
 
 
 def video_frozen_frame_count(mp4: Path, *, sample_hz: float = 2.0) -> int:
@@ -1083,7 +1122,11 @@ def build_candidate(
         total_runtime_seconds=round(total_runtime, 1),
         audio_silence_gap_seconds=audio_silence_gap_seconds(narration_segments[0][0]) if narration_segments else 0.0,
         audio_has_clipping=audio_has_clipping(narration_segments[0][0]) if narration_segments else False,
-        video_black_ratio=video_black_ratio(master_path),
+        # Dark-by-design segments (intro/outro branded cards, act-card
+        # scrim windows) are excluded so intended darkness never counts.
+        video_black_ratio=video_black_ratio(
+            master_path, exclude_windows=black_frame_exclude_windows(edit)
+        ),
         video_frozen_frames=video_frozen_frame_count(master_path),
         video_min_contrast=video_min_contrast(master_path),
         approved_assets=approved_assets,

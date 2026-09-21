@@ -65,7 +65,11 @@ def _check_content_brightness(media: MediaInfo) -> QcCheck:
         return _check('content-brightness', True, f'skipped: {e}')
 
 
-def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
+def evaluate_qc(
+    media: MediaInfo,
+    edit: EditDocument,
+    transition_overlap_seconds: float = 0.0,
+) -> QcReport:
     """Compare probed media to an edit specification and aggregate technical checks."""
     # The master is letterboxed to a cinematic ~2.39:1 band by _polish_master, so
     # accept either the original canvas dimensions or the cropped aspect ratio.
@@ -83,7 +87,12 @@ def evaluate_qc(media: MediaInfo, edit: EditDocument) -> QcReport:
         media.frame_rate is not None
         and abs(media.frame_rate - expected_frame_rate) <= Fraction(1, 100)
     )
-    expected_duration = Fraction(edit.duration_frames, edit.fps)
+    edit_total = Fraction(edit.duration_frames, edit.fps)
+    overlap = Fraction(str(transition_overlap_seconds or 0.0))
+    # Chunk-boundary crossfades overlap the timeline, so the master is
+    # shorter than the edit document by the known join overlap. Subtract it
+    # from the expected duration instead of failing a correct render.
+    expected_duration = edit_total - overlap
     duration_match = (
         media.duration_seconds is not None
         and abs(Fraction(str(media.duration_seconds)) - expected_duration) <= Fraction(1, 10)

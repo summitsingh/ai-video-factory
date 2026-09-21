@@ -49,6 +49,7 @@ class StockAsset:
     license_url: str
     source_url: str
     query: str
+    provider: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

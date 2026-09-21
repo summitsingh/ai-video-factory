@@ -28,6 +28,9 @@ from pathlib import Path
 
 import numpy as np
 
+from ai_video_factory.edit_schema import EditDocument
+from ai_video_factory.subtitle_export import ACT_CARD_TOTAL_FRAMES
+
 SCHEMA_VERSION = 1
 
 # Check thresholds.
@@ -192,8 +195,55 @@ def check_duration(
     )
 
 
-def check_black_frames(ffmpeg_bin: str, master: Path) -> FinalQcCheck:
-    """Fail when >15% of ~1fps sampled frames are near-black (mean luma < 16)."""
+def black_frame_exclude_windows(doc: EditDocument) -> list[tuple[float, float]]:
+    """Dark-by-design windows to exclude from the near-black check.
+
+    Intro/outro scenes render as dark branded sequences, and act-card
+    scenes open with an 84-frame dark-scrim card (mirroring the Remotion
+    renderer's ACT_CARD_TOTAL_FRAMES). Sampling those windows punishes the
+    video for intended darkness: a dark-branded outro alone can trip the
+    15% gate even though nothing is defective. Returns (start, end) seconds
+    for every window where darkness is by design rather than a defect.
+    """
+    windows: list[tuple[float, float]] = []
+    fps = float(doc.fps)
+    card_seconds = ACT_CARD_TOTAL_FRAMES / fps
+    for scene in doc.scenes:
+        start = scene.from_frame / fps
+        end = (scene.from_frame + scene.duration_frames) / fps
+        if scene.kind in ("intro", "outro"):
+            windows.append((start, end))
+        elif scene.act:
+            windows.append((start, min(end, start + card_seconds)))
+    return windows
+
+
+def _excluded_sample_mask(
+    num_frames: int, exclude_windows: list[tuple[float, float]] | None
+) -> "np.ndarray":
+    """Boolean mask of 1fps samples whose timestamp falls in an exclude window."""
+    mask = np.zeros(num_frames, dtype=bool)
+    if not exclude_windows:
+        return mask
+    times = np.arange(num_frames, dtype=float) / BLACK_SAMPLE_FPS
+    for start, end in exclude_windows:
+        mask |= (times >= start) & (times < end)
+    return mask
+
+
+def check_black_frames(
+    ffmpeg_bin: str,
+    master: Path,
+    exclude_windows: list[tuple[float, float]] | None = None,
+) -> FinalQcCheck:
+    """Fail when >15% of ~1fps sampled frames are near-black (mean luma < 16).
+
+    ``exclude_windows`` is a list of (start, end) seconds where dark frames
+    are by design (intro/outro branded cards, act-card scrim windows - see
+    :func:`black_frame_exclude_windows`). Samples inside those windows are
+    ignored so intended darkness never counts as a defect. Uniform black
+    frames across normal content scenes still fail.
+    """
     completed = subprocess.run(
         [
             ffmpeg_bin,
@@ -230,15 +280,29 @@ def check_black_frames(ffmpeg_bin: str, master: Path) -> FinalQcCheck:
         .astype(float)
     )
     mean_luma = frames.mean(axis=1)
-    black = int((mean_luma < BLACK_LUMA_THRESHOLD).sum())
-    ratio = black / num_frames
+    excluded = _excluded_sample_mask(num_frames, exclude_windows)
+    measured = mean_luma[~excluded]
+    if measured.size == 0:
+        return FinalQcCheck(
+            name="black-frames",
+            passed=False,
+            detail="no content frames outside excluded windows could be sampled",
+            value=0,
+        )
+    black = int((measured < BLACK_LUMA_THRESHOLD).sum())
+    ratio = black / measured.size
+    excluded_note = (
+        f"; {int(excluded.sum())} dark-by-design samples excluded"
+        if exclude_windows
+        else ""
+    )
     return FinalQcCheck(
         name="black-frames",
         passed=ratio <= BLACK_FRAME_RATIO_LIMIT,
         detail=(
-            f"{black}/{num_frames} sampled frames near-black "
+            f"{black}/{measured.size} content frames near-black "
             f"(mean luma < {BLACK_LUMA_THRESHOLD:g}; ratio {ratio:.2%}, "
-            f"limit {BLACK_FRAME_RATIO_LIMIT:.0%})"
+            f"limit {BLACK_FRAME_RATIO_LIMIT:.0%}{excluded_note})"
         ),
         value=round(ratio, 4),
     )
@@ -372,12 +436,17 @@ def run_final_qc(
     ffmpeg: str = "ffmpeg",
     ffprobe: str | None = None,
     report_path: str | Path | None = None,
+    exclude_windows: list[tuple[float, float]] | None = None,
 ) -> FinalQcReport:
     """Run the post-render QC gate on a finished master file.
 
     Writes ``qc-report.json`` (default: next to the master) and returns the
     report. ``report.passed`` is False when any check fails; the pipeline
     hook turns that into ``status="fail"``.
+
+    ``exclude_windows`` is forwarded to the black-frames check: (start, end)
+    seconds where dark frames are by design (see
+    :func:`black_frame_exclude_windows`).
     """
     master = Path(master_path)
     ffprobe_bin = ffprobe or _resolve_ffprobe(ffmpeg)
@@ -396,7 +465,7 @@ def run_final_qc(
     )
     report.checks.append(check_resolution(payload, target_width, target_height))
     report.checks.append(check_duration(payload, target_duration_seconds))
-    report.checks.append(check_black_frames(ffmpeg, master))
+    report.checks.append(check_black_frames(ffmpeg, master, exclude_windows))
     report.checks.append(check_audio_silence(ffmpeg, master, total_duration))
     report.checks.append(
         check_audio_peak(ffmpeg, master, has_audio=audio is not None)

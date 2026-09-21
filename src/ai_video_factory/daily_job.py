@@ -582,6 +582,7 @@ def _load_candidate(candidate_dir: Path, research: ResearchResult) -> Any:
     """Reconstruct a CandidateResult from persisted artifacts (resume)."""
     from ai_video_factory.edit_schema import frames_to_seconds
     from ai_video_factory.production import CandidateResult
+    from ai_video_factory.qc_final import black_frame_exclude_windows
 
     edit = load_edit(candidate_dir / "edit.json")
     master_path = candidate_dir / "master.mp4"
@@ -607,7 +608,11 @@ def _load_candidate(candidate_dir: Path, research: ResearchResult) -> Any:
         total_runtime_seconds=total_runtime,
         audio_silence_gap_seconds=0.0,  # recomputed in final QC below
         audio_has_clipping=False,
-        video_black_ratio=video_black_ratio(master_path),
+        # Dark-by-design segments are excluded so intended darkness never
+        # counts toward the recorded metric (the gate recomputes this anyway).
+        video_black_ratio=video_black_ratio(
+            master_path, exclude_windows=black_frame_exclude_windows(edit)
+        ),
         video_frozen_frames=video_frozen_frame_count(master_path),
         video_min_contrast=video_min_contrast(master_path),
         captions=captions,
@@ -657,8 +662,15 @@ def _run_final_qc(
     _narration_duration = audio_duration_seconds(narration_wav) if narration_wav else None
 
     # Visual: measure black ratio, frozen frames, contrast, and repeated shots
-    # directly from the rendered master.
-    black_ratio = video_black_ratio(candidate.master_path)
+    # directly from the rendered master. Dark-by-design segments (intro/outro
+    # branded cards, act-card scrim windows) are excluded from the black
+    # measurement so intended darkness never trips the gate.
+    from ai_video_factory.qc_final import black_frame_exclude_windows
+
+    black_ratio = video_black_ratio(
+        candidate.master_path,
+        exclude_windows=black_frame_exclude_windows(edit),
+    )
     frozen_frames = video_frozen_frame_count(candidate.master_path)
     min_contrast = video_min_contrast(candidate.master_path)
     repeated_shots = video_repeated_shot_count(candidate.master_path)

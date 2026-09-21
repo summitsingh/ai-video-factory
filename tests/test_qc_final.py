@@ -154,3 +154,112 @@ def test_run_final_qc_black_file_fails_black_frames(tmp_path: Path) -> None:
     assert report.status == "fail"
     black = next(c for c in report.checks if c.name == "black-frames")
     assert not black.passed
+
+
+# ========== dark-by-design exclusion regression tests (Issue 2) ==========
+
+
+def _exclude_test_doc() -> "EditDocument":
+    from ai_video_factory.edit_schema import EditDocument, EditScene
+
+    fps = 30
+    scenes = [
+        EditScene(id="intro", from_frame=0, duration_frames=60,
+                  title="I", caption="I", kind="intro"),
+        EditScene(id="cold_open-0", from_frame=60, duration_frames=120,
+                  title="C", caption="C"),
+        EditScene(id="discovery-0", from_frame=180, duration_frames=120,
+                  title="D", caption="D", act="Act II"),
+        EditScene(id="outro", from_frame=300, duration_frames=60,
+                  title="O", caption="O", kind="outro"),
+    ]
+    return EditDocument(
+        schema_version=1, width=320, height=240, fps=fps,
+        duration_frames=360, scenes=scenes,
+    )
+
+
+def test_black_frame_exclude_windows() -> None:
+    from ai_video_factory.qc_final import black_frame_exclude_windows
+
+    windows = black_frame_exclude_windows(_exclude_test_doc())
+    assert windows == [(0.0, 2.0), (6.0, 6.0 + 84 / 30), (10.0, 12.0)]
+
+
+def _make_mixed_master(path: "Path", black_seconds: float, total_seconds: float) -> None:
+    import subprocess
+
+    content_seconds = total_seconds - black_seconds
+    if content_seconds <= 0:
+        inputs = [
+            "-f", "lavfi",
+            "-i", f"color=c=black:size=320x240:rate=15:duration={total_seconds}",
+        ]
+        vmap = ["-map", "0:v"]
+        filters: list[str] = []
+    else:
+        inputs = [
+            "-f", "lavfi",
+            "-i", f"color=c=black:size=320x240:rate=15:duration={black_seconds}",
+            "-f", "lavfi",
+            "-i", f"testsrc=size=320x240:rate=15:duration={content_seconds}",
+        ]
+        vmap = ["-map", "[v]"]
+        filters = ["-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]"]
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            *inputs,
+            "-f", "lavfi",
+            "-i", f"sine=frequency=440:duration={total_seconds}:sample_rate=48000",
+            *filters,
+            *vmap, "-map", f"{len(inputs) // 4}:a",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-shortest", str(path),
+        ],
+        check=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not on PATH")
+def test_check_black_frames_excludes_dark_title_cards(tmp_path: Path) -> None:
+    from ai_video_factory.qc_final import check_black_frames
+
+    master = tmp_path / "mixed.mp4"
+    _make_mixed_master(master, black_seconds=2, total_seconds=12)
+    # 2s dark branded card in a 12s video: 16.7% near-black without exclusions.
+    failing = check_black_frames("ffmpeg", master)
+    assert not failing.passed
+    passing = check_black_frames("ffmpeg", master, exclude_windows=[(0.0, 2.0)])
+    assert passing.passed
+    assert "excluded" in passing.detail
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not on PATH")
+def test_check_black_frames_still_fails_all_black_content(tmp_path: Path) -> None:
+    from ai_video_factory.qc_final import check_black_frames
+
+    master = tmp_path / "allblack.mp4"
+    _make_mixed_master(master, black_seconds=12, total_seconds=12)
+    # Excluding the dark title card must not hide a genuinely black master.
+    failing = check_black_frames("ffmpeg", master, exclude_windows=[(0.0, 2.0)])
+    assert not failing.passed
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not on PATH")
+def test_run_final_qc_accepts_exclude_windows(tmp_path: Path) -> None:
+    master = tmp_path / "mixed.mp4"
+    _make_mixed_master(master, black_seconds=2, total_seconds=12)
+    report = run_final_qc(
+        master,
+        target_width=320,
+        target_height=240,
+        target_duration_seconds=12.0,
+        report_path=tmp_path / "qc-report.json",
+        exclude_windows=[(0.0, 2.0)],
+    )
+    black = next(c for c in report.checks if c.name == "black-frames")
+    assert black.passed
+    assert report.passed

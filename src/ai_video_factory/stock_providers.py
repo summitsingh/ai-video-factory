@@ -1,4 +1,4 @@
-"""Unified stock-footage providers: Pexels, Pixabay, and NASA.
+"""Unified stock-footage providers: Pexels and Pixabay.
 
 Free video sources so the pipeline can put real camera footage behind every
 scene instead of relying only on procedural visuals. No paid APIs, no Google
@@ -13,13 +13,10 @@ Providers
   from https://pixabay.com/api/docs/ (free signup) in the
   ``PIXABAY_API_KEY`` env var. Pixabay Content License: free for commercial
   use, no attribution required.
-* :class:`NASALibraryClient` - NASA Image and Video Library. No key needed.
-  Public domain. Strongest for space / science topics.
 
 :class:`StockFootageProvider` is the single entry point. ``fetch_clip`` takes
 a scene description, derives 2-3 keyword queries from it, tries providers in
-order (Pexels -> Pixabay -> NASA, or NASA first when the description is about
-space), downloads the best landscape-HD match, and returns a
+order (Pexels -> Pixabay), downloads the best landscape-HD match, and returns a
 :class:`StockAsset` from :mod:`ai_video_factory.stock_media` so attribution
 flows into the pipeline's existing attribution log. Downloads are cached under
 ``data/cache/stock/`` keyed by URL hash, so repeat runs never re-download.
@@ -31,8 +28,7 @@ INTEGRATION
 -----------
 The pipeline's visual stage (see ``video_pipeline.py``, step 4.4) currently:
 
-1. ``populate_assets_from_nasa(...)`` fills per-scene dirs from NASA's
-   public-domain library,
+1. ``_populate_stock_clips(...)`` fills per-scene dirs from Pexels/Pixabay stock,
 2. ``attach_scene_assets(...)`` binds clips/images onto ``EditScene.clip``
    / ``.image``,
 3. ``asset_qc`` verifies each asset; rejections go to the ``AssetMemory``
@@ -40,15 +36,15 @@ The pipeline's visual stage (see ``video_pipeline.py``, step 4.4) currently:
 4. ``ai_visuals.generate_scene_visual(...)`` paints a cinematic still for
    scenes left with nothing usable.
 
-To plug this module in, add a step between (1) and (2) - or alongside the
-NASA step - that, for each scene, runs::
+To plug this module in, add a step between (1) and (2) that, for each scene, runs::
 
     from ai_video_factory.stock_providers import StockFootageProvider
 
     provider = StockFootageProvider()  # reads PEXELS_API_KEY / PIXABAY_API_KEY
+    fps = edit.fps if edit.fps else 24
     asset = provider.fetch_clip(
-        scene.visual_direction or scene.title,
-        min_duration_sec=scene.duration_seconds,
+        getattr(scene, "visual_direction", None) or scene.visual or scene.title,
+        min_duration_sec=max(1.0, scene.duration_frames / fps),
     )
     if asset is not None:
         # Copy asset.path into the scene's assets dir, set scene.clip to the
@@ -58,8 +54,8 @@ NASA step - that, for each scene, runs::
 The fallback chain stays: stock footage -> AI stills / Ken Burns ->
 procedural ``ai_visuals``. ``fetch_clip`` returns ``None`` on a total miss,
 so existing fallbacks trigger unchanged. API keys are optional: with neither
-``PEXELS_API_KEY`` nor ``PIXABAY_API_KEY`` set, the provider degrades
-gracefully to NASA-only.
+``PEXELS_API_KEY`` nor ``PIXABAY_API_KEY`` set, every provider is skipped
+and ``fetch_clip`` returns ``None``.
 """
 
 from __future__ import annotations
@@ -171,22 +167,6 @@ _VISUAL_ANCHORS = (
     "street", "crowd", "highway", "sunset", "sunrise", "night", "rain",
     "snow", "fire", "laboratory", "scientist", "dinosaur", "fossil",
 )
-
-_SPACE_KEYWORDS = frozenset({
-    "galaxy", "galaxies", "nebula", "planet", "planets", "astronaut",
-    "rocket", "earth from space", "space station", "black hole",
-    "solar system", "spacewalk", "telescope", "comet", "asteroid",
-    "cosmos", "universe", "orbit", "lunar", "martian", "interstellar",
-})
-
-
-def _is_space_topic(description: str) -> bool:
-    low = (description or "").lower()
-    return any(
-        re.search(rf"(?<![a-z]){re.escape(kw)}(?![a-z])", low)
-        for kw in _SPACE_KEYWORDS
-    )
-
 
 def _derive_queries(description: str, limit: int = 3) -> list[str]:
     """Turn a scene description into concrete visual keyword queries.
@@ -356,75 +336,15 @@ class PixabayClient:
 
 
 # ---------------------------------------------------------------------------
-# NASA (no key) - wraps the existing nasa_media search helpers.
-# ---------------------------------------------------------------------------
-
-_NASA_ASSETS = "https://images-assets.nasa.gov"
-_NASA_LICENSE_URL = "https://www.nasa.gov/nasa-brand-center/images-and-media/"
-
-
-class NASALibraryClient:
-    """NASA Image and Video Library. No API key required, public domain."""
-
-    name = "nasa"
-
-    def __init__(self, cache_dir: Path | None = None) -> None:
-        self.cache_dir = Path(cache_dir) if cache_dir else None
-
-    @property
-    def available(self) -> bool:
-        return True
-
-    def _clip_url(self, nasa_id: str) -> str | None:
-        try:
-            files = _http_json(f"{_NASA_ASSETS}/video/{nasa_id}/collection.json")
-        except StockFootageError:
-            return None
-        mp4s = [f for f in files if isinstance(f, str) and f.endswith(".mp4")]
-        # Prefer mid-size renditions over huge originals.
-        mp4s.sort(key=lambda f: ("orig" in f, "~" in f and "small" not in f))
-        return mp4s[0] if mp4s else None
-
-    def search_clips(self, query: str, per_page: int = 8) -> list[ClipCandidate]:
-        # Reuse the package's NASA search (public function).
-        from ai_video_factory.nasa_media import search_nasa
-
-        try:
-            records = search_nasa(query, mediatype="video", limit=per_page)
-        except Exception as error:  # noqa: BLE001 - provider miss, not fatal
-            log.debug("NASA search failed for %r: %s", query, sanitize_diagnostic(error))
-            return []
-        candidates: list[ClipCandidate] = []
-        for record in records:
-            url = self._clip_url(record["nasa_id"])
-            if not url:
-                continue
-            candidates.append(ClipCandidate(
-                provider=self.name,
-                download_url=url,
-                title=str(record["title"]),
-                artist="NASA",
-                license="Public Domain",
-                license_url=_NASA_LICENSE_URL,
-                source_url=str(record["source_url"]),
-                width=0,   # NASA renditions vary; verified after download.
-                height=0,
-                duration_sec=None,
-            ))
-        return candidates
-
-
-# ---------------------------------------------------------------------------
 # Unified provider
 # ---------------------------------------------------------------------------
 
 class StockFootageProvider:
     """Fetch one real stock clip per scene, trying free providers in order.
 
-    Order is Pexels -> Pixabay -> NASA, except space/science topics where
-    NASA goes first (its catalog is deepest there). Providers without API
-    keys are skipped silently. Returns ``None`` when every provider misses
-    so the caller falls back to AI stills / Ken Burns / procedural visuals.
+    Order is Pexels -> Pixabay. Providers without API keys are skipped
+    silently. Returns ``None`` when every provider misses so the caller
+    falls back to AI stills / Ken Burns / procedural visuals.
     """
 
     def __init__(
@@ -436,13 +356,9 @@ class StockFootageProvider:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.pexels = PexelsClient(api_key=pexels_key)
         self.pixabay = PixabayClient(api_key=pixabay_key)
-        self.nasa = NASALibraryClient()
 
     def _ordered_clients(self, description: str) -> list:
-        clients = [self.pexels, self.pixabay, self.nasa]
-        if _is_space_topic(description):
-            clients = [self.nasa, self.pexels, self.pixabay]
-        return [c for c in clients if c.available]
+        return [c for c in (self.pexels, self.pixabay) if c.available]
 
     def _probe_ok(self, path: Path, min_duration_sec: float) -> bool:
         """Best-effort ffprobe check: valid video with enough duration."""

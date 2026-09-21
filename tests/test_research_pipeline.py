@@ -12,6 +12,7 @@ from ai_video_factory.research_pipeline import (
     Contradiction,
     Extraction,
     ResearchError,
+    ResearchResult,
     SourceDrop,
     _SourceDeadlineExhausted,
     classify_source_quality,

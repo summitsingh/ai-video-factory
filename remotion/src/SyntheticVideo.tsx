@@ -673,7 +673,7 @@ const KeywordLowerThird = ({text}: {text: string}) => {
       <div
         style={{
           position: 'absolute',
-          bottom: height * 0.2,
+          bottom: height * 0.36,
           left: width * 0.06,
           opacity: enter,
           transform: `translateX(${-12 * (1 - enter)}px)`,
@@ -1150,7 +1150,7 @@ const CinematicLowerThird = ({
       <div
         style={{
           position: 'absolute',
-          bottom: height * 0.26,
+          bottom: height * 0.36,
           left: width * 0.06,
           maxWidth: width * 0.4,
           opacity: enter,

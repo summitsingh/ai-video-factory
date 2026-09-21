@@ -395,3 +395,66 @@ def test_build_scene_plan_runtime_stays_within_long_form_band():
     enforce_runtime(durations)
     total = sum(durations) + _BOOKEND_SECONDS
     assert MIN_RUNTIME_SECONDS <= total <= MAX_RUNTIME_SECONDS
+
+
+# ========== video_black_ratio dark-by-design exclusion (Issue 2) ==========
+
+import shutil  # noqa: E402  (appended regression block)
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH"
+)
+def test_video_black_ratio_excludes_dark_by_design(tmp_path: Path) -> None:
+    import subprocess
+
+    from ai_video_factory.production import video_black_ratio
+
+    master = tmp_path / "mixed.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi",
+            "-i", "color=c=black:size=320x240:rate=15:duration=2",
+            "-f", "lavfi",
+            "-i", "testsrc=size=320x240:rate=15:duration=10",
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            str(master),
+        ],
+        check=True,
+        timeout=120,
+    )
+    # 2s of 12s is black: without exclusions the editorial gate's 5% limit
+    # would trip on a dark branded card.
+    assert video_black_ratio(master) > 0.05
+    assert video_black_ratio(master, exclude_windows=[(0.0, 2.0)]) == 0.0
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH"
+)
+def test_video_black_ratio_still_counts_black_content(tmp_path: Path) -> None:
+    import subprocess
+
+    from ai_video_factory.production import video_black_ratio
+
+    master = tmp_path / "halfblack.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi",
+            "-i", "color=c=black:size=320x240:rate=15:duration=2",
+            "-f", "lavfi",
+            "-i", "color=c=black:size=320x240:rate=15:duration=10",
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            str(master),
+        ],
+        check=True,
+        timeout=120,
+    )
+    # Excluding the title card must not hide genuinely black content scenes.
+    assert video_black_ratio(master, exclude_windows=[(0.0, 2.0)]) > 0.05
