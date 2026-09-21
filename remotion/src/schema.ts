@@ -92,7 +92,7 @@ const parseScene = (value: unknown): EditScene => {
     from_frame: nonNegativeInteger(value.from_frame, 'scene from_frame'),
     duration_frames: positiveInteger(value.duration_frames, 'scene duration_frames'),
     title: nonEmptyString(value.title, 'scene title'),
-    caption: nonEmptyString(value.caption, 'scene caption'),
+    caption: typeof value.caption === 'string' ? value.caption : '',
     kind: value.kind === 'normal' || value.kind === 'intro' || value.kind === 'outro'
       ? value.kind
       : 'normal',
