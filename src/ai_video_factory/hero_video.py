@@ -48,6 +48,13 @@ Backend venv: ``.venv-ltx2`` under the repo root (override with ``LTX2_VENV``).
 Test clips: ``output/hero-clips/`` under the repo root (override with
 ``HERO_CLIP_DIR``); ``output/`` is gitignored so clips never get committed.
 
+SIDECARS
+--------
+Every generated clip gets a ``<name>.json`` sidecar next to it (prompt,
+seed, model, quant, timings) via :mod:`ai_video_factory.output_sidecar`,
+so a bad render can be debugged and regenerated without manifest
+archaeology.
+
 KNOWN ISSUES
 ------------
 * ``width``/``height`` must be multiples of 32 (pipeline hard-requires it);
@@ -65,6 +72,8 @@ import os
 import subprocess
 import time
 from pathlib import Path
+
+from ai_video_factory.output_sidecar import record as record_sidecar
 
 log = logging.getLogger(__name__)
 
@@ -187,6 +196,7 @@ def generate_hero_clip(
     num_inference_steps: int | None = None,
     fps: float = FPS,
     variant: str = "auto",
+    guidance_scale: float = 4.0,
 ) -> Path:
     """Generate a hero video clip and return the MP4 path.
 
@@ -197,6 +207,10 @@ def generate_hero_clip(
     The clip is rendered at the next multiple-of-32 above ``width``/``height``
     (a pipeline requirement) and center-cropped back to the requested size,
     so the returned file is exactly ``width``x``height``.
+
+    A settings sidecar (``<name>.json``: prompt, seed, model, quant,
+    timings) is written next to the clip; see
+    :mod:`ai_video_factory.output_sidecar`.
 
     Raises:
         HeroVideoError: if the backend is not installed or generation fails.
@@ -227,6 +241,7 @@ def generate_hero_clip(
         "--num-frames", str(num_frames),
         "--fps", str(fps),
         "--steps", str(steps),
+        "--guidance", str(guidance_scale),
         "--out", str(out),
     ]
     if seed is not None:
@@ -264,5 +279,27 @@ def generate_hero_clip(
     path = Path(result["path"])
     if not path.exists() or path.stat().st_size == 0:
         raise HeroVideoError(f"LTX worker reported success but {path} is missing/empty")
-    log.info("LTX clip done in %.1fs: %s", time.time() - t0, path)
+    wall_total = time.time() - t0
+    timings: dict[str, float] = {"wall_sec": round(wall_total, 1)}
+    for key, dest_key in (("gen_sec", "gen_sec"), ("wall_sec", "worker_wall_sec")):
+        value = result.get(key)
+        if isinstance(value, (int, float)):
+            timings[dest_key] = value
+    record_sidecar(
+        path,
+        prompt=prompt,
+        seed=seed,
+        model=LTX25_MODEL_ID if resolved == VARIANT_LTX25 else "ltx2",
+        quant=LTX25_QUANT if resolved == VARIANT_LTX25 else "bf16",
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        fps=fps,
+        steps=steps,
+        variant=resolved,
+        guidance=guidance_scale,
+        timings=timings,
+        backend=f"generate_ltx2.py via {BACKEND_VENV}",
+    )
+    log.info("LTX clip done in %.1fs: %s", wall_total, path)
     return path
