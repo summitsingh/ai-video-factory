@@ -17,6 +17,9 @@ youtube = [
     "google-api-python-client>=2.0,<3",
     "google-auth-oauthlib>=1.2,<2",
 ]
+whisper = [
+    "openai-whisper>=20240930",
+]
 
 [dependency-groups]
 dev = [

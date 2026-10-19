@@ -15,9 +15,10 @@ This module produces export artifacts for a finished documentary:
 Word-timing note: the TTS backends in narration.py (kokoro / piper / espeak)
 emit no word-level timestamps, so per-word karaoke timing is ESTIMATED by
 distributing each caption segment's words evenly across the segment duration
-(weighted slightly by word length). This tracks the spoken narration well
-enough for a highlight sweep; syllable-exact highlighting would need forced
-alignment (e.g. whisper word timestamps) - a possible future upgrade.
+(weighted slightly by word length). Pass ``word_timings`` (built with
+:mod:`ai_video_factory.whisper_timing`, aligned to the validated script) to
+``build_ass_karaoke`` / ``write_ass_karaoke`` to replace the estimate with
+exact whisper word timestamps.
 
 All artifacts are written as plain files on disk; nothing is uploaded here.
 """
@@ -28,7 +29,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from ai_video_factory.edit_schema import EditDocument, EditScene
 
@@ -395,8 +396,31 @@ def _cues_after_act_card(
     return adjusted
 
 
-def build_ass_karaoke(
+def _iter_karaoke_cues(
     doc: EditDocument, narration_overrides: dict[str, str] | None = None
+) -> Iterable[tuple[float, float, str]]:
+    """Yield ``(start, end, text)`` caption cues in karaoke build order.
+
+    Same cue source as the SRT export, with the act-card delay applied.
+    Shared by :func:`build_ass_karaoke` and the whisper-timing alignment so
+    both agree on cue order.
+    """
+    for scene in doc.scenes:
+        if scene.kind == "intro" or scene.kind == "outro":
+            continue
+        cues = scene_cues(scene, doc.fps, narration_overrides)[0]
+        if scene.act:
+            scene_start = _frame_to_seconds(scene.from_frame, doc.fps)
+            boundary = scene_start + ACT_CARD_TOTAL_FRAMES / doc.fps
+            cues = _cues_after_act_card(cues, boundary)
+        yield from cues
+
+
+def build_ass_karaoke(
+    doc: EditDocument,
+    narration_overrides: dict[str, str] | None = None,
+    *,
+    word_timings: Sequence[Sequence[tuple[float, float, str]]] | None = None,
 ) -> str:
     """Build a karaoke-style ASS subtitle string with word-level timing.
 
@@ -406,25 +430,29 @@ def build_ass_karaoke(
     current word highlights (yellow fill sweeping over white on a dark
     translucent box, lower-third position) as it is spoken.
 
-    Word timings are estimated by :func:`distribute_word_timings` - see the
-    module docstring. Intro/outro scenes are skipped, matching the SRT.
-    Scenes carrying an act label get the same 84-frame caption delay as the
-    Remotion renderer: no karaoke cue starts before the act card has faded.
+    ``word_timings`` optionally supplies exact per-word timings (e.g. from
+    :mod:`ai_video_factory.whisper_timing`, aligned to the validated
+    script): entry ``i`` replaces the heuristic for the ``i``-th cue in
+    :func:`_iter_karaoke_cues` order. Cues without an entry keep the
+    :func:`distribute_word_timings` estimate. Intro/outro scenes are
+    skipped, matching the SRT. Scenes carrying an act label get the same
+    84-frame caption delay as the Remotion renderer: no karaoke cue starts
+    before the act card has faded.
     """
     lines = [_ASS_HEADER.rstrip("\n")]
-    for scene in doc.scenes:
-        if scene.kind == "intro" or scene.kind == "outro":
-            continue
-        cues = scene_cues(scene, doc.fps, narration_overrides)[0]
-        if scene.act:
-            scene_start = _frame_to_seconds(scene.from_frame, doc.fps)
-            boundary = scene_start + ACT_CARD_TOTAL_FRAMES / doc.fps
-            cues = _cues_after_act_card(cues, boundary)
-        for cue_start, cue_end, text in cues:
+    for index, (cue_start, cue_end, text) in enumerate(
+        _iter_karaoke_cues(doc, narration_overrides)
+    ):
+        word_cues: list[tuple[float, float, str]] | None = None
+        if word_timings is not None and index < len(word_timings):
+            entry = [(start, end, word) for start, end, word in word_timings[index]]
+            if entry:
+                word_cues = entry
+        if not word_cues:
             word_cues = distribute_word_timings(text, cue_start, cue_end)
-            if not word_cues:
-                continue
-            lines.append(_ass_dialogue(cue_start, cue_end, word_cues))
+        if not word_cues:
+            continue
+        lines.append(_ass_dialogue(cue_start, cue_end, word_cues))
     return "\n".join(lines) + "\n"
 
 
@@ -434,18 +462,21 @@ def write_ass_karaoke(
     *,
     base_name: str = "subtitles",
     narration_overrides: dict[str, str] | None = None,
+    word_timings: Sequence[Sequence[tuple[float, float, str]]] | None = None,
 ) -> dict[str, Path]:
     """Write the karaoke ASS file next to the plain subtitle exports.
 
     Returns ``{"ass": path}`` so callers can register it as a pipeline
     artifact. The plain .srt/.vtt exports are untouched (kept for YouTube
-    upload).
+    upload). ``word_timings`` is forwarded to :func:`build_ass_karaoke`
+    (exact whisper timings replace the heuristic per cue).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     ass_path = output_dir / f"{base_name}.karaoke.ass"
     ass_path.write_text(
-        build_ass_karaoke(doc, narration_overrides), encoding="utf-8"
+        build_ass_karaoke(doc, narration_overrides, word_timings=word_timings),
+        encoding="utf-8",
     )
     return {"ass": ass_path}
 
