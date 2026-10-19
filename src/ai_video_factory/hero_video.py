@@ -74,6 +74,7 @@ import time
 from pathlib import Path
 
 from ai_video_factory.output_sidecar import record as record_sidecar
+from ai_video_factory.prompt_enhancer import enhance_prompt
 
 log = logging.getLogger(__name__)
 
@@ -217,6 +218,7 @@ def generate_hero_clip(
     variant: str = "auto",
     guidance_scale: float = 4.0,
     run_qc: bool = True,
+    prompt_enhance: bool = True,
 ) -> Path:
     """Generate a hero video clip and return the MP4 path.
 
@@ -227,6 +229,13 @@ def generate_hero_clip(
     The clip is rendered at the next multiple-of-32 above ``width``/``height``
     (a pipeline requirement) and center-cropped back to the requested size,
     so the returned file is exactly ``width``x``height``.
+
+    Unless ``prompt_enhance`` is False, the prompt is first expanded through
+    the per-model prompt enhancer (:mod:`ai_video_factory.prompt_enhancer`)
+    via the local LLM endpoint; the raw prompt is kept in the sidecar.
+    Set ``HERO_PROMPT_ENHANCE=0`` to disable without code changes. The
+    enhancer never breaks generation: on any LLM failure the raw prompt
+    is used.
 
     Unless ``run_qc`` is False, the finished clip is checked with
     :func:`qc_hero_clip` (asset QC, ``cut_policy="hard_fail"``): mid-shot
@@ -246,6 +255,13 @@ def generate_hero_clip(
     if not ok:
         raise HeroVideoError(f"LTX backend unavailable: {detail}")
     steps = num_inference_steps if num_inference_steps is not None else default_steps(resolved)
+
+    raw_prompt = prompt
+    if prompt_enhance and os.environ.get("HERO_PROMPT_ENHANCE", "1") != "0":
+        prompt = enhance_prompt(prompt, model=resolved)
+        if prompt != raw_prompt:
+            log.info("prompt enhanced for %s (%d -> %d words)",
+                     resolved, len(raw_prompt.split()), len(prompt.split()))
 
     gen_w, gen_h = _snap32(width), _snap32(height)
     num_frames = int(round(duration_sec * fps))
@@ -323,6 +339,9 @@ def generate_hero_clip(
             }
         }
         log.info("hero clip QC ok: %s", path)
+    extra: dict | None = dict(qc_extra) if qc_extra else None
+    if prompt != raw_prompt:
+        extra = {**(extra or {}), "raw_prompt": raw_prompt}
     record_sidecar(
         path,
         prompt=prompt,
@@ -338,7 +357,7 @@ def generate_hero_clip(
         guidance=guidance_scale,
         timings=timings,
         backend=f"generate_ltx2.py via {BACKEND_VENV}",
-        extra=qc_extra,
+        extra=extra,
     )
     log.info("LTX clip done in %.1fs: %s", wall_total, path)
     return path
