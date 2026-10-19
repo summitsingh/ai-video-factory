@@ -29,6 +29,7 @@ what a full run would attempt without producing or uploading anything.
 
 from __future__ import annotations
 
+import atexit
 import json
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -155,6 +156,121 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+# ========== L4: crash-safe job queue manifest ==========
+#
+# Concept borrowed from WanGP's queue autosave (wgp.py autosave_queue):
+# persist the job queue so overnight runs survive restarts. Reimplemented
+# here as a JSON manifest at <project_root>/runs/daily/queue.json.
+# run_daily_job records its own entry (in_progress -> completed/failed),
+# flips stale in_progress entries left by a dead process to "interrupted"
+# on startup (crash detection), and keeps the manifest current through an
+# atexit hook plus per-stage updates.
+
+DAILY_QUEUE_NAME = "queue.json"
+DAILY_QUEUE_SCHEMA_VERSION = 1
+DAILY_JOB_STATUSES = ("queued", "in_progress", "completed", "failed", "interrupted")
+
+_daily_autosave_registered: set[str] = set()
+
+
+def daily_queue_path(project_root: Path) -> Path:
+    """Path of the crash-safe job queue manifest."""
+    return Path(project_root) / "runs" / "daily" / DAILY_QUEUE_NAME
+
+
+def load_daily_queue(project_root: Path) -> list[dict[str, Any]]:
+    """Read the job queue manifest; [] when missing or corrupt."""
+    path = daily_queue_path(project_root)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if data.get("kind") != "daily-job-queue":
+        return []
+    entries = data.get("entries", [])
+    return entries if isinstance(entries, list) else []
+
+
+def save_daily_queue(project_root: Path, entries: list[dict[str, Any]]) -> None:
+    """Best-effort persist of the job queue manifest; never raises."""
+    path = daily_queue_path(project_root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": DAILY_QUEUE_SCHEMA_VERSION,
+                    "kind": "daily-job-queue",
+                    "saved_at": datetime.now(UTC).isoformat(),
+                    "entries": entries,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def enqueue_daily_job(project_root: Path, job: dict[str, Any]) -> dict[str, Any]:
+    """Stage a job entry (status "queued") for a future daily run."""
+    entries = load_daily_queue(project_root)
+    entry = {
+        "id": f"daily-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}",
+        "status": "queued",
+        "enqueued_at": datetime.now(UTC).isoformat(),
+    }
+    entry.update({k: v for k, v in job.items() if k not in ("id", "status")})
+    if job.get("id"):
+        entry["id"] = str(job["id"])
+    entries.append(entry)
+    save_daily_queue(project_root, entries)
+    return entry
+
+
+def mark_interrupted_stale_entries(project_root: Path) -> int:
+    """Flip in_progress entries left by a dead process to interrupted.
+
+    Returns the number of entries flipped (0 when the previous run exited
+    cleanly). This is the startup half of crash recovery.
+    """
+    entries = load_daily_queue(project_root)
+    flipped = 0
+    for entry in entries:
+        if entry.get("status") == "in_progress":
+            entry["status"] = "interrupted"
+            entry["interrupted_at"] = datetime.now(UTC).isoformat()
+            flipped += 1
+    if flipped:
+        save_daily_queue(project_root, entries)
+    return flipped
+
+
+def install_daily_autosave(
+    project_root: Path, get_entries: Callable[[], list[dict[str, Any]]]
+) -> None:
+    """Register an atexit hook persisting the live queue; idempotent per root.
+
+    The hook is best-effort and never raises.
+    """
+    key = str(Path(project_root))
+    if key in _daily_autosave_registered:
+        return
+    _daily_autosave_registered.add(key)
+
+    def _on_exit() -> None:
+        try:
+            save_daily_queue(Path(project_root), get_entries())
+        except Exception:  # noqa: BLE001 - atexit hooks must not raise
+            pass
+
+    atexit.register(_on_exit)
+
+
 # ========== Top-level entry point ==========
 
 
@@ -178,6 +294,31 @@ def run_daily_job(
     state_store = state_store or RunStore(
         project_root / "state", artifact_root=project_root / "runs"
     )
+
+    # L4 crash-safe queue: flip entries a dead process left in_progress to
+    # interrupted (startup restore), then record this run's own entry. An
+    # atexit hook plus per-stage updates keep the manifest current, so an
+    # overnight kill leaves "interrupted @ stage" instead of silence.
+    mark_interrupted_stale_entries(project_root)
+    queue_entries = load_daily_queue(project_root)
+    job_entry: dict[str, Any] = {
+        "id": f"daily-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}",
+        "status": "in_progress",
+        "stage": "trend",
+        "started_at": _now(),
+        "topic_override": config.topic_override,
+        "dry_run": config.dry_run,
+    }
+    queue_entries.append(job_entry)
+    save_daily_queue(project_root, queue_entries)
+    install_daily_autosave(project_root, lambda: queue_entries)
+
+    def _note_stage(stage: str, status: str | None = None) -> None:
+        job_entry["stage"] = stage
+        if status is not None:
+            job_entry["status"] = status
+            job_entry["finished_at"] = _now()
+        save_daily_queue(project_root, queue_entries)
 
     start_time = time.monotonic()
     timings: dict[str, float] = {}
@@ -218,6 +359,7 @@ def run_daily_job(
             )
         except Exception:  # noqa: BLE001 - audit bookkeeping must not abort the result
             pass
+        _note_stage("done", "failed")
         return _fail(reason, run_id=run_id, **extra)
 
     # ---- Stage 1: trend discovery (idempotent via RunStore) ----
@@ -252,6 +394,7 @@ def run_daily_job(
 
     if not candidates:
         return _record_failure("no trend candidates discovered", run_id=daily_run.run_id)
+    _note_stage("research")
 
     # ---- Stage 2: build research packages for a bounded shortlist ----
     research_results: list[ResearchResult] = []
@@ -276,6 +419,7 @@ def run_daily_job(
             run_id=daily_run.run_id,
             research_packages=research_dirs,
         )
+    _note_stage("preflight")
 
     # ---- Stage 3: preflight gates (before any production) ----
     t0 = time.monotonic()
@@ -288,10 +432,12 @@ def run_daily_job(
             research_packages=research_dirs,
             artifacts={"preflight_failures": preflight_failures},
         )
+    _note_stage("production")
 
     # ---- Stage 4: produce the real rendered candidate (or dry-run report) ----
     t0 = time.monotonic()
     if config.dry_run:
+        _note_stage("done", "completed")
         return _dry_run_report(chosen, config, timings, run_id=daily_run.run_id)
 
     # Production rendering must be explicitly configured. The test-only
@@ -314,13 +460,16 @@ def run_daily_job(
         timings["production"] = round(time.monotonic() - t0, 3)
         return _record_failure(str(error), run_id=daily_run.run_id, research_packages=research_dirs)
     timings["production"] = round(time.monotonic() - t0, 3)
+    _note_stage("qc")
 
     # ---- Stage 5: final QC on real artifacts (fail-closed) ----
     qc_summary, gate_results = _run_final_qc(chosen, candidate, research_dirs)
     timings["qc"] = round(time.monotonic() - t0, 3)
+    _note_stage("package")
 
     if qc_summary.status != "pass":
         # Retain diagnostic artifacts; do NOT create an approval package.
+        _note_stage("done", "failed")
         return DailyJobResult(
             run_id=daily_run.run_id,
             status="failed",
@@ -341,6 +490,7 @@ def run_daily_job(
     try:
         package = _build_upload_package(chosen, candidate, candidate_dir)
     except PublisherError as error:
+        _note_stage("done", "failed")
         return DailyJobResult(
             run_id=daily_run.run_id,
             status="failed",
@@ -371,6 +521,7 @@ def run_daily_job(
     except Exception:  # noqa: BLE001 - audit bookkeeping must not abort the result
         pass
 
+    _note_stage("done", "completed")
     return DailyJobResult(
         run_id=daily_run.run_id,
         status=status,
