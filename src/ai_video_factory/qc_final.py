@@ -484,6 +484,181 @@ def check_audio_silence_warning(
     )
 
 
+_EBUR128_INTEGRATED_RE = re.compile(r"\bI:\s*(-?[\d.]+|-inf)\s*LUFS")
+_EBUR128_TRUE_PEAK_RE = re.compile(r"Peak:\s*(-?[\d.]+)\s*dBFS")
+
+
+def _parse_ebur128_summary(stderr_text: str) -> tuple[float | None, float | None]:
+    """Parse the ffmpeg ebur128 Summary block.
+
+    Returns (integrated LUFS, true peak dBTP), each None when the block
+    is missing or unmeasurable (e.g. "-inf" on near-silent input).
+    """
+    summary = stderr_text.rsplit("Summary:", 1)[-1]
+    integrated: float | None = None
+    match = _EBUR128_INTEGRATED_RE.search(summary)
+    if match and match.group(1) != "-inf":
+        try:
+            integrated = float(match.group(1))
+        except ValueError:
+            integrated = None
+    true_peak: float | None = None
+    match = _EBUR128_TRUE_PEAK_RE.search(summary)
+    if match:
+        try:
+            true_peak = float(match.group(1))
+        except ValueError:
+            true_peak = None
+    return integrated, true_peak
+
+
+@dataclass
+class _AudioLevels:
+    clipped_samples: int
+    integrated_lufs: float | None
+    true_peak_dbtp: float | None
+
+
+def _measure_audio_levels(ffmpeg_bin: str, master: Path) -> _AudioLevels:
+    """Measure clipping, integrated loudness, and true peak in one decode.
+
+    Decodes the mix to float32 PCM through ``ebur128=peak=true`` (the
+    filter passes samples through, so one decode serves both): numpy
+    counts full-scale samples (|sample| >= 1.0, the WanGP inspect_audio
+    clipping criterion, reimplemented), and the ebur128 Summary on
+    stderr gives EBU R128 integrated loudness + true peak. Raises
+    RuntimeError when the audio cannot be decoded.
+    """
+    completed = subprocess.run(
+        [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-i",
+            str(master),
+            "-vn",
+            "-af",
+            "ebur128=peak=true",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+        ],
+        capture_output=True,
+        timeout=600,
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        raise RuntimeError("audio levels could not be measured (decode failed)")
+    clipped = 0
+    raw = completed.stdout
+    usable = len(raw) // 4 * 4
+    chunk_samples = 1 << 20
+    for offset in range(0, usable, chunk_samples * 4):
+        samples = np.frombuffer(
+            raw[offset:offset + chunk_samples * 4], dtype="<f4"
+        )
+        if not np.isfinite(samples).all():
+            raise RuntimeError("decoded audio contains non-finite samples")
+        clipped += int((np.abs(samples) >= 1.0).sum())
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    integrated, true_peak = _parse_ebur128_summary(stderr)
+    return _AudioLevels(
+        clipped_samples=clipped,
+        integrated_lufs=integrated,
+        true_peak_dbtp=true_peak,
+    )
+
+
+def check_audio_clipping(
+    ffmpeg_bin: str, master: Path, has_audio: bool
+) -> FinalQcCheck:
+    """Fail on any full-scale sample in the decoded mix (digital clipping)."""
+    if not has_audio:
+        return FinalQcCheck(
+            name="audio-clipping",
+            passed=False,
+            detail="no audio stream in the master",
+            value=None,
+        )
+    try:
+        levels = _measure_audio_levels(ffmpeg_bin, master)
+    except RuntimeError as exc:
+        return FinalQcCheck(
+            name="audio-clipping",
+            passed=False,
+            detail=str(exc),
+            value=None,
+        )
+    return FinalQcCheck(
+        name="audio-clipping",
+        passed=levels.clipped_samples == 0,
+        detail=(
+            f"{levels.clipped_samples} full-scale sample(s) at 0 dBFS"
+            + (" (clipping)" if levels.clipped_samples else "")
+        ),
+        value=levels.clipped_samples,
+    )
+
+
+def check_audio_loudness(
+    ffmpeg_bin: str, master: Path, has_audio: bool
+) -> FinalQcCheck:
+    """Assert the mix measures -16 +/- 1 LUFS with true peak <= -1 dBTP.
+
+    The pipeline already targets these numbers; this gate verifies them
+    instead of assuming them.
+    """
+    if not has_audio:
+        return FinalQcCheck(
+            name="audio-loudness",
+            passed=False,
+            detail="no audio stream in the master",
+            value=None,
+        )
+    try:
+        levels = _measure_audio_levels(ffmpeg_bin, master)
+    except RuntimeError as exc:
+        return FinalQcCheck(
+            name="audio-loudness",
+            passed=False,
+            detail=str(exc),
+            value=None,
+        )
+    problems: list[str] = []
+    if levels.integrated_lufs is None:
+        problems.append("integrated loudness unmeasurable")
+    elif (
+        abs(levels.integrated_lufs - LOUDNESS_TARGET_LUFS) > LOUDNESS_TOLERANCE_LU
+    ):
+        problems.append(
+            f"integrated {levels.integrated_lufs:.1f} LUFS outside "
+            f"{LOUDNESS_TARGET_LUFS:g} +/- {LOUDNESS_TOLERANCE_LU:g} LU"
+        )
+    if levels.true_peak_dbtp is None:
+        problems.append("true peak unmeasurable")
+    elif levels.true_peak_dbtp > TRUE_PEAK_MAX_DBTP:
+        problems.append(
+            f"true peak {levels.true_peak_dbtp:.1f} dBTP above "
+            f"{TRUE_PEAK_MAX_DBTP:g} dBTP ceiling"
+        )
+    measured = (
+        f"integrated {levels.integrated_lufs} LUFS, "
+        f"true peak {levels.true_peak_dbtp} dBTP"
+    )
+    detail = (
+        measured
+        if not problems
+        else f"{measured}; " + "; ".join(problems)
+    )
+    return FinalQcCheck(
+        name="audio-loudness",
+        passed=not problems,
+        detail=detail,
+        value=levels.integrated_lufs,
+    )
+
+
 _PEAK_RE = re.compile(r"max_volume:\s*(-?[0-9.]+|n/a)\s*dB")
 
 
@@ -642,6 +817,12 @@ def run_final_qc(
     )
     report.checks.append(
         check_audio_peak(ffmpeg, master, has_audio=audio is not None)
+    )
+    report.checks.append(
+        check_audio_clipping(ffmpeg, master, has_audio=audio is not None)
+    )
+    report.checks.append(
+        check_audio_loudness(ffmpeg, master, has_audio=audio is not None)
     )
     report.checks.append(check_audio_video_skew(payload))
 
