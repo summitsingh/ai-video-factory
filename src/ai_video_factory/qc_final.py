@@ -15,6 +15,17 @@ Checks:
     pipeline's 2.39:1 letterboxed variant is accepted, mirroring
     :func:`ai_video_factory.qc.evaluate_qc`).
   * ``duration``: output duration within 5% of the target.
+  * ``audio-video-skew`` (Q2): the audio stream ends >= 1.0 s before the
+    video duration (the Fermi 6 s silent-tail defect class).
+  * ``audio-silence-warning`` (Q3): warning tier only, never fails;
+    records near-silent stretches below -45 dB lasting >= 1.0 s.
+  * ``audio-clipping`` (Q7): any full-scale (>= 1.0) float sample in the
+    decoded mix.
+  * ``audio-loudness`` (Q7): measured integrated loudness within
+    -16 +/- 1 LUFS and true peak <= -1 dBTP (ffmpeg ``ebur128``).
+  * ``mid-shot-cuts`` (Q1): hard-cut detection via the scene-score
+    heuristic; ``cut_policy="hard_fail"`` fails on any cut (hero clips),
+    the default ``"advisory"`` only records them (stock, masters).
 """
 
 from __future__ import annotations
@@ -47,6 +58,23 @@ SILENCE_NOISE_DB = -70.0
 SILENCE_MAX_SECONDS = 3.0
 AUDIO_PEAK_MIN_DBFS = -30.0
 DURATION_TOLERANCE = 0.05
+#: Q2: fail when the audio stream ends this far (or more) before the
+#: video duration. Adopted from WanGP's quiet_ranges EOF edge case: an
+#: audio stream that stops early leaves a silent tail nothing else
+#: catches (the Fermi 6 s silent-tail defect).
+AUDIO_VIDEO_SKEW_LIMIT_SECONDS = 1.0
+#: Q3: warning-tier silence measurement (WanGP's -45 dB / 1 s): near-
+#: silent stretches (music dropouts, breath gaps) are recorded in
+#: qc-report.json but never fail the gate.
+SILENCE_WARN_NOISE_DB = -45.0
+SILENCE_WARN_MIN_SECONDS = 1.0
+#: Q7: loudness targets the pipeline already aims for (-16 LUFS / -2
+#: dBTP) but never measures. The gate asserts integrated loudness
+#: within +/- this tolerance of -16 LUFS (ffmpeg ebur128).
+LOUDNESS_TARGET_LUFS = -16.0
+LOUDNESS_TOLERANCE_LU = 1.0
+#: Q7: true-peak ceiling in dBTP (ffmpeg ebur128 peak=true).
+TRUE_PEAK_MAX_DBTP = -1.0
 _LETTERBOX_ASPECT = 2.39
 _LETTERBOX_ASPECT_TOL = 0.02
 
@@ -446,6 +474,61 @@ def check_audio_peak(
     )
 
 
+def check_audio_video_skew(payload: dict) -> FinalQcCheck:
+    """Fail when the audio stream ends >= 1 s before the video duration.
+
+    Catches the audio/video duration-skew defect class (Fermi's 6 s
+    silent tail): the mix stops playing while the picture keeps running.
+    Stream durations fall back to the container duration, mirroring
+    WanGP's quiet_ranges EOF handling. Audio running longer than the
+    video passes (a different, non-failing condition, noted in detail).
+    """
+    video = _first_stream(payload, "video")
+    audio = _first_stream(payload, "audio")
+    video_duration = _stream_or_format_duration(video, payload)
+    if video_duration is None:
+        return FinalQcCheck(
+            name="audio-video-skew",
+            passed=False,
+            detail="video duration unavailable",
+            value=None,
+        )
+    if audio is None:
+        return FinalQcCheck(
+            name="audio-video-skew",
+            passed=False,
+            detail="no audio stream in the master",
+            value=None,
+        )
+    audio_duration = _stream_or_format_duration(audio, payload)
+    if audio_duration is None:
+        return FinalQcCheck(
+            name="audio-video-skew",
+            passed=False,
+            detail="audio duration unavailable",
+            value=None,
+        )
+    gap = video_duration - audio_duration
+    failed = gap >= AUDIO_VIDEO_SKEW_LIMIT_SECONDS
+    if gap < 0:
+        detail = (
+            f"audio outruns video by {-gap:.2f}s "
+            f"(video {video_duration:.2f}s, audio {audio_duration:.2f}s)"
+        )
+    else:
+        detail = (
+            f"audio ends {gap:.2f}s before video end "
+            f"(limit {AUDIO_VIDEO_SKEW_LIMIT_SECONDS:g}s; "
+            f"video {video_duration:.2f}s, audio {audio_duration:.2f}s)"
+        )
+    return FinalQcCheck(
+        name="audio-video-skew",
+        passed=not failed,
+        detail=detail,
+        value=round(gap, 3),
+    )
+
+
 def run_final_qc(
     master_path: str | Path,
     *,
@@ -489,6 +572,7 @@ def run_final_qc(
     report.checks.append(
         check_audio_peak(ffmpeg, master, has_audio=audio is not None)
     )
+    report.checks.append(check_audio_video_skew(payload))
 
     destination = (
         Path(report_path) if report_path is not None else master.parent / "qc-report.json"
