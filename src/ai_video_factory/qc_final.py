@@ -39,6 +39,11 @@ from pathlib import Path
 
 import numpy as np
 
+from ai_video_factory.asset_qc import (
+    CUT_POLICY_ADVISORY,
+    CUT_POLICY_HARD_FAIL,
+    detect_cuts,
+)
 from ai_video_factory.edit_schema import EditDocument
 from ai_video_factory.subtitle_export import ACT_CARD_TOTAL_FRAMES
 
@@ -772,6 +777,46 @@ def check_audio_video_skew(payload: dict) -> FinalQcCheck:
     )
 
 
+def check_mid_shot_cuts(
+    ffmpeg_bin: str, master: Path, *, cut_policy: str = "advisory"
+) -> FinalQcCheck:
+    """Detect hard cuts with the scene-score heuristic.
+
+    ``cut_policy="hard_fail"`` fails on any cut: use for hero/T2V clips,
+    which must be one continuous shot (a cut means the model cut away
+    mid-shot). ``"advisory"`` (default) only records the cut times as a
+    warning: use for stock/B-roll and finished masters, where
+    scene-boundary cuts are legitimate.
+    """
+    if cut_policy not in (CUT_POLICY_ADVISORY, CUT_POLICY_HARD_FAIL):
+        raise ValueError(
+            f"cut_policy must be {CUT_POLICY_ADVISORY!r} or {CUT_POLICY_HARD_FAIL!r}"
+        )
+    try:
+        cuts = detect_cuts(master, ffmpeg_bin=ffmpeg_bin)
+    except RuntimeError as exc:
+        return FinalQcCheck(
+            name="mid-shot-cuts",
+            passed=cut_policy == CUT_POLICY_ADVISORY,
+            detail=f"cut detection failed: {exc}",
+            value=None,
+        )
+    hard_fail = cut_policy == CUT_POLICY_HARD_FAIL
+    detail = f"{len(cuts)} hard cut(s) detected"
+    if cuts:
+        shown = ", ".join(f"{cut:.2f}s" for cut in cuts[:10])
+        suffix = f" (+{len(cuts) - 10} more)" if len(cuts) > 10 else ""
+        detail += f" [{shown}{suffix}]"
+    if not hard_fail:
+        detail += " (advisory: scene-boundary cuts are legitimate here)"
+    return FinalQcCheck(
+        name="mid-shot-cuts",
+        passed=not (hard_fail and cuts),
+        detail=detail,
+        value=float(len(cuts)),
+    )
+
+
 def run_final_qc(
     master_path: str | Path,
     *,
@@ -782,6 +827,7 @@ def run_final_qc(
     ffprobe: str | None = None,
     report_path: str | Path | None = None,
     exclude_windows: list[tuple[float, float]] | None = None,
+    cut_policy: str = "advisory",
 ) -> FinalQcReport:
     """Run the post-render QC gate on a finished master file.
 
@@ -792,6 +838,10 @@ def run_final_qc(
     ``exclude_windows`` is forwarded to the black-frames check: (start, end)
     seconds where dark frames are by design (see
     :func:`black_frame_exclude_windows`).
+
+    ``cut_policy`` controls the mid-shot-cuts check: "advisory" (default)
+    records cut times as a warning, "hard_fail" fails on any cut (for
+    single-shot hero clips).
     """
     master = Path(master_path)
     ffprobe_bin = ffprobe or _resolve_ffprobe(ffmpeg)
@@ -825,6 +875,9 @@ def run_final_qc(
         check_audio_loudness(ffmpeg, master, has_audio=audio is not None)
     )
     report.checks.append(check_audio_video_skew(payload))
+    report.checks.append(
+        check_mid_shot_cuts(ffmpeg, master, cut_policy=cut_policy)
+    )
 
     destination = (
         Path(report_path) if report_path is not None else master.parent / "qc-report.json"
