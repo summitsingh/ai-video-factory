@@ -188,23 +188,26 @@ def video_pipeline(
     5. Run quality checks
     6. Render a draft
     """
+    project_root = Path(__file__).resolve().parents[2]
+
+    if dry_run:
+        # Q4 preflight: validate everything that can fail before any
+        # expensive stage runs. Never loads models or runs inference.
+        # Placed before the try block: typer.Exit subclasses Exception,
+        # so the handler below would swallow it and always exit 2.
+        from ai_video_factory.preflight import format_report, run_preflight
+
+        report = run_preflight(
+            project_root,
+            data_root=project_root / "data",
+            width=640 if draft else 1280,
+            height=360 if draft else 720,
+        )
+        typer.echo(format_report(report))
+        raise typer.Exit(code=0 if report.ok else 1)
+
     try:
-        project_root = Path(__file__).resolve().parents[2]
         output_path = Path(output)
-
-        if dry_run:
-            # Q4 preflight: validate everything that can fail before any
-            # expensive stage runs. Never loads models or runs inference.
-            from ai_video_factory.preflight import format_report, run_preflight
-
-            report = run_preflight(
-                project_root,
-                data_root=project_root / "data",
-                width=640 if draft else 1280,
-                height=360 if draft else 720,
-            )
-            typer.echo(format_report(report))
-            raise typer.Exit(code=0 if report.ok else 1)
 
         # Resolve the theming preset (defaults to the space theme, which
         # preserves the original pipeline behavior).
