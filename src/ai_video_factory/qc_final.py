@@ -380,6 +380,27 @@ def _parse_silence_gaps(stderr_text: str, total_duration: float | None) -> list[
     return gaps
 
 
+def _parse_silence_ranges(
+    stderr_text: str, total_duration: float | None
+) -> list[tuple[float, float]]:
+    """Parse silencedetect stderr into [(start, end)] silence ranges."""
+    ranges: list[tuple[float, float]] = []
+    pending_start: float | None = None
+    for line in stderr_text.splitlines():
+        start_match = _SILENCE_START_RE.search(line)
+        if start_match:
+            pending_start = float(start_match.group(1))
+            continue
+        end_match = _SILENCE_END_RE.search(line)
+        if end_match and pending_start is not None:
+            ranges.append((pending_start, float(end_match.group(1))))
+            pending_start = None
+    if pending_start is not None and total_duration is not None:
+        # Trailing silence runs to end of file.
+        ranges.append((pending_start, max(pending_start, total_duration)))
+    return ranges
+
+
 def check_audio_silence(
     ffmpeg_bin: str, master: Path, total_duration: float | None
 ) -> FinalQcCheck:
@@ -412,6 +433,53 @@ def check_audio_silence(
             f"{len(gaps)} silence run(s) detected; longest "
             f"{longest:.2f}s (limit {SILENCE_MAX_SECONDS:g}s continuous)"
         ),
+        value=round(longest, 3),
+    )
+
+
+def check_audio_silence_warning(
+    ffmpeg_bin: str, master: Path, total_duration: float | None
+) -> FinalQcCheck:
+    """Warning tier for near-silent stretches; never fails the gate.
+
+    Measures at -45 dB / 1.0 s (the thresholds WanGP's quiet_ranges
+    uses, reimplemented here): music dropouts and breath gaps the
+    -70 dB / 3 s hard-fail tier deliberately ignores. Always passes;
+    the ranges are recorded in qc-report.json for human review.
+    """
+    completed = subprocess.run(
+        [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-i",
+            str(master),
+            "-vn",
+            "-af",
+            f"silencedetect=noise={SILENCE_WARN_NOISE_DB:g}dB:d={SILENCE_WARN_MIN_SECONDS:g}",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    ranges = _parse_silence_ranges(completed.stderr, total_duration)
+    longest = max((end - start for start, end in ranges), default=0.0)
+    detail = (
+        f"{len(ranges)} near-silent stretch(es) below "
+        f"{SILENCE_WARN_NOISE_DB:g} dB lasting >= {SILENCE_WARN_MIN_SECONDS:g}s; "
+        f"longest {longest:.2f}s"
+    )
+    if ranges:
+        shown = ", ".join(f"{start:.1f}-{end:.1f}s" for start, end in ranges[:10])
+        suffix = f" (+{len(ranges) - 10} more)" if len(ranges) > 10 else ""
+        detail += f" [{shown}{suffix}]"
+    return FinalQcCheck(
+        name="audio-silence-warning",
+        passed=True,
+        detail=detail,
         value=round(longest, 3),
     )
 
@@ -569,6 +637,9 @@ def run_final_qc(
     report.checks.append(check_duration(payload, target_duration_seconds))
     report.checks.append(check_black_frames(ffmpeg, master, exclude_windows))
     report.checks.append(check_audio_silence(ffmpeg, master, total_duration))
+    report.checks.append(
+        check_audio_silence_warning(ffmpeg, master, total_duration)
+    )
     report.checks.append(
         check_audio_peak(ffmpeg, master, has_audio=audio is not None)
     )
