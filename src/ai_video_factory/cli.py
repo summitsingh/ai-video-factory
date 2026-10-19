@@ -176,6 +176,7 @@ def video_pipeline(
     llm_url: str = typer.Option("http://localhost:1234/v1/chat/completions", "--llm-url", help="OpenAI-compatible chat completions URL for script generation (LM Studio default, or llama-server e.g. http://localhost:8080/v1/chat/completions)"),
     draft: bool = typer.Option(False, "--draft", help="Render at 640x360 for fast review iterations instead of full 1280x720"),
     format_key: str = typer.Option(None, "--format", help="YouTube format preset for --longform: business_autopsy, systems_explainer, history_reconstruction, mystery_deep_dive, science_doc, armchair_true_crime, horror_anthology"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate environment and inputs only (preflight); never renders or loads models"),
 ) -> None:
     """Run a complete video production pipeline for a trending topic.
     
@@ -190,6 +191,20 @@ def video_pipeline(
     try:
         project_root = Path(__file__).resolve().parents[2]
         output_path = Path(output)
+
+        if dry_run:
+            # Q4 preflight: validate everything that can fail before any
+            # expensive stage runs. Never loads models or runs inference.
+            from ai_video_factory.preflight import format_report, run_preflight
+
+            report = run_preflight(
+                project_root,
+                data_root=project_root / "data",
+                width=640 if draft else 1280,
+                height=360 if draft else 720,
+            )
+            typer.echo(format_report(report))
+            raise typer.Exit(code=0 if report.ok else 1)
 
         # Resolve the theming preset (defaults to the space theme, which
         # preserves the original pipeline behavior).
