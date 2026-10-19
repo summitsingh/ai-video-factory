@@ -120,6 +120,9 @@ def pumping_std(
     series = music_bed.momentary_loudness_series(
         stem, start_s=window_start, duration_s=window_end - window_start, ffmpeg=ffmpeg
     )
+    # Drop the first 0.5 s: ebur128's 400 ms momentary window starts empty
+    # after an input seek, so the first frames read as silence (-120 LUFS).
+    series = series[5:]
     if len(series) < 5:
         return {"lu": None, "note": "too few momentary frames"}
     return {"lu": round(statistics.pstdev(series), 2), "n_frames": len(series)}
