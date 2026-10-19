@@ -758,20 +758,27 @@ def mix_ducked_audio(
         f"apad,atrim=0:{duration:.3f}[music_fit]",
     ]
     if duck_mode == DUCK_MODE_SIDECHAIN:
-        parts.append(duck_filter("music_fit", "narr_fit", "music_ducked"))
+        parts.append(duck_filter("music_fit", "narr_fit", "music_ducked_raw"))
     else:
         parts.append(
             duck_envelope_filter(
                 "music_fit",
-                "music_ducked",
+                "music_ducked_raw",
                 intervals or [],
                 depth_db=depth_db,
                 attack_s=attack_s,
                 release_s=release_s,
             )
         )
+    # The ducked bed feeds both the mix and the optional stem map; split it
+    # when the stem is mapped because a filtergraph label can only be
+    # consumed once (an unconnected split output is a filtergraph error).
+    duck_mix_label = "music_ducked_raw"
+    if ducked_stem is not None:
+        parts.append("[music_ducked_raw]asplit=2[music_ducked][music_stem]")
+        duck_mix_label = "music_ducked"
     parts.append(
-        "[narr_fit][music_ducked]amix=inputs=2:normalize=0[mixed];"
+        f"[narr_fit][{duck_mix_label}]amix=inputs=2:normalize=0[mixed];"
         f"[mixed]aresample={MIX_SAMPLE_RATE * LIMITER_OVERSAMPLE},"
         f"alimiter=limit={ceiling:.4f}:level=0,"
         f"aresample={MIX_SAMPLE_RATE}[limited]"
@@ -790,7 +797,7 @@ def mix_ducked_audio(
         stem_path = Path(ducked_stem)
         stem_path.parent.mkdir(parents=True, exist_ok=True)
         cmd += [
-            "-map", "[music_ducked]", "-c:a", "pcm_s16le",
+            "-map", "[music_stem]", "-c:a", "pcm_s16le",
             "-ar", str(MIX_SAMPLE_RATE), "-ac", "2", str(stem_path),
         ]
     try:
@@ -820,7 +827,9 @@ def _ebur128_stderr(
 ) -> str:
     """Run the ebur128 filter over *path* (or a segment); return ffmpeg stderr."""
     cmd = [ffmpeg, "-nostdin", "-hide_banner"]
-    cmd += ["-loglevel", "verbose"] if framelog_verbose else ["-loglevel", "error"]
+    # The ebur128 Summary (integrated loudness, true peak) prints at info
+    # level; per-frame logs need verbose.
+    cmd += ["-loglevel", "verbose"] if framelog_verbose else ["-loglevel", "info"]
     if start_s is not None:
         cmd += ["-ss", f"{start_s:.3f}"]
     cmd += ["-i", str(path)]
