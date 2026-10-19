@@ -187,6 +187,25 @@ def _snap32(n: int) -> int:
     return (n + 31) // 32 * 32
 
 
+def qc_hero_clip(path: Path) -> dict:
+    """Run asset QC on a hero clip with ``cut_policy="hard_fail"``.
+
+    Hero/T2V clips must be one continuous shot: any mid-shot cut (or a
+    cut-detection failure) fails the verdict. Raises HeroVideoError on
+    failure; returns the verdict dict otherwise.
+    """
+    from ai_video_factory.asset_qc import verify_video_asset
+
+    verdict = verify_video_asset(path, cut_policy="hard_fail")
+    if not verdict.get("ok", False):
+        reasons = verdict.get("reasons", [])
+        raise HeroVideoError(
+            f"hero clip QC failed for {path}: "
+            f"{', '.join(reasons) if reasons else 'unknown reason'}"
+        )
+    return verdict
+
+
 def generate_hero_clip(
     prompt: str,
     duration_sec: float = 8,
@@ -197,6 +216,7 @@ def generate_hero_clip(
     fps: float = FPS,
     variant: str = "auto",
     guidance_scale: float = 4.0,
+    run_qc: bool = True,
 ) -> Path:
     """Generate a hero video clip and return the MP4 path.
 
@@ -208,12 +228,18 @@ def generate_hero_clip(
     (a pipeline requirement) and center-cropped back to the requested size,
     so the returned file is exactly ``width``x``height``.
 
+    Unless ``run_qc`` is False, the finished clip is checked with
+    :func:`qc_hero_clip` (asset QC, ``cut_policy="hard_fail"``): mid-shot
+    cuts fail the render, consistent with the pipeline's fail-hard
+    philosophy.
+
     A settings sidecar (``<name>.json``: prompt, seed, model, quant,
-    timings) is written next to the clip; see
+    timings, QC verdict) is written next to the clip; see
     :mod:`ai_video_factory.output_sidecar`.
 
     Raises:
-        HeroVideoError: if the backend is not installed or generation fails.
+        HeroVideoError: if the backend is not installed, generation fails,
+            or (with run_qc) the clip fails QC.
     """
     resolved, model_dir = _resolve_variant(variant)
     ok, detail = backend_available(resolved)
@@ -285,6 +311,18 @@ def generate_hero_clip(
         value = result.get(key)
         if isinstance(value, (int, float)):
             timings[dest_key] = value
+    qc_extra: dict | None = None
+    if run_qc:
+        verdict = qc_hero_clip(path)
+        qc_extra = {
+            "qc": {
+                "ok": verdict.get("ok", False),
+                "reasons": list(verdict.get("reasons", [])),
+                "scores": dict(verdict.get("scores", {})),
+                "cut_policy": "hard_fail",
+            }
+        }
+        log.info("hero clip QC ok: %s", path)
     record_sidecar(
         path,
         prompt=prompt,
@@ -300,6 +338,7 @@ def generate_hero_clip(
         guidance=guidance_scale,
         timings=timings,
         backend=f"generate_ltx2.py via {BACKEND_VENV}",
+        extra=qc_extra,
     )
     log.info("LTX clip done in %.1fs: %s", wall_total, path)
     return path

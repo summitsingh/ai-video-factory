@@ -114,3 +114,39 @@ def test_backend_available_no_weights(tmp_path, monkeypatch):
     ok, detail = hero_video.backend_available("auto")
     assert not ok
     assert "download_ltx2.py" in detail
+
+
+def test_qc_hero_clip_uses_hard_fail_policy(tmp_path, monkeypatch):
+    import ai_video_factory.asset_qc as asset_qc
+
+    seen = {}
+
+    def fake_verify(path, work_dir=None, *, cut_policy="advisory"):
+        seen["cut_policy"] = cut_policy
+        seen["path"] = path
+        return {"ok": True, "reasons": [], "scores": {}}
+
+    monkeypatch.setattr(asset_qc, "verify_video_asset", fake_verify)
+    clip = tmp_path / "hero.mp4"
+    clip.write_bytes(b"x")
+    verdict = hero_video.qc_hero_clip(clip)
+    assert verdict["ok"] is True
+    assert seen["cut_policy"] == "hard_fail"
+    assert seen["path"] == clip
+
+
+def test_qc_hero_clip_raises_on_mid_shot_cuts(tmp_path, monkeypatch):
+    import ai_video_factory.asset_qc as asset_qc
+
+    def fake_verify(path, work_dir=None, *, cut_policy="advisory"):
+        return {
+            "ok": False,
+            "reasons": ["mid_shot_cuts"],
+            "scores": {"cut_count": 2.0},
+        }
+
+    monkeypatch.setattr(asset_qc, "verify_video_asset", fake_verify)
+    clip = tmp_path / "hero.mp4"
+    clip.write_bytes(b"x")
+    with pytest.raises(hero_video.HeroVideoError, match="mid_shot_cuts"):
+        hero_video.qc_hero_clip(clip)
