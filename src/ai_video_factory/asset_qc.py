@@ -2,7 +2,8 @@
 
 Catches the bad-asset classes seen in production renders: black or empty
 frames at clip starts, NASA TV title slates and broadcast graphics with
-heavy burned-in text, and static slates (near-duplicate frames). These
+heavy burned-in text, static slates (near-duplicate frames), and mid-shot
+cuts in hero clips (via the scene-score cut detector). These
 checks run on the cheap downloaded files BEFORE the expensive Remotion
 render, so a bad asset can be skipped and replaced while it is still cheap.
 
@@ -13,6 +14,7 @@ edge-density heuristic in text-band regions stands in for text detection.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -45,6 +47,27 @@ TEXT_DARK_EDGE_FLOOR = 0.016
 
 #: Frame-to-frame similarity (0-1) above which frames count as identical.
 STATIC_SIMILARITY_THRESHOLD = 0.995
+
+#: Scene-score (ffmpeg lavfi.scene_score) at/above which a frame may be a
+#: hard cut. Calibrated from the WanGP picture_checks heuristic this
+#: reimplements: real cuts score 0.14-1.0 (down to 0.14 between dark
+#: shots) while continuous motion stays <= 0.1.
+CUT_SCENE_SCORE_THRESHOLD = 0.08
+
+#: A cut candidate must also reach this multiple of the highest scene
+#: score among the neighbouring frames, so fast motion never counts.
+CUT_LOCAL_MAX_MULTIPLE = 3.0
+
+#: Frames on either side of a candidate forming the local-max window.
+CUT_NEIGHBOUR_FRAMES = 6
+
+#: Cut-detection policy for verify_video_asset: "advisory" records cut
+#: times in the scores without failing the verdict (stock/B-roll, where
+#: cuts are normal); "hard_fail" rejects the asset on any cut (hero/T2V
+#: clips, which must be one continuous shot - a mid-shot cut means the
+#: model cut away to another shot).
+CUT_POLICY_ADVISORY = "advisory"
+CUT_POLICY_HARD_FAIL = "hard_fail"
 
 #: OCR word count at/above which a frame is text-heavy (tesseract only).
 OCR_WORD_THRESHOLD = 8
@@ -286,6 +309,77 @@ def _frame_problems(img: Image.Image) -> tuple[list[str], dict[str, float]]:
 # Public API
 # ---------------------------------------------------------------------------
 
+_SCENE_SCORE_RE = re.compile(r"lavfi\.scene_score=([\d.]+)")
+_PTS_TIME_RE = re.compile(r"pts_time:([\d.]+)")
+
+
+def _cut_frame_indexes(scores: list[float]) -> list[int]:
+    """Indexes of frames that read as hard cuts under the scene-score rule.
+
+    A frame counts when its scene score reaches CUT_SCENE_SCORE_THRESHOLD
+    and is at least CUT_LOCAL_MAX_MULTIPLE times the highest score among
+    the CUT_NEIGHBOUR_FRAMES frames on either side.
+    """
+    cuts: list[int] = []
+    width = CUT_NEIGHBOUR_FRAMES
+    for index, score in enumerate(scores):
+        if score < CUT_SCENE_SCORE_THRESHOLD:
+            continue
+        neighbours = (
+            scores[max(0, index - width):index]
+            + scores[index + 1:index + 1 + width]
+        )
+        if score >= CUT_LOCAL_MAX_MULTIPLE * max(neighbours or [0.0]):
+            cuts.append(index)
+    return cuts
+
+
+def detect_cuts(path: str | Path, ffmpeg_bin: str | None = None) -> list[float]:
+    """Timestamps (seconds) of hard cuts in a video file.
+
+    One ffmpeg decode at 160px wide: every frame's ``lavfi.scene_score``
+    is measured (``select='gte(scene,0)'`` passes all frames; the score is
+    printed by the metadata filter) and :func:`_cut_frame_indexes` picks
+    the cuts with the local-max heuristic. This is a from-scratch
+    reimplementation of the scene-score idea behind WanGP's
+    ``picture_checks`` - no WanGP code is copied.
+
+    Raises RuntimeError when ffmpeg is unavailable or cannot decode the
+    file.
+    """
+    binary = ffmpeg_bin or _FFMPEG
+    if not binary:
+        raise RuntimeError("ffmpeg is not available for cut detection")
+    completed = subprocess.run(
+        [
+            binary,
+            "-hide_banner",
+            "-v",
+            "info",
+            "-i",
+            str(path),
+            "-an",
+            "-vf",
+            "scale=160:-2,select='gte(scene,0)',"
+            "metadata=print:key=lavfi.scene_score",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"ffmpeg could not decode {path} for cut detection")
+    times = [float(value) for value in _PTS_TIME_RE.findall(completed.stderr)]
+    scores = [float(value) for value in _SCENE_SCORE_RE.findall(completed.stderr)]
+    count = min(len(times), len(scores))
+    cut_indexes = set(_cut_frame_indexes(scores[:count]))
+    return [round(times[index], 2) for index in sorted(cut_indexes)]
+
+
 def verify_image_asset(path: str | Path) -> dict:
     """Check a downloaded still image. Returns a verdict dict.
 
@@ -312,14 +406,31 @@ def verify_image_asset(path: str | Path) -> dict:
     return {"ok": not reasons, "reasons": reasons, "scores": scores}
 
 
-def verify_video_asset(path: str | Path, work_dir: str | Path | None = None) -> dict:
+def verify_video_asset(
+    path: str | Path,
+    work_dir: str | Path | None = None,
+    *,
+    cut_policy: str = CUT_POLICY_ADVISORY,
+) -> dict:
     """Check a downloaded video clip. Returns a verdict dict.
 
     Samples first/middle/last frames and rejects black or empty frames,
     heavy burned-in text (slates, broadcast graphics), and static slates
     (near-duplicate frames). Same verdict shape as verify_image_asset,
-    with extra reasons: dark_frames, static_slate, probe_unavailable.
+    with extra reasons: dark_frames, static_slate, probe_unavailable,
+    mid_shot_cuts, cut_detection_failed; extra scores: cut_count,
+    cut_times_seconds.
+
+    ``cut_policy`` controls mid-shot cut handling: "advisory" (default)
+    records cut times in the scores without failing the verdict - for
+    stock/B-roll, where cuts are normal; "hard_fail" adds the
+    "mid_shot_cuts" reason, failing the verdict - for hero/T2V clips,
+    which must be one continuous shot.
     """
+    if cut_policy not in (CUT_POLICY_ADVISORY, CUT_POLICY_HARD_FAIL):
+        raise ValueError(
+            f"cut_policy must be {CUT_POLICY_ADVISORY!r} or {CUT_POLICY_HARD_FAIL!r}"
+        )
     file_path = Path(path)
     if not file_path.is_file() or file_path.stat().st_size == 0:
         return {"ok": False, "reasons": ["unreadable"], "scores": {}}
@@ -356,6 +467,21 @@ def verify_video_asset(path: str | Path, work_dir: str | Path | None = None) -> 
         scores["min_frame_similarity"] = min(sims)
         if all(s >= STATIC_SIMILARITY_THRESHOLD for s in sims):
             reasons.append("static_slate")
+
+    try:
+        cuts = detect_cuts(file_path)
+    except (RuntimeError, OSError):
+        cuts = None
+    if cuts is None:
+        scores["cut_count"] = 0.0
+        scores["cut_times_seconds"] = []
+        if cut_policy == CUT_POLICY_HARD_FAIL:
+            reasons.append("cut_detection_failed")
+    else:
+        scores["cut_count"] = float(len(cuts))
+        scores["cut_times_seconds"] = cuts
+        if cuts and cut_policy == CUT_POLICY_HARD_FAIL:
+            reasons.append("mid_shot_cuts")
 
     try:
         for leftover in scratch.glob("sample-*.png"):
