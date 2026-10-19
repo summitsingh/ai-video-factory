@@ -108,6 +108,9 @@ def test_run_final_qc_good_file_passes(tmp_path: Path) -> None:
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=4",
             "-f", "lavfi", "-i", "sine=frequency=440:duration=4:sample_rate=48000",
+            # Normalize to the pipeline's -16 LUFS / -2 dBTP target so the
+            # loudness gate (Q7) passes on this good fixture.
+            "-af", "loudnorm=I=-16:TP=-2:LRA=11",
             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest", str(master),
         ],
@@ -214,6 +217,9 @@ def _make_mixed_master(path: "Path", black_seconds: float, total_seconds: float)
             "-i", f"sine=frequency=440:duration={total_seconds}:sample_rate=48000",
             *filters,
             *vmap, "-map", f"{len(inputs) // 4}:a",
+            # Normalize to the pipeline's -16 LUFS / -2 dBTP target so the
+            # loudness gate (Q7) passes on this good fixture.
+            "-af", "loudnorm=I=-16:TP=-2:LRA=11",
             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-ar", "48000", "-ac", "2",
             "-shortest", str(path),
