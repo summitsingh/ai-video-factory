@@ -13,6 +13,7 @@ INTEGRATION.md.
 
 from __future__ import annotations
 
+import atexit
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -72,6 +73,101 @@ def save_queue_items(queue_path: Path, items: list[dict[str, Any]]) -> None:
     )
 
 
+# ---- L4: crash-safe queue autosave ----
+#
+# Concept borrowed from WanGP's queue autosave (wgp.py autosave_queue):
+# persist the in-progress queue so an overnight run survives restarts.
+# Reimplemented here as a JSON snapshot manifest next to queue.json
+# (the human-facing review queue is never clobbered by the autosave).
+
+SNAPSHOT_NAME = "queue.snapshot.json"
+SNAPSHOT_SCHEMA_VERSION = 1
+
+_autosave_registered: set[str] = set()
+
+
+def snapshot_path(qdir: Path) -> Path:
+    """Path of the crash-recovery snapshot for a nightly queue dir."""
+    return Path(qdir) / SNAPSHOT_NAME
+
+
+def save_queue_snapshot(qdir: Path, items: list[dict[str, Any]]) -> Path:
+    """Best-effort persist of the in-progress queue; never raises."""
+    path = snapshot_path(qdir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": SNAPSHOT_SCHEMA_VERSION,
+                    "kind": "nightly-queue-snapshot",
+                    "saved_at": datetime.now().isoformat(),
+                    "items": items,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return path
+
+
+def load_queue_snapshot(qdir: Path) -> list[dict[str, Any]]:
+    """Restore items from a snapshot; [] when missing or corrupt."""
+    path = snapshot_path(qdir)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if data.get("kind") != "nightly-queue-snapshot":
+        return []
+    items = data.get("items", [])
+    return items if isinstance(items, list) else []
+
+
+def clear_queue_snapshot(qdir: Path) -> None:
+    """Remove the snapshot after a clean run; never raises."""
+    try:
+        snapshot_path(qdir).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _snapshot_is_fresher(qdir: Path, queue_path: Path) -> bool:
+    snap = snapshot_path(qdir)
+    if not snap.is_file():
+        return False
+    if not Path(queue_path).is_file():
+        return True
+    return snap.stat().st_mtime > Path(queue_path).stat().st_mtime
+
+
+def install_queue_autosave(
+    qdir: Path, get_items: Callable[[], list[dict[str, Any]]]
+) -> None:
+    """Register an atexit hook persisting the live queue to the snapshot.
+
+    Idempotent per queue dir. The hook is best-effort and never raises.
+    """
+    key = str(Path(qdir))
+    if key in _autosave_registered:
+        return
+    _autosave_registered.add(key)
+
+    def _on_exit() -> None:
+        try:
+            save_queue_snapshot(Path(qdir), get_items())
+        except Exception:  # noqa: BLE001 - atexit hooks must not raise
+            pass
+
+    atexit.register(_on_exit)
+
+
 def _set_status(
     queue_path: Path, item_id: str, status: str
 ) -> dict[str, Any]:
@@ -128,6 +224,15 @@ def run_nightly(
     qdir = queue_dir(data_root, run_date)
     qpath = qdir / "queue.json"
     items = load_queue_items(qpath)
+    # L4 crash recovery: a snapshot newer than queue.json means a previous
+    # run died mid-flight; resume from it instead of losing drafted items.
+    restored = False
+    if _snapshot_is_fresher(qdir, qpath):
+        snapshot_items = load_queue_snapshot(qdir)
+        if snapshot_items:
+            items = snapshot_items
+            restored = True
+    install_queue_autosave(qdir, lambda: items)
     queued_topics = {
         _normalize_topic(str(item.get("topic", ""))) for item in items
     }
@@ -168,6 +273,7 @@ def run_nightly(
                     "generated_at": datetime.now().isoformat(),
                 }
             )
+            save_queue_snapshot(qdir, items)  # L4: survive kill -9, not just atexit
             continue
         if pipeline_result.get("status") not in ("pass", "draft_ok", "ok"):
             failed += 1
@@ -181,6 +287,7 @@ def run_nightly(
                     "generated_at": datetime.now().isoformat(),
                 }
             )
+            save_queue_snapshot(qdir, items)  # L4: survive kill -9, not just atexit
             continue
         drafted += 1
         items.append(
@@ -201,8 +308,10 @@ def run_nightly(
                 "generated_at": datetime.now().isoformat(),
             }
         )
+        save_queue_snapshot(qdir, items)  # L4: survive kill -9, not just atexit
 
     save_queue_items(qpath, items)
+    clear_queue_snapshot(qdir)  # L4: clean finish, no stale snapshot
     report = {
         "date": run_date,
         "queue_path": str(qpath),
@@ -211,6 +320,7 @@ def run_nightly(
         "failed": failed,
         "skipped": skipped,
         "queue_size": len(items),
+        "restored_from_snapshot": restored,
     }
     (qdir / "report.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
