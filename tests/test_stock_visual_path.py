@@ -111,15 +111,18 @@ def test_populate_stock_clips_resolves_stock_for_beat_id_scenes(
     assets_dir = tmp_path / "assets"
     assets = video_pipeline._populate_stock_clips(edit, assets_dir)
 
-    # 4 normal scenes -> 4 fetched clips, one per scene slot dir.
-    assert len(assets) == 4
-    assert len(calls) == 4
+    # Four normal scenes plus the intro/outro title cards each get a clip.
+    assert len(assets) == 6
+    assert len(calls) == 6
     for slot in range(4):
         # Provider-aware filename: the fake clip declares provider="pexels".
         copied = assets_dir / f"scene-{slot:02d}" / "stock-clip-pexels.mp4"
         assert copied.is_file(), f"missing {copied}"
     # Asset paths are rewritten to the per-scene copies.
-    assert assets[0].path == str(assets_dir / "scene-00" / "stock-clip-pexels.mp4")
+    assert any(
+        asset.path == str(assets_dir / "scene-00" / "stock-clip-pexels.mp4")
+        for asset in assets
+    )
 
     # And attach binds them onto the beat-id scenes.
     attached = video_pipeline.attach_scene_assets(edit, assets_dir)
@@ -128,8 +131,8 @@ def test_populate_stock_clips_resolves_stock_for_beat_id_scenes(
     assert by_id["discovery-1"].clip == "scene-01-clip.mp4"
     assert by_id["mechanism-0"].clip == "scene-02-clip.mp4"
     assert by_id["meaning-0"].clip == "scene-03-clip.mp4"
-    assert by_id["cold_open-0"].clip is None  # intro keeps title card
-    assert by_id["open_question-0"].clip is None  # outro keeps title card
+    assert by_id["cold_open-0"].clip == "card-intro-clip.mp4"
+    assert by_id["open_question-0"].clip == "card-outro-clip.mp4"
 
 
 def test_attach_scene_assets_skips_scenes_with_no_slot_dir(tmp_path: Path):

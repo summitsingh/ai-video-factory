@@ -341,7 +341,7 @@ def cache_assets_for_remotion(
     public directory. We copy all scene media there beforehand so they
     are available during rendering.
 
-    Stale ``scene-*`` files left over from previous runs are removed first,
+    Stale ``scene-*`` and ``card-*`` files left over from previous runs are removed first,
     because the per-scene naming scheme means an old clip/image for a given
     scene would otherwise shadow (or be shadowed by) the current one. Oversized
     clips are re-encoded down to a browser-friendly size so Chrome can decode
@@ -349,7 +349,9 @@ def cache_assets_for_remotion(
     """
     remotion_public.mkdir(parents=True, exist_ok=True)
     # Remove stale per-scene media from prior runs (clips + images).
-    for stale in list(remotion_public.glob("scene-*")):
+    stale_media = list(remotion_public.glob("scene-*"))
+    stale_media.extend(remotion_public.glob("card-*"))
+    for stale in stale_media:
         if stale.is_file() and (stale.suffix.lower() in (".mp4", ".jpg", ".jpeg", ".png", ".webp")):
             try:
                 stale.unlink()
@@ -380,6 +382,17 @@ def cache_assets_for_remotion(
             dst = remotion_public / f"scene-{idx:02d}-image{img.suffix}"
             if not dst.exists():
                 shutil.copy2(img, dst)
+
+    for card_dir in sorted(assets_dir.glob("card-*")):
+        if not card_dir.is_dir():
+            continue
+        card_kind = card_dir.name[len("card-"):]
+        if not card_kind:
+            continue
+        for clip in sorted(card_dir.glob("*clip*.mp4")):
+            dst = remotion_public / f"card-{card_kind}-clip{clip.suffix}"
+            _ensure_clip_ready(clip, dst)
+            break
 
 
 def _ensure_clip_ready(src: Path, dst: Path, *, max_bytes: int = 80_000_000) -> None:
@@ -500,9 +513,10 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
 
     Step 4.4a of the visual stage: try the free stock providers
     (Pexels -> Pixabay) for every normal content scene whose ``scene-NN/``
-    dir has no ``*clip*.mp4`` yet. A successful fetch is copied into the
-    scene dir as ``stock-clip-<provider>.mp4`` so the existing
-    ``attach_scene_assets`` / QC / AI-visual fallbacks pick it up unchanged.
+    dir has no ``*clip*.mp4`` yet and every intro/outro scene whose
+    ``card-<kind>/`` dir has no clip. A successful fetch is copied into the
+    relevant dir as ``stock-clip-<provider>.mp4`` so the existing
+    ``attach_scene_assets`` / QC steps pick it up unchanged.
 
     Returns the StockAsset records (with ``path`` rewritten to the per-scene
     copy) so the caller can append them to the run attribution log.
@@ -518,10 +532,12 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
     fps = edit.fps if edit.fps else 24
     for scene in edit.scenes:
         idx = slots.get(str(scene.id))
-        if idx is None:
-            # Intro/outro or non-content scene: no per-scene assets.
+        if idx is not None:
+            scene_dir = assets_dir / f'scene-{idx:02d}'
+        elif scene.kind in ("intro", "outro"):
+            scene_dir = assets_dir / f"card-{scene.kind}"
+        else:
             continue
-        scene_dir = assets_dir / f'scene-{idx:02d}'
         if scene_dir.is_dir() and next(scene_dir.glob('*clip*.mp4'), None):
             # Already has a clip (e.g. user-supplied); stock footage is
             # the fallback, never the override.
@@ -560,7 +576,9 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
     # so asset QC can record the true source (and attach_scene_assets, which
     # renames clips, runs before QC and would otherwise lose it).
     providers_map: dict[str, str] = {}
-    for scene_dir in sorted(p for p in assets_dir.glob('scene-*') if p.is_dir()):
+    provider_dirs = list(assets_dir.glob('scene-*'))
+    provider_dirs.extend(assets_dir.glob('card-*'))
+    for scene_dir in sorted(p for p in provider_dirs if p.is_dir()):
         for clip in scene_dir.glob('stock-clip-*.mp4'):
             tag = clip.stem[len('stock-clip-'):]
             providers_map[scene_dir.name] = tag or 'unknown'
@@ -570,12 +588,13 @@ def _populate_stock_clips(edit: EditDocument, assets_dir: Path) -> list:
 
 
 def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocument:
-    """Attach downloaded stock image/clip paths to scenes by directory index.
+    """Attach downloaded stock media paths to content scenes and title cards.
 
     Expects per-scene directories ``scene-00/``, ``scene-01/``, ... beneath
-    assets_dir. Prefers one clip then one image per scene; scenes without
-    assets keep the title-card look. Paths are stored as filenames that
-    will be copied to Remotion's public directory prior to rendering.
+    assets_dir and card directories ``card-intro/`` and ``card-outro/``.
+    Content scenes prefer one clip then one image; title cards accept only
+    motion clips. Paths are stored as filenames copied to Remotion's public
+    directory prior to rendering.
 
     Scenes are matched by their numeric id suffix (``scene-0`` -> ``scene-00/``),
     so intro/outro sequences and any reordering do not shift asset lookup.
@@ -626,8 +645,40 @@ def attach_scene_assets(edit: EditDocument, assets_dir: Path | None) -> EditDocu
                     if images[0].name != image_name:
                         images[0].rename(scene_dir / image_name)
                     update["image"] = image_name
+        elif scene.kind in ("intro", "outro"):
+            # Title cards take motion clips only: never stills.
+            update["image"] = None
+            card_dir = assets_dir / f"card-{scene.kind}"
+            if card_dir.is_dir():
+                clips = sorted(card_dir.glob("*clip*.mp4"))
+                if clips:
+                    clip_name = f"card-{scene.kind}-clip{clips[0].suffix}"
+                    if clips[0].name != clip_name:
+                        clips[0].rename(card_dir / clip_name)
+                    update["clip"] = clip_name
         scenes.append(scene.model_copy(update=update) if update else scene)
     return edit.model_copy(update={"scenes": scenes})
+
+
+def _enforce_title_card_clip_gate(edit: EditDocument) -> None:
+    """Abort unless every intro/outro title card has a verified motion clip.
+
+    The Remotion IntroSequence/OutroSequence fail-closed when a title card
+    has no motion clip, so a card left media-less must abort the run here
+    with a clear error instead of failing deep inside the render. Normal
+    scenes keep their existing fallbacks; only title cards are gated.
+    """
+    media_less = [
+        scene.id
+        for scene in edit.scenes
+        if scene.kind in ("intro", "outro") and not scene.clip
+    ]
+    if media_less:
+        raise RuntimeError(
+            "fail-closed visual gate: no verified motion clip for "
+            f"title card(s) {', '.join(media_less)}; refusing to "
+            "render stills or procedural visuals"
+        )
 
 
 def _chunk_edit(edit: EditDocument, max_frames: int) -> list[EditDocument]:
@@ -2178,6 +2229,10 @@ def run_video_pipeline(
                 metadata["assets_qc"] = "complete"
             except Exception as error:  # noqa: BLE001 - QC is best-effort
                 metadata["assets_qc"] = f"skipped: {sanitize_diagnostic(error)}"
+            # Fail-closed title-card gate: intro/outro scenes must carry a
+            # verified motion clip; the Remotion renderer refuses title
+            # cards without one, so abort here with a clear error.
+            _enforce_title_card_clip_gate(edit_doc)
         metadata["edit_status"] = "complete"
         artifacts["edit"] = str(job.edit_path)
 
